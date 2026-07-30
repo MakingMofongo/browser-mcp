@@ -2015,10 +2015,17 @@ async function dispatch(port, method, params) {
         } catch (e1) {
           if (e1?.name !== 'SyntaxError') return asErr(e1);
           try {
-            // Statement code / top-level await / top-level return: async-body wrap
-            return tryEval(() => new Function('return (async () => {\n' + codeStr + '\n})()'));
-          } catch (e2) {
-            return asErr(e2);
+            // Await-containing single EXPRESSION ("await fetch(...)"): wrap so the
+            // awaited value is RETURNED, not discarded as a statement.
+            return tryEval(() => new Function('return (async () => { return (' + codeStr + '\n); })()'));
+          } catch (e1b) {
+            if (e1b?.name !== 'SyntaxError') return asErr(e1b);
+            try {
+              // Statement code / top-level return: async-body wrap
+              return tryEval(() => new Function('return (async () => {\n' + codeStr + '\n})()'));
+            } catch (e2) {
+              return asErr(e2);
+            }
           }
         }
       };
