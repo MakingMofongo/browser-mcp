@@ -1,8 +1,17 @@
 {
   "manifest_version": 3,
   "name": "Agent360 Browser MCP",
-  "version": "1.26.0",
-  "description": "Control your real Chrome from Claude Code — navigate, click, fill, screenshot, clipboard, solve CAPTCHAs. 41 tools, multi-session.",
+  "version": "2.0.0",
+  "description": "Control your real Chrome from Claude Code — navigate, click, fill, screenshot, batch, refs, find, clipboard, CAPTCHAs. 47 tools, multi-session, multi-browser.",
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["console-capture.js"],
+      "run_at": "document_start",
+      "world": "MAIN",
+      "all_frames": false
+    }
+  ],
   "permissions": [
     "clipboardRead",
     "clipboardWrite",

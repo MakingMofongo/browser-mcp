@@ -6,6 +6,72 @@
 
 export const TOOLS = [
   {
+    name: 'browser_batch',
+    description: 'Execute a sequence of browser tool calls in ONE round trip. Actions run SEQUENTIALLY and stop on the first error. Use this whenever you can predict 2+ steps ahead (e.g. navigate → read_page → fill → click → get_page_content) — it is dramatically faster than separate calls. Each item is {name, params} where name is the tool name (with or without the browser_ prefix) and params is exactly what you would pass to that tool. Screenshots inside a batch are returned as proper images. Cannot be nested; ask_user/solve_captcha not allowed inside.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        actions: {
+          type: 'array',
+          description: 'Tool calls to execute in order. Example: [{"name":"navigate","params":{"url":"https://example.com"}},{"name":"read_page","params":{}},{"name":"click","params":{"selector":"ref_3"}}]',
+          items: {
+            type: 'object',
+            properties: {
+              name: { type: 'string', description: 'Tool name, e.g. "navigate", "click", "fill", "read_page"' },
+              params: { type: 'object', description: 'That tool\'s parameters, same shape as calling it directly' },
+            },
+            required: ['name'],
+          },
+        },
+      },
+      required: ['actions'],
+    },
+  },
+  {
+    name: 'browser_read_page',
+    description: 'Get a structured outline of the page: every visible interactive element (links, buttons, inputs, selects, tabs, checkboxes…) with role, accessible name, state (value/checked/disabled/href) and a stable ref handle [ref_N]. Refs are usable DIRECTLY as selectors in click/fill/select_option/hover ("ref_12"). THE tool for unfamiliar pages — read once, then act on refs instead of guessing CSS selectors. filter:"all" adds headings and images. Refs reset on navigation.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        filter: { type: 'string', enum: ['interactive', 'all'], description: 'interactive (default): actionable elements only. all: also headings, images, landmarks.' },
+        max_chars: { type: 'number', description: 'Truncate outline beyond this many characters (default: 40000)' },
+      },
+    },
+  },
+  {
+    name: 'browser_find',
+    description: 'Find elements by plain-language description — "login button", "search input", "link containing pricing". Scores accessible names, placeholders, roles and text; returns the top matches with ref handles usable directly as selectors ("ref_7"). Use when you know WHAT you want but not its selector. For a full page inventory use browser_read_page instead.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'What to find, e.g. "submit button", "email field", "next page link"' },
+        max_results: { type: 'number', description: 'Max matches to return (default: 10, cap 20)' },
+      },
+      required: ['query'],
+    },
+  },
+  {
+    name: 'browser_health',
+    description: 'Pre-flight check of the automation channels on the active tab: is script injection working, is the debugger attachable, which tab is active, how many session tabs exist. Call when interactive tools start failing (attach errors, timeouts) to diagnose instead of retrying blind — the hint field says what to do.',
+    inputSchema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'browser_list_browsers',
+    description: 'List every Chrome instance (profile/machine) whose Browser MCP extension is connected to this session, with id, label, platform and which one is active. Use before browser_select_browser when the user has multiple Chromes.',
+    inputSchema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'browser_select_browser',
+    description: 'Route all subsequent browser commands to a specific connected Chrome instance (by id or label from browser_list_browsers). If the active browser disconnects, the server auto-fails-over to another connected one.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: { type: 'string', description: 'Browser instance id (or exact label) from browser_list_browsers' },
+      },
+      required: ['id'],
+    },
+  },
+  {
     name: 'browser_navigate',
     description: 'Navigate the active browser tab to a URL. Reuses the current tab by default (no tab spam). Pass new_tab=true only when you need to keep the current page open.',
     inputSchema: {
@@ -19,11 +85,12 @@ export const TOOLS = [
   },
   {
     name: 'browser_get_page_content',
-    description: 'Get the content of the current page as text or HTML.',
+    description: 'Get the content of the current page. format:"article" extracts the main content only (nav/header/footer/sidebar/cookie noise stripped) — strongly preferred for reading articles, docs, and dashboards. "text" is the full body innerText; "html" the raw DOM. Long output is truncated at max_chars with an explicit marker.',
     inputSchema: {
       type: 'object',
       properties: {
-        format: { type: 'string', enum: ['text', 'html'], description: 'Output format (default: text)' },
+        format: { type: 'string', enum: ['article', 'text', 'html'], description: 'article: main content only (best for reading). text: full page text (default). html: raw DOM.' },
+        max_chars: { type: 'number', description: 'Truncation limit (default: 60000)' },
       },
     },
   },
@@ -39,11 +106,11 @@ export const TOOLS = [
   },
   {
     name: 'browser_execute_script',
-    description: 'Execute JavaScript in the current page. IMPORTANT: the parameter is `code` (NOT `script` — though that alias is accepted), and it must be an EXPRESSION, not statements: use an IIFE `(() => { ...; return x; })()`. Top-level `return` is a syntax error (the handler wraps code in parentheses).',
+    description: 'Execute JavaScript in the page with full REPL semantics (like the DevTools console): multi-statement code works, top-level await works, and the LAST EXPRESSION is the return value. E.g. `const r = await fetch("/api"); const j = await r.json(); j.items.length`. Parameter is `code` (alias `script` accepted).',
     inputSchema: {
       type: 'object',
       properties: {
-        code: { type: 'string', description: 'JavaScript EXPRESSION to evaluate in page context. For multi-statement logic use an IIFE: (() => { ...; return result; })()' },
+        code: { type: 'string', description: 'JavaScript to run in page context. Multi-statement + top-level await supported; the last expression is returned.' },
       },
       required: ['code'],
     },
@@ -118,22 +185,22 @@ export const TOOLS = [
   },
   {
     name: 'browser_click',
-    description: 'Click an element on the page. Supports CSS selectors AND text-based selectors. Auto-scrolls element into view. Uses real mouse events (works on Angular/React SPAs and CSP-strict sites like Google, Stripe). Examples: "button:text(Get started)", "text=Submit", "#my-button", "a.btn-primary"',
+    description: 'Click an element. Selectors: CSS ("#btn"), text ("text=Submit", "button:text(Get started)"), or a ref handle from read_page/find ("ref_12"). Auto-scrolls into view; real trusted mouse events with automatic synthetic fallback. The result reports verified + click_path — verified:false means NO event reached the page (never a silent no-op): re-read the page or try another selector.',
     inputSchema: {
       type: 'object',
       properties: {
-        selector: { type: 'string', description: 'CSS selector or text selector. Text formats: "text=Click me" (any element), "button:text(Submit)" (specific tag)' },
+        selector: { type: 'string', description: 'CSS selector, text selector ("text=Click me", "button:text(Submit)"), or ref handle ("ref_12")' },
       },
       required: ['selector'],
     },
   },
   {
     name: 'browser_fill',
-    description: 'Fill a form input field with a value. Supports CSS selectors AND text-based selectors. Auto-scrolls and focuses the element. Works on CSP-strict sites via Chrome Debugger API. For date inputs use browser_set_date, for autocomplete/combobox use browser_set_combobox.',
+    description: 'Fill a form input with a value. Selectors: CSS, text ("text=Email"), or ref handle from read_page/find ("ref_7"). Returns value_before and value_after so you can verify the fill landed on the RIGHT element (passwords redacted). For date inputs use browser_set_date, for autocomplete/combobox use browser_set_combobox.',
     inputSchema: {
       type: 'object',
       properties: {
-        selector: { type: 'string', description: 'CSS selector or text selector for the input field' },
+        selector: { type: 'string', description: 'CSS selector, text selector, or ref handle ("ref_7") for the input field' },
         value: { type: 'string', description: 'Value to fill in' },
       },
       required: ['selector', 'value'],
@@ -353,11 +420,14 @@ export const TOOLS = [
   },
   {
     name: 'browser_console_logs',
-    description: 'Get recent console.log/warn/error messages from the page. Installs a lightweight interceptor on first call. Returns the last N console messages.',
+    description: 'Read the page\'s console history — captured from document_start, so messages logged BEFORE your first read are included, plus uncaught exceptions and unhandled promise rejections. Filter with pattern (regex) to avoid noise; only_errors:true for errors/exceptions only; clear:true to reset the buffer after reading.',
     inputSchema: {
       type: 'object',
       properties: {
-        count: { type: 'number', description: 'Number of recent messages to return (default: 50)' },
+        count: { type: 'number', description: 'Max messages to return (default: 50)' },
+        pattern: { type: 'string', description: 'Regex filter — only matching messages are returned (recommended: always pass one)' },
+        only_errors: { type: 'boolean', description: 'Only error and exception entries (default: false)' },
+        clear: { type: 'boolean', description: 'Clear the buffer after reading to avoid duplicates on the next call (default: false)' },
       },
     },
   },

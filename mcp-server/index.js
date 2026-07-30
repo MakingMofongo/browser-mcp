@@ -54,12 +54,25 @@ try {
 
 const BASE_PORT = 9876;
 const MAX_PORT = 9895; // 20 ports instead of 10 — zombies die within 5s via parent check
-let extensionSocket = null;
+// v2.0 multi-browser: EVERY connected extension instance (per Chrome profile/machine)
+// is tracked; commands route to the ACTIVE one. Previously the last connection
+// silently overwrote the socket — two browsers meant nondeterministic routing.
+const extConnections = new Map(); // ws → { id, label, platform, chrome_version, connectedAt }
+let activeExt = null;             // ws currently receiving commands
 let activePort = null;
 let wss = null; // Track WSS for graceful shutdown
 let cmdId = 0;
 let lastActivity = Date.now();
 const pending = new Map();
+
+function pickFailover() {
+  const next = extConnections.keys().next();
+  activeExt = next.done ? null : next.value;
+  if (activeExt) {
+    const meta = extConnections.get(activeExt);
+    process.stderr.write(`[MCP] Failed over to browser: ${meta?.label || 'unknown'}\n`);
+  }
+}
 
 // Timers hoisted to module scope so gracefulShutdown can clear them deterministically.
 let heartbeat = null;
@@ -85,8 +98,9 @@ function createWSS(port = BASE_PORT) {
   });
 
   server.on('connection', (ws) => {
-    extensionSocket = ws;
-    process.stderr.write(`[MCP] Chrome extension connected on port ${port}\n`);
+    extConnections.set(ws, { id: null, label: 'connecting…', connectedAt: Date.now() });
+    if (!activeExt) activeExt = ws;
+    process.stderr.write(`[MCP] Chrome extension connected on port ${port} (${extConnections.size} browser(s))\n`);
 
     // If extension was auto-updated, trigger reload
     if (process.env.BROWSER_MCP_EXTENSION_UPDATED === '1') {
@@ -101,8 +115,24 @@ function createWSS(port = BASE_PORT) {
       let msg;
       try { msg = JSON.parse(data.toString()); } catch { return; }
 
+      if (msg.type === 'hello' && msg.instance) {
+        const prev = extConnections.get(ws) || {};
+        extConnections.set(ws, { ...prev, ...msg.instance });
+        process.stderr.write(`[MCP] Browser identified: ${msg.instance.label} (${msg.instance.platform})\n`);
+        return;
+      }
+
       if (msg.type === 'terminate') {
-        gracefulShutdown('Terminate signal from extension (last tab closed)');
+        // Only the ACTIVE browser closing this session's last tab may terminate —
+        // and only when no other browser is connected to fail over to.
+        if (ws !== activeExt) return;
+        if (extConnections.size > 1) {
+          extConnections.delete(ws);
+          try { ws.close(); } catch {}
+          pickFailover();
+          return;
+        }
+        gracefulShutdown('Terminate signal from extension (user closed last session tab)');
         return;
       }
 
@@ -116,9 +146,11 @@ function createWSS(port = BASE_PORT) {
     });
 
     ws.on('close', () => {
-      if (extensionSocket === ws) {
-        extensionSocket = null;
-        process.stderr.write(`[MCP] Chrome extension disconnected\n`);
+      const meta = extConnections.get(ws);
+      extConnections.delete(ws);
+      if (activeExt === ws) {
+        pickFailover();
+        process.stderr.write(`[MCP] Active browser disconnected (${meta?.label || '?'}); ${extConnections.size} remaining\n`);
       }
     });
   });
@@ -130,8 +162,8 @@ function createWSS(port = BASE_PORT) {
 
   // Heartbeat + idle timeout (4 hours) — hoisted to module scope so gracefulShutdown can clear it
   heartbeat = setInterval(() => {
-    if (extensionSocket && extensionSocket.readyState === 1) {
-      extensionSocket.ping();
+    for (const ws of extConnections.keys()) {
+      if (ws.readyState === 1) ws.ping();
     }
     if (Date.now() - lastActivity > 4 * 60 * 60 * 1000) {
       gracefulShutdown('Idle timeout (4h)');
@@ -143,14 +175,18 @@ createWSS();
 
 // ── Send command to extension ───────────────────────────────────────────────
 
-async function sendToExtension(method, params = {}, timeoutMs = 30000, _retries = 5) {
-  // Retry if extension is temporarily disconnected (reconnects every 2s)
-  if (!extensionSocket || extensionSocket.readyState !== 1) {
+async function sendToExtension(method, params = {}, timeoutMs = 30000, _retries = 8) {
+  // Auto-reconnect: extension offscreen doc rescans ports every 2s, so transient
+  // disconnects (extension reload, service-worker restart, Chrome relaunch) heal
+  // themselves — we just wait for a socket. If the active one died but another
+  // browser is connected, failover already happened in the close handler.
+  if ((!activeExt || activeExt.readyState !== 1) && extConnections.size > 0) pickFailover();
+  if (!activeExt || activeExt.readyState !== 1) {
     if (_retries > 0) {
       await new Promise(r => setTimeout(r, 1500));
       return sendToExtension(method, params, timeoutMs, _retries - 1);
     }
-    throw new Error('Chrome extension not connected after 5 retries. Open Chrome and ensure Agent360 Browser MCP extension is installed.');
+    throw new Error('Chrome extension not connected after 12s of retries. Open Chrome and ensure the Browser MCP extension is loaded and enabled (chrome://extensions). It reconnects automatically within ~2s of Chrome starting.');
   }
   return new Promise((resolve, reject) => {
     const id = ++cmdId;
@@ -159,7 +195,7 @@ async function sendToExtension(method, params = {}, timeoutMs = 30000, _retries 
       reject(new Error(`Command timed out after ${timeoutMs}ms: ${method}`));
     }, timeoutMs);
     pending.set(id, { resolve, reject, timer });
-    extensionSocket.send(JSON.stringify({ id, method, params }));
+    activeExt.send(JSON.stringify({ id, method, params }));
   });
 }
 
@@ -167,12 +203,23 @@ async function sendToExtension(method, params = {}, timeoutMs = 30000, _retries 
 
 const INSTRUCTIONS = `You control the user's real Chrome browser via this MCP server. Each session gets its own color-coded Chrome Tab Group.
 
+## v2.0 workflow — fewer round trips, verified actions
+- **Batch aggressively**: browser_batch executes up to 25 tool calls sequentially in ONE round trip, stopping on the first error. Whenever you can predict 2+ steps ahead (navigate → read_page → fill → click → get_page_content), batch them. This is the single biggest speed lever.
+- **Read before guessing selectors**: browser_read_page returns an outline of every interactive element with stable ref handles (ref_N) — click/fill accept them directly as selectors ("ref_12"). browser_find locates elements from a plain-language description ("blue login button", "search input"). Prefer refs on unfamiliar pages; prefer CSS selectors on pages you know.
+- **Trust the click verdict**: click results include verified + click_path. verified:false means NO event reached the page — do not assume it worked; re-read the page or try a different selector. This tool never silently no-ops.
+- **execute_script is a full REPL**: multi-statement code, top-level await, and the last expression is the return value — exactly like the DevTools console. No IIFE contortions needed.
+- **browser_health** pre-checks the tab: debugger attachable, scripting injectable. Call it when actions start failing instead of retrying blind.
+
 ## Key behaviors
 - **Always use browser_ask_user** when you need credentials, 2FA codes, CAPTCHA help, or any user input. Never guess passwords or tokens.
-- **ALWAYS close tabs when done** with browser_close_tab after completing each task. Don't leave tabs open — close them immediately after extracting the data you need. Use browser_list_tabs to find and close all session tabs when a task is complete.
+- **Close tabs when a task is fully done** with browser_close_tab. Closing your last tab no longer kills the session — the server stays alive and the next navigate creates a fresh tab.
 - **Check existing tabs first** with browser_list_tabs before navigating — reuse tabs instead of opening duplicates.
 - **One task per tab** — navigate to a URL, do your work, then close or move on.
 - **Tell the user what you're doing** in the browser. "I'm navigating to Stripe to find the API key" not just silently calling tools.
+- **Every response carries _tab** (id/url/title of the active tab) — use it to stay oriented instead of extra list_tabs calls.
+
+## Multiple browsers
+If the user runs the extension in several Chrome profiles or machines, browser_list_browsers shows all connected instances and browser_select_browser switches the active one. If the active browser disconnects, the server fails over automatically.
 
 ## Tab management
 - navigate creates tabs in your session's tab group (visible in Chrome as colored groups)
@@ -302,6 +349,10 @@ mcpServer.setRequestHandler(CallToolRequestSchema, async (request) => {
       browser_right_click: 'right_click',
       browser_click_xy: 'click_xy',
       browser_reattach_debugger: 'reattach_debugger',
+      browser_batch: 'batch',
+      browser_read_page: 'read_page',
+      browser_find: 'find',
+      browser_health: 'health',
     };
 
     if (name === 'browser_about') {
@@ -312,14 +363,56 @@ mcpServer.setRequestHandler(CallToolRequestSchema, async (request) => {
       return await handleExtractToken(args);
     }
 
+    // Multi-browser management — answered from server state, no extension round-trip
+    if (name === 'browser_list_browsers') {
+      const list = [...extConnections.entries()].map(([ws, meta]) => ({
+        id: meta.id || '(handshaking)',
+        label: meta.label,
+        platform: meta.platform,
+        chrome_version: meta.chrome_version,
+        connected_since: new Date(meta.connectedAt).toISOString(),
+        active: ws === activeExt,
+      }));
+      return { content: [{ type: 'text', text: JSON.stringify({ browsers: list, count: list.length }, null, 2) }] };
+    }
+    if (name === 'browser_select_browser') {
+      const target = [...extConnections.entries()].find(([, meta]) =>
+        meta.id === args?.id || meta.label === args?.id || meta.label === args?.label);
+      if (!target) {
+        const labels = [...extConnections.values()].map(m => `${m.label} (${m.id})`).join(', ') || 'none connected';
+        return { content: [{ type: 'text', text: `Browser not found: ${args?.id || args?.label}. Connected: ${labels}` }], isError: true };
+      }
+      activeExt = target[0];
+      return { content: [{ type: 'text', text: `Active browser is now: ${target[1].label} (${target[1].id})` }] };
+    }
+
     const method = methodMap[name];
     if (!method) {
       return { content: [{ type: 'text', text: `Unknown tool: ${name}` }], isError: true };
     }
 
     const timeout = method === 'ask_user' ? (args?.timeout || 120000) + 5000 :
-                    method === 'solve_captcha' ? 60000 : 30000;
+                    method === 'solve_captcha' ? 60000 :
+                    method === 'batch' ? 180000 : 30000;
     const result = await sendToExtension(method, args || {}, timeout);
+
+    // Batch: hoist any screenshots taken inside the batch into proper image blocks
+    // (base64 in JSON text would blow up the context and render as garbage).
+    if (method === 'batch' && result?.results) {
+      const images = [];
+      for (const r of result.results) {
+        if (r?.result?.image?.startsWith?.('data:image/')) {
+          const isJpeg = r.result.image.startsWith('data:image/jpeg');
+          images.push({
+            type: 'image',
+            data: r.result.image.replace(/^data:image\/(jpeg|png);base64,/, ''),
+            mimeType: isJpeg ? 'image/jpeg' : 'image/png',
+          });
+          r.result.image = `[image ${images.length} attached below]`;
+        }
+      }
+      return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }, ...images] };
+    }
 
     if (name === 'browser_screenshot' && result?.image) {
       const isJpeg = result.image.startsWith('data:image/jpeg');
@@ -440,8 +533,8 @@ function gracefulShutdown(reason, code = 0) {
   if (heartbeat) clearInterval(heartbeat);
 
   // Close WS with explicit close-frame so extension's onclose handler fires
-  if (extensionSocket && extensionSocket.readyState === 1) {
-    try { extensionSocket.close(1000, 'mcp-shutdown'); } catch {}
+  for (const ws of extConnections.keys()) {
+    if (ws.readyState === 1) try { ws.close(1000, 'mcp-shutdown'); } catch {}
   }
   if (wss) try { wss.close(); } catch {}
 
@@ -454,7 +547,7 @@ process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 process.on('exit', () => {
   // Safety net for direct process.exit calls that bypass gracefulShutdown
   if (wss) try { wss.close(); } catch {}
-  if (extensionSocket) try { extensionSocket.close(); } catch {}
+  for (const ws of extConnections.keys()) try { ws.close(); } catch {}
 });
 
 // Detect Claude Code exit — check if parent process is still alive

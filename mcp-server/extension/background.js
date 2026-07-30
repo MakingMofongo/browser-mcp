@@ -517,14 +517,15 @@ async function debuggerClick(tabId, x, y) {
     //    SPA re-renders (Google Ads) detach the element first. Fires a full pointer
     //    + mouse sequence on the shadow-pierced target, then React/Angular handlers.
     await new Promise(r => setTimeout(r, 120));
-    await cdpSend(tabId, 'Runtime.evaluate', {
+    const verdictRes = await cdpSend(tabId, 'Runtime.evaluate', {
+      returnByValue: true,
       expression: `(() => {
         const el = window.__bmcpClickTarget;
         const landed = window.__bmcpClicked === true;
         try { window.__bmcpClickListener && document.removeEventListener('click', window.__bmcpClickListener, true); } catch (e) {}
         try { delete window.__bmcpClickTarget; delete window.__bmcpClicked; delete window.__bmcpClickListener; } catch (e) {}
-        if (landed) return;                   // FIX-13: trusted click already landed — do NOT double-fire
-        if (!el || !el.isConnected) return;   // already navigated/handled — don't double-fire
+        if (landed) return { landed: true, path: 'trusted' };  // FIX-13: trusted click landed — do NOT double-fire
+        if (!el || !el.isConnected) return { landed: true, path: 'navigated' };  // page navigated/re-rendered — click had effect
         const opts = { bubbles: true, cancelable: true, composed: true, view: window, clientX: ${x}, clientY: ${y} };
         try { el.dispatchEvent(new PointerEvent('pointerdown', opts)); } catch (e) {}
         el.dispatchEvent(new MouseEvent('mousedown', opts));
@@ -549,8 +550,13 @@ async function debuggerClick(tabId, x, y) {
           const matRipple = el.closest && el.closest('[mat-button], [mat-raised-button], [mat-icon-button], [mat-fab], mat-checkbox, mat-slide-toggle, mat-radio-button');
           if (matRipple) matRipple.dispatchEvent(new MouseEvent('click', opts));
         }
+        return { landed: true, path: 'synthetic-fallback' };
       })()`,
     });
+    // Honest reporting: never claim success when zero events reached the page.
+    // (The competing tool's worst failure mode — "Clicked at (x,y)" while an
+    // instrumented listener records nothing — is exactly what this prevents.)
+    return verdictRes?.result?.value || { landed: false, path: 'unverified' };
   } finally {
     await debuggerDetach(tabId);
   }
@@ -686,7 +692,11 @@ async function scriptingClick(tabId, selector) {
       world: 'MAIN',
       func: (sel) => {
         let el;
-        if (sel.startsWith('text=')) {
+        const refM = sel.match(/^ref[_=](\d+)$/);
+        if (refM) {
+          el = window.__bmcpRefEls && window.__bmcpRefEls['ref_' + refM[1]];
+          if (el && !el.isConnected) el = null;
+        } else if (sel.startsWith('text=')) {
           const text = sel.slice(5).trim();
           el = Array.from(document.querySelectorAll('button, a, [role="button"], [role="menuitem"], [role="tab"], [role="option"], input, label, span, div, p, li, td'))
             .find(e => (e.textContent || '').trim() === text);
@@ -797,6 +807,10 @@ function buildTextFinderJS(textPattern, tagFilter) {
 }
 
 function parseSelector(selector) {
+  // "ref_12" / "ref=12" → element handle from browser_read_page / browser_find
+  const refMatch = selector.match(/^ref[_=](\d+)$/);
+  if (refMatch) return { type: 'ref', ref: 'ref_' + refMatch[1] };
+
   // "button:text(Get started)" → { tag: 'button', text: 'Get started' }
   const tagTextMatch = selector.match(/^(\w+):text\((.+)\)$/);
   if (tagTextMatch) return { type: 'text', tag: tagTextMatch[1], text: tagTextMatch[2] };
@@ -808,8 +822,40 @@ function parseSelector(selector) {
   return { type: 'css', selector };
 }
 
+// Locate a ref-handle element (assigned by read_page/find) and return its center.
+// Runs as a serialized function in MAIN world — page CSP cannot block it.
+async function resolveRefElement(tabId, refKey) {
+  const r = await chrome.scripting.executeScript({
+    target: { tabId },
+    world: 'MAIN',
+    func: (key) => {
+      const el = window.__bmcpRefEls && window.__bmcpRefEls[key];
+      if (!el) return { error: 'unknown-ref' };
+      if (!el.isConnected) return { error: 'stale-ref' };
+      el.scrollIntoView({ block: 'center', behavior: 'instant' });
+      const rect = el.getBoundingClientRect();
+      return {
+        x: rect.x + rect.width / 2, y: rect.y + rect.height / 2,
+        tag: el.tagName, text: (el.textContent || '').trim().slice(0, 80), found: true,
+      };
+    },
+    args: [refKey],
+  });
+  const res = r?.[0]?.result;
+  if (!res || res.error) {
+    throw new Error(res?.error === 'stale-ref'
+      ? `Ref ${refKey} is stale — the element left the DOM (page navigated or re-rendered). Re-run browser_read_page or browser_find to get fresh refs.`
+      : `Unknown ref ${refKey} on this page. Run browser_read_page or browser_find first (refs are per-page and reset on navigation).`);
+  }
+  return res;
+}
+
 async function resolveElement(tabId, selectorStr) {
   const parsed = parseSelector(selectorStr);
+
+  if (parsed.type === 'ref') {
+    return await resolveRefElement(tabId, parsed.ref);
+  }
 
   if (parsed.type === 'css') {
     // Standard CSS with shadow DOM traversal — try executeScript first, debugger fallback
@@ -916,7 +962,20 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     // Restore sessions from storage (service worker may have restarted)
     restoreSessions().then(() => {
       dispatch(port, msg.method, msg.params)
-        .then(result => sendResponse(result))
+        .then(async (result) => {
+          // v2.0: echo active-tab context on every response (like Claude-in-Chrome's
+          // "Tab Context" footer) so the model never drifts on which page it's driving.
+          if (result && typeof result === 'object' && !Array.isArray(result) && !result.__error) {
+            try {
+              const s = sessions.get(port);
+              if (s?.activeTabId && result.url === undefined) {
+                const t = await chrome.tabs.get(s.activeTabId);
+                result._tab = { id: t.id, url: (t.url || '').slice(0, 120), title: (t.title || '').slice(0, 80) };
+              }
+            } catch {}
+          }
+          sendResponse(result);
+        })
         .catch(err => sendResponse({ __error: err.message || String(err) }));
     }).catch(err => sendResponse({ __error: err.message || String(err) })); // else a storage-restore reject hangs the caller
     return true; // async response
@@ -1816,13 +1875,54 @@ async function dispatch(port, method, params) {
       const tab = await getSessionTab(port);
       if (tab.url.startsWith('chrome://')) throw new Error('Cannot access chrome:// pages');
       const format = params.format || 'text';
-      const scriptResult = await safeExecuteScript(tab.id, (fmt) => fmt === 'html' ? document.documentElement.outerHTML : document.body.innerText, [format]);
-      if (!scriptResult.cspBlocked) {
-        return { content: scriptResult.result, url: tab.url, title: tab.title };
+      const maxChars = Math.max(1000, params.max_chars || 60000);
+      // Serialized-func injection is CSP-immune (no string eval), so no debugger needed.
+      const [res] = await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        world: 'MAIN',
+        args: [format],
+        func: (fmt) => {
+          if (fmt === 'html') return document.documentElement.outerHTML;
+          if (fmt !== 'article') return document.body.innerText;
+          // Article mode: main content only — nav, headers, footers, sidebars,
+          // cookie banners and script noise stripped. Ideal for reading pages.
+          const pickRoot = () => {
+            const cands = [
+              document.querySelector('article'),
+              document.querySelector('main'),
+              document.querySelector('[role="main"]'),
+              document.getElementById('content'),
+              document.querySelector('.post-content, .article-body, .entry-content'),
+            ].filter(Boolean);
+            let best = null, bestLen = 0;
+            for (const c of cands) {
+              const len = (c.innerText || '').length;
+              if (len > bestLen) { best = c; bestLen = len; }
+            }
+            // Require the candidate to hold a meaningful share of page text
+            return (best && bestLen > 400) ? best : document.body;
+          };
+          const root = pickRoot().cloneNode(true);
+          const STRIP = 'nav, header, footer, aside, script, style, noscript, iframe, form, ' +
+            '[role="navigation"], [role="banner"], [role="contentinfo"], [role="complementary"], ' +
+            '[role="dialog"], [aria-hidden="true"], [class*="cookie" i], [class*="sidebar" i], ' +
+            '[class*="related" i], [class*="share" i], [class*="comment" i], [id*="cookie" i]';
+          root.querySelectorAll(STRIP).forEach(el => el.remove());
+          // cloneNode loses layout, so innerText degrades to textContent — normalize whitespace
+          const text = (root.innerText || root.textContent || '')
+            .replace(/[ \t]+/g, ' ')
+            .replace(/\n{3,}/g, '\n\n')
+            .trim();
+          return text;
+        },
+      });
+      let content = res?.result ?? '';
+      const fullLength = content.length;
+      if (content.length > maxChars) {
+        content = content.slice(0, maxChars) +
+          `\n\n[TRUNCATED: showing ${maxChars} of ${fullLength} chars — pass max_chars for more, or format:"article" to strip boilerplate]`;
       }
-      // CSP fallback
-      const content = await debuggerEval(tab.id, format === 'html' ? 'document.documentElement.outerHTML' : 'document.body.innerText');
-      return { content, url: tab.url, title: tab.title, method: 'debugger' };
+      return { content, url: tab.url, title: tab.title, length: fullLength, format };
     }
 
     case 'screenshot': {
@@ -1898,58 +1998,60 @@ async function dispatch(port, method, params) {
 
       const diag = { tried: [] };
 
-      // Step 1: try ISOLATED world
-      try {
-        const [result] = await chrome.scripting.executeScript({
-          target: { tabId: tab.id },
-          world: 'ISOLATED',
-          args: [params.code],
-          func: (codeStr) => {
-            try {
-              const fn = new Function('return (' + codeStr + ')');
-              return { __ok: true, value: fn() };
-            } catch (e) {
-              return { __scriptingError: true, message: String(e?.message || e), name: e?.name, world: 'ISOLATED' };
-            }
-          },
-        });
-        const r = result?.result;
-        diag.tried.push({ world: 'ISOLATED', result_keys: r ? Object.keys(r) : null, r_type: typeof r });
-        if (r && typeof r === 'object' && r.__ok) {
-          return { result: r.value, method: 'scripting-isolated' };
+      // v2.0 REPL semantics: accept full multi-statement code with top-level await.
+      // Each scripting world tries (a) expression eval, (b) async-function-body wrap —
+      // so `const r = await fetch(...); r.status` and top-level `return x` both work.
+      const replFunc = (codeStr) => {
+        const asErr = (e) => ({ __scriptingError: true, message: String(e?.message || e), name: e?.name });
+        const tryEval = (build) => {
+          const fn = build();
+          const v = fn();
+          return (v && typeof v.then === 'function')
+            ? v.then(x => ({ __ok: true, value: x }), asErr)  // async rejection → structured error, never unhandled
+            : { __ok: true, value: v };
+        };
+        try {
+          return tryEval(() => new Function('return (' + codeStr + '\n)'));
+        } catch (e1) {
+          if (e1?.name !== 'SyntaxError') return asErr(e1);
+          try {
+            // Statement code / top-level await / top-level return: async-body wrap
+            return tryEval(() => new Function('return (async () => {\n' + codeStr + '\n})()'));
+          } catch (e2) {
+            return asErr(e2);
+          }
         }
-        if (r && typeof r === 'object' && r.__scriptingError) {
-          diag.isolated_error = r.message;
-        }
-      } catch (e) {
-        diag.isolated_throw = String(e?.message || e);
-      }
+      };
 
-      // Step 2: try MAIN world
-      try {
-        const [result] = await chrome.scripting.executeScript({
-          target: { tabId: tab.id },
-          world: 'MAIN',
-          args: [params.code],
-          func: (codeStr) => {
-            try {
-              const fn = new Function('return (' + codeStr + ')');
-              return { __ok: true, value: fn() };
-            } catch (e) {
-              return { __scriptingError: true, message: String(e?.message || e), name: e?.name, world: 'MAIN' };
+      for (const world of ['ISOLATED', 'MAIN']) {
+        try {
+          const [result] = await chrome.scripting.executeScript({
+            target: { tabId: tab.id },
+            world,
+            args: [params.code],
+            func: replFunc,
+          });
+          const r = result?.result;
+          diag.tried.push({ world, result_keys: r ? Object.keys(r) : null, r_type: typeof r });
+          if (r && typeof r === 'object' && r.__ok) {
+            return { result: r.value, method: 'scripting-' + world.toLowerCase() };
+          }
+          if (r && typeof r === 'object' && r.__scriptingError) {
+            diag[world.toLowerCase() + '_error'] = r.message;
+            // ISOLATED-world errors are often just page globals being invisible there —
+            // always continue to MAIN. A MAIN-world runtime (non-CSP) error is REAL:
+            // surface it instead of re-running side-effectful code in the debugger path.
+            if (world === 'MAIN' &&
+                !/unsafe-eval|Content Security Policy|Function constructor|EvalError/i.test(r.message) &&
+                r.name !== 'EvalError' && r.name !== 'SyntaxError') {
+              throw new Error(r.message + ' | scripting-diag: ' + JSON.stringify(diag));
             }
-          },
-        });
-        const r = result?.result;
-        diag.tried.push({ world: 'MAIN', result_keys: r ? Object.keys(r) : null, r_type: typeof r });
-        if (r && typeof r === 'object' && r.__ok) {
-          return { result: r.value, method: 'scripting-main' };
+          }
+        } catch (e) {
+          const m = String(e?.message || e);
+          if (m.includes('scripting-diag')) throw e;
+          diag[world.toLowerCase() + '_throw'] = m;
         }
-        if (r && typeof r === 'object' && r.__scriptingError) {
-          diag.main_error = r.message;
-        }
-      } catch (e) {
-        diag.main_throw = String(e?.message || e);
       }
 
       // Step 3: debugger fallback — the ONLY universal path for arbitrary STRING code
@@ -1965,19 +2067,28 @@ async function dispatch(port, method, params) {
       for (let attempt = 0; attempt < 4; attempt++) {
         try {
           await debuggerAttach(tab.id);
+          // replMode gives DevTools-console semantics: multi-statement code,
+          // top-level await, and the last expression as the completion value.
           rawDbg = await cdpSend(tab.id, 'Runtime.evaluate', {
-            expression: '(' + params.code + '\n)',
+            expression: params.code,
             returnByValue: true,
             awaitPromise: true,
+            replMode: true,
           });
           if (rawDbg && rawDbg.exceptionDetails) {
             const ex = rawDbg.exceptionDetails;
             await debuggerDetach(tab.id).catch(() => {});
             throw new Error('__SCRIPT_EX__' + (ex.exception?.description || ex.text || 'Script exception'));
           }
-          if (rawDbg && rawDbg.result && rawDbg.result.type !== 'undefined') {
+          if (rawDbg && rawDbg.result) {
+            // replMode: `undefined` is a legitimate completion value (assignments,
+            // void calls). Only a fully EMPTY CDP response means detach-mid-command.
             await debuggerDetach(tab.id).catch(() => {});
-            return { result: rawDbg.result.value, method: 'debugger' };
+            return {
+              result: rawDbg.result.type === 'undefined' ? null : rawDbg.result.value,
+              method: 'debugger-repl',
+              ...(rawDbg.result.type === 'undefined' ? { note: 'code completed; last statement had no value' } : {}),
+            };
           }
           dbgErr = 'empty/undefined CDP response: ' + JSON.stringify(rawDbg);
         } catch (e) {
@@ -2011,12 +2122,27 @@ async function dispatch(port, method, params) {
         if (!el) return { ok: false, error: 'Element not found: ' + params.selector };
 
         // Primary path: debugger mouse events (isTrusted=true, works on React/Angular SPAs)
-        await debuggerClick(tab.id, el.x, el.y);
-        return { ok: true, method: el.method || 'debugger', tag: el.tag, text: el.text };
+        const verdict = await debuggerClick(tab.id, el.x, el.y);
+        return { ok: true, method: el.method || 'debugger', tag: el.tag, text: el.text, click_path: verdict.path, verified: verdict.landed };
       } catch (e) {
         // Fallback: synthetic click via chrome.scripting for anti-automation sites
         // (Apple ASC etc.) OR user-blocked-debugger scenarios.
-        if (/Debugger detached/.test(e?.message || '')) {
+        //
+        // MÅLT 29/7: betingelsen var kun /Debugger detached/, men den HYPPIGSTE fejl hedder
+        // "Debugger attach failed after 3 attempts" (kastes l.298) — altså når Chrome nægter
+        // at koble debuggeren på overhovedet. De to strenge ligner hinanden og betyder næsten
+        // det samme, men regexet ramte kun den ene, så fallbacken fyrede aldrig i det tilfælde
+        // den var skrevet til: "user-blocked-debugger scenarios" står ordret i kommentaren
+        // ovenfor, og det var netop dét den ikke dækkede.
+        //
+        // Konsekvens i praksis: klikker brugeren Cancel på Chromes debugger-banner ÉN gang,
+        // husker Chrome det på tværs af extension-reloads, og hvert eneste klik fejler
+        // permanent — selvom scriptingClick ville have virket hele tiden. Den bruger `func:`
+        // og ikke en kode-streng, så den rammes ikke af sidens CSP.
+        //
+        // Prisen ved fallbacken er at klikket mister isTrusted=true. Det tjekker de færreste
+        // sider, og et klik der virker på 95% af nettet slår et klik der aldrig virker.
+        if (/Debugger detached|Debugger attach failed|not attached/i.test(e?.message || '')) {
           const r = await scriptingClick(tab.id, params.selector);
           if (r.ok) return { ok: true, method: 'scripting-fallback', tag: r.tag };
         }
@@ -2029,20 +2155,53 @@ async function dispatch(port, method, params) {
       if (tab.url.startsWith('chrome://')) throw new Error('Cannot interact with chrome:// pages');
       const parsed = parseSelector(params.selector);
 
+      // Value feedback (v2.0): report previous + resulting value so the caller can
+      // detect wrong-element fills and React-controlled reverts without a re-read.
+      // Password fields are redacted to a length only.
+      const readField = async () => {
+        try {
+          const [r] = await chrome.scripting.executeScript({
+            target: { tabId: tab.id },
+            world: 'MAIN',
+            args: [parsed.type === 'ref' ? parsed.ref : (parsed.type === 'css' ? parsed.selector : null)],
+            func: (sel) => {
+              let el = null;
+              if (sel && sel.startsWith('ref_')) el = window.__bmcpRefEls && window.__bmcpRefEls[sel];
+              else if (sel) el = document.querySelector(sel);
+              if (!el) return null;
+              const isPw = (el.type || '').toLowerCase() === 'password';
+              const v = ('value' in el) ? el.value : (el.textContent || '');
+              return { value: isPw ? null : String(v).slice(0, 200), redacted: isPw, len: String(v).length };
+            },
+          });
+          return r?.result || null;
+        } catch { return null; }
+      };
+      const before = await readField();
+      const describe = (f) => f == null ? undefined : (f.redacted ? `[redacted ${f.len} chars]` : f.value);
+
       // For text-based selectors, click the element first then type
-      if (parsed.type === 'text') {
+      if (parsed.type === 'text' || parsed.type === 'ref') {
         const el = await resolveElement(tab.id, params.selector);
         if (!el) return { ok: false, error: 'Element not found: ' + params.selector };
         await debuggerClick(tab.id, el.x, el.y);
         await new Promise(r => setTimeout(r, 100));
-        await debuggerType(tab.id, params.value);
-        return { ok: true, method: 'debugger' };
+        await debuggerAttach(tab.id);
+        try {
+          await clearFieldAttached(tab.id);
+          await cdpSend(tab.id, 'Input.insertText', { text: params.value });
+        } finally {
+          await debuggerDetach(tab.id);
+        }
+        const after = await readField();
+        return { ok: true, method: 'debugger', value_before: describe(before), value_after: describe(after) };
       }
 
       // Always use debugger for input/textarea — React/Angular/Vue need real keyboard events
       try {
         await debuggerFill(tab.id, parsed.selector, params.value);
-        return { ok: true, method: 'debugger' };
+        const after = await readField();
+        return { ok: true, method: 'debugger', value_before: describe(before), value_after: describe(after) };
       } catch (e) {
         // Fallback to executeScript if debugger fails
         const scriptResult = await safeExecuteScript(tab.id, (sel, val) => {
@@ -2382,8 +2541,8 @@ async function dispatch(port, method, params) {
       if (typeof params.x !== 'number' || typeof params.y !== 'number') {
         return { ok: false, error: 'x and y (numbers, CSS pixels in viewport) are required' };
       }
-      await debuggerClick(tab.id, params.x, params.y);
-      return { ok: true, clicked_at: { x: params.x, y: params.y } };
+      const verdict = await debuggerClick(tab.id, params.x, params.y);
+      return { ok: verdict.landed, clicked_at: { x: params.x, y: params.y }, click_path: verdict.path, verified: verdict.landed };
     }
 
     case 'reattach_debugger': {
@@ -2654,49 +2813,35 @@ async function dispatch(port, method, params) {
     }
 
     case 'console_logs': {
+      // v2.0: the interceptor is installed at document_start by a registered
+      // content script (console-capture.js), so the FULL console history since
+      // page load is available — including errors logged before the first read,
+      // uncaught exceptions, and unhandled promise rejections. The old design
+      // installed the interceptor lazily on first read and missed all of that.
       const tab = await getSessionTab(port);
       const count = params.count || 50;
-      try {
-        await debuggerAttach(tab.id);
-        await cdpSend(tab.id, 'Runtime.enable');
-        // Collect console messages for a brief period
-        const logs = [];
-        const handler = (source, method, eventParams) => {
-          if (source.tabId === tab.id && method === 'Runtime.consoleAPICalled') {
-            logs.push({
-              type: eventParams.type,
-              text: eventParams.args?.map(a => a.value || a.description || '').join(' '),
-              timestamp: eventParams.timestamp,
-            });
-          }
-        };
-        chrome.debugger.onEvent.addListener(handler);
-        // Also grab existing console via page JS
-        const { result } = await cdpSend(tab.id, 'Runtime.evaluate', {
-          expression: `(() => {
-            if (!window.__mcpConsoleLogs) {
-              window.__mcpConsoleLogs = [];
-              const orig = { log: console.log, warn: console.warn, error: console.error, info: console.info };
-              for (const [type, fn] of Object.entries(orig)) {
-                console[type] = (...args) => {
-                  window.__mcpConsoleLogs.push({ type, text: args.map(a => typeof a === 'object' ? JSON.stringify(a) : String(a)).join(' '), ts: Date.now() });
-                  if (window.__mcpConsoleLogs.length > 200) window.__mcpConsoleLogs.shift();
-                  fn.apply(console, args);
-                };
-              }
-            }
-            return JSON.stringify(window.__mcpConsoleLogs.slice(-${count}));
-          })()`,
-          returnByValue: true,
-        });
-        chrome.debugger.onEvent.removeListener(handler);
-        await debuggerDetach(tab.id);
-        const existing = JSON.parse(result.value || '[]');
-        return { logs: [...existing, ...logs].slice(-count) };
-      } catch (e) {
-        try { await debuggerDetach(tab.id); } catch {}
-        return { logs: [], error: e.message };
+      const [res] = await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        world: 'MAIN',
+        args: [count, params.pattern || null, !!params.only_errors, !!params.clear],
+        func: (count, pattern, onlyErrors, clear) => {
+          const buf = window.__mcpConsoleLogs || [];
+          let re = null;
+          if (pattern) { try { re = new RegExp(pattern, 'i'); } catch {} }
+          let out = buf.filter(l =>
+            (!onlyErrors || l.type === 'error' || l.type === 'exception') &&
+            (!re || re.test(l.text)));
+          const total = out.length;
+          out = out.slice(-count);
+          if (clear) buf.length = 0;
+          return { logs: out, total_matched: total, captured_since_load: !!window.__mcpConsoleLogs };
+        },
+      });
+      const r = res?.result || { logs: [], captured_since_load: false };
+      if (!r.captured_since_load) {
+        r.note = 'Interceptor not present on this page (loaded before the extension was updated, or a chrome:// page). Reload the page to capture from document_start.';
       }
+      return r;
     }
 
     case 'ask_user': {
@@ -2893,10 +3038,19 @@ async function dispatch(port, method, params) {
       if (!session.tabIds.has(tabId)) {
         throw new Error(`Tab ${tabId} does not belong to this session (${session.label})`);
       }
-      await chrome.tabs.remove(tabId);
+      // TEARDOWN-RACE FIX: remove from the session BEFORE chrome.tabs.remove, so the
+      // onRemoved listener doesn't see it as the session's last tab and terminate the
+      // MCP server mid-conversation. A COMMAND closing tabs is the client tidying up —
+      // the session lives on (next navigate simply creates a fresh tab). Only the USER
+      // closing the last session tab by hand should ever terminate the server.
       session.tabIds.delete(tabId);
       if (session.activeTabId === tabId) session.activeTabId = null;
       persistSessions();
+      try {
+        await chrome.tabs.remove(tabId);
+      } catch (e) {
+        return { ok: true, remaining: session.tabIds.size, note: 'tab was already closed' };
+      }
       return { ok: true, remaining: session.tabIds.size };
     }
 
@@ -2981,6 +3135,298 @@ async function dispatch(port, method, params) {
         try { await debuggerDetach(tab.id); } catch {}
         return { ok: false, error: e.message };
       }
+    }
+
+    // ── v2.0 tools: read_page, find, health, batch ──────────────────────────
+
+    case 'read_page': {
+      const tab = await getSessionTab(port);
+      if (tab.url.startsWith('chrome://')) throw new Error('Cannot read chrome:// pages');
+      const filter = params.filter === 'all' ? 'all' : 'interactive';
+      const maxChars = Math.max(2000, params.max_chars || 40000);
+      const [res] = await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        world: 'MAIN',
+        args: [filter, maxChars],
+        func: (filter, maxChars) => {
+          if (!window.__bmcpRefEls) { window.__bmcpRefEls = {}; window.__bmcpRefSeq = 0; }
+          const refs = window.__bmcpRefEls;
+          const assignRef = (el) => {
+            if (el.__bmcpRef && refs[el.__bmcpRef] === el) return el.__bmcpRef;
+            const key = 'ref_' + (++window.__bmcpRefSeq);
+            try { Object.defineProperty(el, '__bmcpRef', { value: key, configurable: true }); } catch {}
+            refs[key] = el;
+            return key;
+          };
+          const visible = (el) => {
+            const r = el.getBoundingClientRect();
+            if (r.width <= 0 || r.height <= 0) return false;
+            if (el.closest('[aria-hidden="true"]')) return false;
+            return true;
+          };
+          const accName = (el) => {
+            const aria = el.getAttribute && el.getAttribute('aria-label');
+            if (aria) return aria.trim();
+            const lbl = el.getAttribute && el.getAttribute('aria-labelledby');
+            if (lbl) {
+              const t = lbl.split(/\s+/).map(id => document.getElementById(id)?.textContent || '').join(' ').trim();
+              if (t) return t;
+            }
+            if (el.labels && el.labels[0]) { const t = el.labels[0].textContent.trim(); if (t) return t; }
+            if (el.placeholder) return el.placeholder.trim();
+            if (el.alt) return el.alt.trim();
+            if (el.title) return el.title.trim();
+            const t = (el.textContent || '').trim().replace(/\s+/g, ' ');
+            if (t) return t.slice(0, 80);
+            if (el.value && (el.type || '') !== 'password') return String(el.value).slice(0, 40);
+            return '';
+          };
+          const roleOf = (el) => {
+            const r = el.getAttribute && el.getAttribute('role');
+            if (r) return r;
+            const tag = el.tagName.toLowerCase();
+            if (tag === 'a') return el.href ? 'link' : 'a';
+            if (tag === 'button' || tag === 'summary') return 'button';
+            if (tag === 'select') return 'combobox';
+            if (tag === 'textarea') return 'textbox';
+            if (tag === 'input') {
+              const t = (el.type || 'text').toLowerCase();
+              return { checkbox: 'checkbox', radio: 'radio', submit: 'button', button: 'button', range: 'slider', file: 'file-input', date: 'date-input', search: 'searchbox' }[t] || 'textbox';
+            }
+            if (/^h[1-6]$/.test(tag)) return 'heading-' + tag[1];
+            if (el.isContentEditable) return 'textbox';
+            return tag;
+          };
+          const stateOf = (el) => {
+            const bits = [];
+            const tag = el.tagName.toLowerCase();
+            if (tag === 'input' || tag === 'textarea') {
+              const t = (el.type || 'text').toLowerCase();
+              if (t === 'password') bits.push(el.value ? 'value=[redacted]' : 'empty');
+              else if (t === 'checkbox' || t === 'radio') bits.push(el.checked ? 'checked' : 'unchecked');
+              else { bits.push('type=' + t); if (el.value) bits.push('value=' + JSON.stringify(String(el.value).slice(0, 40))); }
+            }
+            if (tag === 'select') {
+              const sel = el.selectedOptions[0];
+              bits.push('selected=' + JSON.stringify(sel ? sel.text.slice(0, 40) : ''));
+              bits.push(el.options.length + ' options');
+            }
+            if (tag === 'a' && el.href) bits.push('href=' + JSON.stringify(el.href.slice(0, 70)));
+            if (el.disabled) bits.push('disabled');
+            if (el.getAttribute('aria-expanded')) bits.push('expanded=' + el.getAttribute('aria-expanded'));
+            return bits.length ? ' ' + bits.join(' ') : '';
+          };
+          const INTERACTIVE = 'a[href], button, input, select, textarea, summary, audio[controls], video[controls], ' +
+            '[role="button"], [role="link"], [role="menuitem"], [role="tab"], [role="option"], [role="checkbox"], ' +
+            '[role="radio"], [role="switch"], [role="combobox"], [role="searchbox"], [role="textbox"], [role="slider"], ' +
+            '[onclick], [contenteditable="true"], [tabindex]:not([tabindex="-1"])';
+          const wanted = filter === 'all' ? INTERACTIVE + ', h1, h2, h3, h4, h5, h6, img[alt], [role="heading"]' : INTERACTIVE;
+          const collect = (root, out) => {
+            for (const el of root.querySelectorAll(wanted)) out.push(el);
+            for (const el of root.querySelectorAll('*')) if (el.shadowRoot) collect(el.shadowRoot, out);
+            return out;
+          };
+          const all = [...new Set(collect(document, []))];
+          const lines = [];
+          let hidden = 0;
+          for (const el of all) {
+            if (!visible(el)) { hidden++; continue; }
+            const role = roleOf(el);
+            const name = accName(el);
+            if (/^h[1-6]$/.test(el.tagName.toLowerCase()) || role.startsWith('heading')) {
+              lines.push(`\n## ${name}`);
+              continue;
+            }
+            lines.push(`${role} ${JSON.stringify(name)}${stateOf(el)} [${assignRef(el)}]`);
+          }
+          let text = lines.join('\n');
+          let truncated = false;
+          if (text.length > maxChars) { text = text.slice(0, text.lastIndexOf('\n', maxChars)); truncated = true; }
+          return {
+            outline: text,
+            elements: lines.length,
+            hidden_skipped: hidden,
+            truncated,
+            viewport: { w: innerWidth, h: innerHeight, scrollY: Math.round(scrollY), pageHeight: document.documentElement.scrollHeight },
+          };
+        },
+      });
+      const r = res?.result;
+      if (!r) throw new Error('read_page injection returned nothing (page may still be loading)');
+      return { ...r, url: tab.url, title: tab.title, hint: 'Use refs directly as selectors: browser_click({selector:"ref_12"}), browser_fill({selector:"ref_7", value:"..."}). Refs reset on navigation.' };
+    }
+
+    case 'find': {
+      const tab = await getSessionTab(port);
+      if (tab.url.startsWith('chrome://')) throw new Error('Cannot search chrome:// pages');
+      if (!params.query || !String(params.query).trim()) return { ok: false, error: 'query required' };
+      const maxResults = Math.min(20, params.max_results || 10);
+      const [res] = await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        world: 'MAIN',
+        args: [String(params.query), maxResults],
+        func: (query, maxResults) => {
+          if (!window.__bmcpRefEls) { window.__bmcpRefEls = {}; window.__bmcpRefSeq = 0; }
+          const refs = window.__bmcpRefEls;
+          const assignRef = (el) => {
+            if (el.__bmcpRef && refs[el.__bmcpRef] === el) return el.__bmcpRef;
+            const key = 'ref_' + (++window.__bmcpRefSeq);
+            try { Object.defineProperty(el, '__bmcpRef', { value: key, configurable: true }); } catch {}
+            refs[key] = el;
+            return key;
+          };
+          const accName = (el) => {
+            const parts = [
+              el.getAttribute && el.getAttribute('aria-label'),
+              el.labels && el.labels[0] && el.labels[0].textContent,
+              el.placeholder, el.alt, el.title,
+              (el.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 120),
+            ];
+            return (parts.find(p => p && String(p).trim()) || '').toString().trim();
+          };
+          const ROLE_HINTS = {
+            button: ['button', '[role="button"]', 'input[type="submit"]', 'input[type="button"]'],
+            link: ['a[href]', '[role="link"]'],
+            input: ['input', 'textarea', '[contenteditable="true"]', 'select'],
+            field: ['input', 'textarea', 'select'],
+            textbox: ['input', 'textarea'],
+            search: ['input[type="search"]', '[role="searchbox"]', 'input[placeholder*="search" i]', 'input[aria-label*="search" i]'],
+            checkbox: ['input[type="checkbox"]', '[role="checkbox"]'],
+            radio: ['input[type="radio"]', '[role="radio"]'],
+            dropdown: ['select', '[role="combobox"]', '[aria-haspopup="listbox"]'],
+            select: ['select', '[role="combobox"]'],
+            tab: ['[role="tab"]'],
+            menu: ['[role="menu"]', '[role="menuitem"]'],
+            image: ['img'],
+            heading: ['h1', 'h2', 'h3', 'h4', 'h5', 'h6', '[role="heading"]'],
+            upload: ['input[type="file"]'],
+            date: ['input[type="date"]', 'input[placeholder*="date" i]'],
+          };
+          const qLower = query.toLowerCase().trim();
+          let tokens = qLower.split(/\s+/).filter(t => t.length > 1);
+          const hintSelectors = [];
+          tokens = tokens.filter(t => {
+            const hint = ROLE_HINTS[t.replace(/s$/, '')] || ROLE_HINTS[t];
+            if (hint) { hintSelectors.push(...hint); return false; }
+            return true;
+          });
+          const textQuery = tokens.join(' ');
+          const CANDIDATES = 'a[href], button, input, select, textarea, summary, label, img[alt], ' +
+            'h1, h2, h3, h4, h5, h6, [role], [onclick], [contenteditable="true"], [aria-label], [tabindex]:not([tabindex="-1"])';
+          const collect = (root, out) => {
+            for (const el of root.querySelectorAll(CANDIDATES)) out.push(el);
+            for (const el of root.querySelectorAll('*')) if (el.shadowRoot) collect(el.shadowRoot, out);
+            return out;
+          };
+          const all = [...new Set(collect(document, []))];
+          const scored = [];
+          for (const el of all) {
+            const r = el.getBoundingClientRect();
+            const isVisible = r.width > 0 && r.height > 0;
+            const name = accName(el).toLowerCase();
+            let score = 0;
+            const reasons = [];
+            if (hintSelectors.length) {
+              if (hintSelectors.some(s => { try { return el.matches(s); } catch { return false; } })) { score += 30; reasons.push('role-match'); }
+              else if (!textQuery) continue;
+            }
+            if (textQuery && name) {
+              if (name === textQuery) { score += 100; reasons.push('exact'); }
+              else if (name.startsWith(textQuery)) { score += 60; reasons.push('starts-with'); }
+              else if (name.includes(textQuery)) { score += 45; reasons.push('contains'); }
+              else {
+                const hit = tokens.filter(t => name.includes(t)).length;
+                if (hit) { score += Math.round(35 * hit / tokens.length); reasons.push(`${hit}/${tokens.length} words`); }
+              }
+            } else if (textQuery && !name) {
+              continue;
+            }
+            if (score <= 0) continue;
+            if (isVisible) score += 10; else score -= 25;
+            if (name.length > 150) score -= 15;
+            scored.push({ el, score, reasons, name: accName(el), isVisible });
+          }
+          scored.sort((a, b) => b.score - a.score);
+          // Innermost preference: drop an element whose higher-scored descendant is also matched
+          const top = [];
+          for (const s of scored) {
+            if (top.length >= maxResults) break;
+            if (top.some(t => s.el.contains(t.el))) continue;
+            top.push(s);
+          }
+          return {
+            total_candidates: scored.length,
+            matches: top.map(s => ({
+              ref: assignRef(s.el),
+              role: s.el.getAttribute('role') || s.el.tagName.toLowerCase(),
+              name: s.name.slice(0, 100),
+              score: s.score,
+              match: s.reasons.join(','),
+              visible: s.isVisible,
+            })),
+          };
+        },
+      });
+      const r = res?.result;
+      if (!r) throw new Error('find injection returned nothing (page may still be loading)');
+      return { ...r, query: params.query, hint: r.matches.length ? 'Click/fill via ref: browser_click({selector:"' + r.matches[0].ref + '"})' : 'No matches — try different words, or browser_read_page for the full element outline.' };
+    }
+
+    case 'health': {
+      const session = getSession(port);
+      const tab = await getSessionTab(port);
+      let debuggerAttachedReal = false;
+      try {
+        const targets = await chrome.debugger.getTargets();
+        debuggerAttachedReal = !!targets.find(t => t.tabId === tab.id)?.attached;
+      } catch {}
+      let scriptingOk = false;
+      try {
+        const [r] = await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: () => true });
+        scriptingOk = r?.result === true;
+      } catch {}
+      return {
+        ok: true,
+        active_tab: { id: tab.id, url: tab.url, title: tab.title },
+        session: { label: session.label, color: session.color, tabs: session.tabIds.size },
+        debugger_attached: debuggerAttachedReal,
+        scripting_works: scriptingOk,
+        ready: scriptingOk,
+        hint: !scriptingOk ? 'Scripting injection failing — tab may be chrome:// or still loading.' :
+              !debuggerAttachedReal ? 'Debugger not currently attached (attaches on demand for clicks/keys). If clicks fail with attach errors, another automation extension may be holding the debugger — disable it or use browser_reattach_debugger.' :
+              'All channels operational.',
+      };
+    }
+
+    case 'batch': {
+      const actions = params.actions;
+      if (!Array.isArray(actions) || !actions.length) {
+        return { ok: false, error: 'actions array required: [{name:"navigate", params:{url:"..."}}, ...]' };
+      }
+      if (actions.length > 25) return { ok: false, error: 'Max 25 actions per batch' };
+      const results = [];
+      for (let i = 0; i < actions.length; i++) {
+        const a = actions[i] || {};
+        const m = String(a.name || a.method || '').replace(/^browser_/, '');
+        const p = a.params || a.input || {};
+        if (!m) { results.push({ index: i, ok: false, error: 'missing action name' }); break; }
+        if (m === 'batch') { results.push({ index: i, ok: false, error: 'batch cannot be nested' }); break; }
+        if (m === 'ask_user' || m === 'solve_captcha') { results.push({ index: i, ok: false, error: m + ' not allowed inside batch (needs interactive timeout) — call it standalone' }); break; }
+        try {
+          const r = await dispatch(port, m, p);
+          const failed = r && typeof r === 'object' && (r.ok === false || r.__error || r.error);
+          results.push({ index: i, action: m, ok: !failed, result: r });
+          if (failed) {
+            results.push({ index: i + 1, note: `stopped: action ${i} (${m}) failed — ${results[i].result?.error || 'see result'}; ${actions.length - i - 1} action(s) skipped` });
+            break;
+          }
+        } catch (e) {
+          results.push({ index: i, action: m, ok: false, error: e?.message || String(e) });
+          break;
+        }
+      }
+      const completed = results.filter(r => r.ok).length;
+      return { ok: completed === actions.length, completed, total: actions.length, results };
     }
 
     case 'reload_extension': {

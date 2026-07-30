@@ -12,6 +12,28 @@ const BASE_PORT = 9876;
 const MAX_PORT = 9895;
 const connections = new Map(); // port → WebSocket
 
+// Stable identity for this browser installation (persisted in extension storage).
+// Label is user-editable via chrome.storage ('bmcpLabel') — default derives from platform.
+let instanceCache = null;
+async function getInstanceInfo() {
+  if (instanceCache) return instanceCache;
+  const stored = await chrome.storage.local.get(['bmcpInstanceId', 'bmcpLabel']);
+  let id = stored.bmcpInstanceId;
+  if (!id) {
+    id = crypto.randomUUID();
+    await chrome.storage.local.set({ bmcpInstanceId: id });
+  }
+  const platform = (navigator.userAgentData && navigator.userAgentData.platform) || navigator.platform || 'unknown';
+  const chromeVer = (navigator.userAgent.match(/Chrome\/([\d.]+)/) || [])[1] || '?';
+  instanceCache = {
+    id,
+    label: stored.bmcpLabel || `Chrome on ${platform}`,
+    platform,
+    chrome_version: chromeVer,
+  };
+  return instanceCache;
+}
+
 function scanPorts() {
   for (let port = BASE_PORT; port <= MAX_PORT; port++) {
     const existing = connections.get(port);
@@ -34,10 +56,17 @@ function tryConnect(port) {
     if (ws.readyState !== WebSocket.OPEN) ws.close();
   }, 2000);
 
-  ws.onopen = () => {
+  ws.onopen = async () => {
     clearTimeout(connectTimeout);
     connections.set(port, ws);
     console.log(`[Offscreen] Connected to MCP server on port ${port} (${connections.size} total)`);
+    // v2.0 hello handshake: identify this browser instance so the MCP server can
+    // track multiple connected Chromes (profiles/machines) and let the model pick
+    // one via browser_list_browsers / browser_select_browser.
+    try {
+      const instance = await getInstanceInfo();
+      ws.send(JSON.stringify({ type: 'hello', instance }));
+    } catch {}
     updateStatus();
   };
 
