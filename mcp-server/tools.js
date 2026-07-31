@@ -83,7 +83,7 @@ export const TOOLS = [
       type: 'object',
       properties: {
         path: { type: 'string', description: 'Where to write the file' },
-        mode: { type: 'string', enum: ['pdf', 'url'], description: 'pdf prints the current page; url downloads the given address (default: pdf, or url when one is given)' },
+        mode: { type: 'string', enum: ['pdf', 'url', 'print'], description: 'pdf prints the current page, or downloads the original file when the tab is displaying a PDF; url downloads the given address; print forces printing even for a PDF tab' },
         url: { type: 'string', description: 'Address to download for mode "url"' },
         landscape: { type: 'boolean', description: 'Print in landscape' },
         background: { type: 'boolean', description: 'Include background graphics when printing (default: true)' },
@@ -173,6 +173,7 @@ export const TOOLS = [
         clear: { type: 'boolean', description: 'Clear the buffer after reading' },
         include_extension_requests: { type: 'boolean', description: 'Include chrome-extension:// asset requests from other installed extensions (excluded by default as noise)' },
         include_body: { type: 'boolean', description: 'Return captured response bodies. Entries listing has_body have one available.' },
+        request_id: { type: 'string', description: 'Re-read one response in full, for a body that came back truncated.' },
         max_body_chars: { type: 'number', description: 'Truncate each returned body at this length (default: 4000)' },
       },
     },
