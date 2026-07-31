@@ -44,25 +44,44 @@ function restoreSessions() {
           // open them, so we must not take them away.
           adopted: new Set((data.adopted || []).filter(id => validTabIds.has(id))),
           groupId: data.groupId || null,
-          color: data.color || SESSION_COLORS[sessions.size % SESSION_COLORS.length],
-          label: data.label || `Claude ${sessions.size + 1}`,
+          // Port-derived, so a restored session keeps the same name/colour it had
+          // and can never collide with a live session on another port.
+          ...sessionIdentity(Number(port)),
         });
       }
+    }
+    // Re-stamp restored groups with their port-derived identity, so groups that
+    // were created under the old size-based naming (which could produce two
+    // "Claude 2"s) are renamed in place instead of being left as duplicates.
+    for (const [p, s] of sessions) {
+      if (s.groupId == null) continue;
+      try { await chrome.tabGroups.update(s.groupId, { title: s.label, color: s.color }); }
+      catch { s.groupId = null; }
     }
   })().catch(err => { restorePromise = null; throw err; });
   return restorePromise;
 }
 
+// Identity is derived from the PORT, which is unique per MCP server and stable
+// across service-worker restarts. Deriving it from sessions.size (the old way)
+// collided whenever the map was rebuilt — two concurrent sessions both computed
+// "Claude 2"/green and Chrome showed two identically named tab groups.
+const BASE_WS_PORT = 9876;
+function sessionIdentity(port) {
+  const idx = Math.max(0, (Number(port) || BASE_WS_PORT) - BASE_WS_PORT);
+  return { label: `Claude ${idx + 1}`, color: SESSION_COLORS[idx % SESSION_COLORS.length] };
+}
+
 function getSession(port) {
   if (!sessions.has(port)) {
-    const idx = sessions.size % SESSION_COLORS.length;
+    const { label, color } = sessionIdentity(port);
     sessions.set(port, {
       tabIds: new Set(),
       activeTabId: null,
       adopted: new Set(),
       groupId: null,
-      color: SESSION_COLORS[idx],
-      label: `Claude ${sessions.size + 1}`,
+      color,
+      label,
     });
   }
   return sessions.get(port);
@@ -119,9 +138,23 @@ async function addTabToSession(port, tabId) {
     }
 
     if (session.groupId === null) {
-      const groupId = await chrome.tabs.group({ tabIds: [...session.tabIds] });
-      session.groupId = groupId;
-      await chrome.tabGroups.update(groupId, {
+      // Adopt an existing group with this session's title before making a new one.
+      // After a service-worker restart the old group still exists in Chrome, and
+      // blindly creating another produced two identically named groups.
+      let existing = null;
+      try {
+        const found = await chrome.tabGroups.query({ title: session.label });
+        const claimed = new Set([...sessions.values()].map(s => s.groupId).filter(g => g != null));
+        existing = found.find(g => !claimed.has(g.id)) || null;
+      } catch {}
+      if (existing) {
+        session.groupId = existing.id;
+        try { await chrome.tabs.group({ tabIds: [tabId], groupId: existing.id }); } catch { session.groupId = null; }
+      }
+      if (session.groupId === null) {
+        session.groupId = await chrome.tabs.group({ tabIds: [...session.tabIds] });
+      }
+      await chrome.tabGroups.update(session.groupId, {
         title: session.label,
         color: session.color,
         collapsed: false,
@@ -754,6 +787,211 @@ async function clearFieldAttached(tabId) {
   await cdpSend(tabId, 'Input.dispatchKeyEvent', {
     type: 'keyUp', key: 'Backspace', code: 'Backspace',
   });
+}
+
+// ── Robust fill (v2.3) ─────────────────────────────────────────────────────
+// Replaces the old focus-then-type-then-read-by-selector flow, which could type
+// into whatever had focus at that instant and then read back through the ORIGINAL
+// selector — reporting a clean success while the text landed in a different field
+// (observed on Gmail: a subject value overwrote the To address). Everything here
+// operates on ONE element captured up front, tagged with a unique attribute, and
+// every step re-resolves that tag — including through shadow roots.
+
+const BMCP_TAG = 'data-bmcp-fill-target';
+
+// Single self-contained injected worker. MV3's extension CSP forbids `new Function`
+// in the service worker, and chrome.scripting does not serialize closures, so the
+// shadow-piercing resolver is declared inside the function that uses it and the
+// operation is selected by argument.
+function bmcpFillOp(op, selOrExpected, TAG, extra) {
+  const deepQ = (root, s) => {
+    let el = null;
+    try { el = root.querySelector(s); } catch (e) { return null; }
+    if (el) return el;
+    for (const n of root.querySelectorAll('*')) if (n.shadowRoot) { const f = deepQ(n.shadowRoot, s); if (f) return f; }
+    return null;
+  };
+  const walkAll = (root, out) => {
+    for (const e of root.querySelectorAll('*')) { out.push(e); if (e.shadowRoot) walkAll(e.shadowRoot, out); }
+    return out;
+  };
+  const resolve = (sel) => {
+    if (!sel) return null;
+    const rm = /^ref[_=](\d+)$/.exec(sel);
+    if (rm) { const e = window.__bmcpRefEls && window.__bmcpRefEls['ref_' + rm[1]]; return (e && e.isConnected) ? e : null; }
+    const tm = /^(\w+):text\((.+)\)$/.exec(sel);
+    if (tm || sel.startsWith('text=')) {
+      const needle = (tm ? tm[2] : sel.slice(5)).trim();
+      const want = tm ? tm[1].toUpperCase() : null;
+      const all = walkAll(document, []);
+      const m = all.filter(e => (!want || e.tagName === want) && (e.textContent || '').trim().includes(needle));
+      const inner = m.filter(e => !m.some(o => o !== e && e.contains && e.contains(o)));
+      return inner[0] || m[0] || null;
+    }
+    return deepQ(document, sel);
+  };
+  const readVal = (el) => el.isContentEditable ? (el.textContent || '') : (el.value != null ? el.value : '');
+  const tagged = () => deepQ(document, '[' + TAG + ']');
+
+  // Snapshot every editable field so collateral damage is detectable/reversible.
+  const snapshotFields = () => {
+    const out = [];
+    for (const e of walkAll(document, [])) {
+      const t = e.tagName;
+      if (t !== 'INPUT' && t !== 'TEXTAREA' && !e.isContentEditable) continue;
+      if (e.type === 'hidden' || e.type === 'password') continue;
+      out.push({ el: e, v: String(readVal(e)) });
+    }
+    return out;
+  };
+
+  if (op === 'locate') {
+    const el = resolve(selOrExpected);
+    if (!el) return { found: false };
+    window.__bmcpFieldSnapshot = snapshotFields();
+    try { el.scrollIntoView({ block: 'center', behavior: 'instant' }); } catch (e) {}
+    walkAll(document, []).forEach(n => { if (n.hasAttribute && n.hasAttribute(TAG)) n.removeAttribute(TAG); });
+    el.setAttribute(TAG, '1');
+    const before = readVal(el);
+    try { el.focus({ preventScroll: true }); } catch (e) { try { el.focus(); } catch (e2) {} }
+    const active = (el.getRootNode() && el.getRootNode().activeElement) || document.activeElement;
+    const r = el.getBoundingClientRect();
+    return {
+      found: true, isCE: !!el.isContentEditable, tag: el.tagName,
+      type: (el.type || '').toLowerCase(), before: String(before),
+      focused: active === el,
+      focus_landed_on: active === el ? null : ((active && (active.tagName + (active.name ? '[name=' + active.name + ']' : ''))) || 'none'),
+      x: r.x + r.width / 2, y: r.y + r.height / 2,
+      inShadow: el.getRootNode() !== document,
+    };
+  }
+
+  if (op === 'verify') {
+    const el = tagged();
+    if (!el) return { gone: true };
+    const expected = selOrExpected;
+    let now = String(readVal(el));
+    let repaired = false;
+    const collateral = [];
+    if (now !== expected) {
+      // The value is not where we aimed. If trusted keystrokes went somewhere else
+      // (focus moved after we checked), some OTHER field now holds our text — the
+      // Gmail failure, where a subject line overwrote the recipient. Undo it.
+      const snap = window.__bmcpFieldSnapshot || [];
+      for (const s of snap) {
+        if (!s.el || !s.el.isConnected || s.el === el) continue;
+        const cur = String(readVal(s.el));
+        if (cur === s.v) continue;
+        if (cur.includes(expected) || expected.includes(cur)) {
+          if (s.el.isContentEditable) s.el.textContent = s.v;
+          else {
+            const p = s.el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+            const dd = Object.getOwnPropertyDescriptor(p, 'value');
+            if (dd && dd.set) dd.set.call(s.el, s.v); else s.el.value = s.v;
+          }
+          s.el.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+          s.el.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+          collateral.push((s.el.name || s.el.id || s.el.tagName) + ' (restored)');
+        }
+      }
+    }
+    if (now !== expected) {
+      if (el.isContentEditable) {
+        el.focus();
+        el.textContent = '';
+        try { document.execCommand('insertText', false, expected); } catch (e) { el.textContent = expected; }
+      } else {
+        const proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+        const d = Object.getOwnPropertyDescriptor(proto, 'value');
+        if (d && d.set) d.set.call(el, expected); else el.value = expected;
+      }
+      el.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+      repaired = true;
+      now = String(readVal(el));
+    }
+    return { gone: false, value: now, repaired, collateral };
+  }
+
+  if (op === 'focuscheck') {
+    const el = tagged();
+    if (!el) return { focused: false };
+    const active = (el.getRootNode() && el.getRootNode().activeElement) || document.activeElement;
+    return { focused: active === el };
+  }
+
+  // 'settle' — final read after a tick, then drop the tag
+  const el = tagged();
+  if (!el) return { gone: true };
+  const v = String(readVal(el));
+  el.removeAttribute(TAG);
+  try { delete window.__bmcpFieldSnapshot; } catch (e) { window.__bmcpFieldSnapshot = null; }
+  return { gone: false, value: v };
+}
+
+async function fillElementDeep(tabId, selector, value) {
+  const inject = async (args) => {
+    const [r] = await chrome.scripting.executeScript({
+      target: { tabId }, world: 'MAIN', args, func: bmcpFillOp,
+    });
+    return r?.result;
+  };
+
+  // 1. Locate ONCE (shadow-piercing), tag it, focus it, report whether focus stuck.
+  const info = await inject(['locate', selector, BMCP_TAG, null]);
+
+  if (!info || !info.found) return { ok: false, error: 'Element not found: ' + selector };
+
+  // 2. Trusted typing ONLY when focus verifiably landed on our element. Otherwise
+  //    keystrokes would go to whatever else holds focus — the Gmail failure.
+  let method = null, typedTrusted = false;
+  if (info.focused && !info.isCE) {
+    try {
+      await debuggerAttach(tabId);
+      // Re-confirm focus immediately before typing — the gap between the focus
+      // call and the keystrokes is exactly where a focus-stealing page diverts them.
+      const stillFocused = await inject(['focuscheck', null, BMCP_TAG, null]);
+      if (!stillFocused?.focused) throw new Error('focus drifted before typing');
+      await cdpSend(tabId, 'Input.dispatchKeyEvent', { type: 'keyDown', key: 'a', code: 'KeyA', modifiers: SELECT_ALL_MODS });
+      await cdpSend(tabId, 'Input.dispatchKeyEvent', { type: 'keyUp', key: 'a', code: 'KeyA' });
+      await cdpSend(tabId, 'Input.insertText', { text: value });
+      typedTrusted = true;
+      method = 'trusted-input';
+    } catch { /* fall through to setter */ }
+  }
+
+  // 3. Read back FROM THE TAGGED ELEMENT (never the selector) and repair if needed.
+  const verify = await inject(['verify', value, BMCP_TAG, typedTrusted]);
+
+  if (verify?.gone) return { ok: false, error: 'Element left the DOM during fill (page re-rendered) — re-read the page and retry.' };
+  if (verify?.repaired) method = typedTrusted ? 'trusted-input+setter-repair' : 'native-setter';
+
+  // 4. Framework-acceptance check: reactive frameworks (LWC, React) can render the
+  //    value and still not record it in component state, so a later save persists
+  //    blank. Re-read after a tick; if the framework reverted it, say so.
+  await new Promise(r => setTimeout(r, 90));
+  const settled = await inject(['settle', null, BMCP_TAG, null]);
+
+  const finalValue = settled?.gone ? null : settled.value;
+  const accepted = finalValue === value;
+  const redacted = info.type === 'password';
+  const show = (v) => v == null ? null : (redacted ? `[${v.length} chars]` : String(v).slice(0, 120));
+
+  return {
+    ok: accepted,
+    method: method || 'native-setter',
+    value_before: show(info.before),
+    value_after: show(finalValue),
+    focus_verified: !!info.focused,
+    ...(info.inShadow ? { shadow_dom: true } : {}),
+    ...(info.focused ? {} : { focus_drift: info.focus_landed_on }),
+    ...(verify?.collateral?.length ? { collateral_restored: verify.collateral } : {}),
+    ...(accepted ? {} : {
+      error: finalValue === '' || finalValue == null
+        ? 'Value did not persist — the framework reverted it after input (common on Salesforce LWC / React controlled inputs). The field will likely save blank.'
+        : 'Field holds a different value than requested (input mask or validator transformed it).',
+    }),
+  };
 }
 
 async function debuggerFill(tabId, selector, value) {
@@ -2412,6 +2650,13 @@ async function dispatch(port, method, params) {
     }
 
     case 'fill': {
+      const tab = await getSessionTab(port, true);
+      if (tab.url.startsWith('chrome://')) throw new Error('Cannot interact with chrome:// pages');
+      if (typeof params.value !== 'string') return { ok: false, error: 'value (string) required' };
+      return await fillElementDeep(tab.id, params.selector, params.value);
+    }
+
+    case 'fill_legacy': {
       const tab = await getSessionTab(port);
       if (tab.url.startsWith('chrome://')) throw new Error('Cannot interact with chrome:// pages');
       const parsed = parseSelector(params.selector);
@@ -2865,6 +3110,125 @@ async function dispatch(port, method, params) {
       }
       const verdict = await debuggerClick(tab.id, params.x, params.y);
       return { ok: verdict.landed, clicked_at: { x: params.x, y: params.y }, click_path: verdict.path, verified: verdict.landed };
+    }
+
+    case 'submit': {
+      // Click a submit control and REPORT WHAT ACTUALLY HAPPENED.
+      // From a real transcript: click "Sign In" returned {ok:true} three times
+      // across 11 minutes while the login never happened — the caller had no way
+      // to tell "submitted", "rejected with errors", and "nothing happened" apart,
+      // so it burned 20s waits and eventually asked the user to click it himself.
+      const tab = await getSessionTab(port, true);
+      if (tab.url.startsWith('chrome://')) throw new Error('Cannot interact with chrome:// pages');
+      const timeout = Math.min(60000, params.timeout || 15000);
+
+      const snap = async () => {
+        const [r] = await chrome.scripting.executeScript({
+          target: { tabId: tab.id }, world: 'MAIN',
+          args: [params.expect_text || null, params.expect_gone || null],
+          func: (expectText, expectGone) => {
+            const vis = (el) => {
+              const r = el.getBoundingClientRect(); if (r.width <= 0 || r.height <= 0) return false;
+              const st = getComputedStyle(el);
+              return st.visibility !== 'hidden' && st.display !== 'none';
+            };
+            const body = (document.body?.innerText || '').replace(/\s+/g, ' ').trim();
+            const errs = [...document.querySelectorAll('[role="alert"], [aria-invalid="true"], .error, .invalid-feedback, .help-block, [class*="error" i]:not(input):not(select):not(textarea):not(form)')]
+              .filter(vis).map(e => (e.textContent || '').trim().replace(/\s+/g, ' ')).filter(t => t && t.length < 200);
+            const low = body.toLowerCase();
+            return {
+              url: location.href, title: document.title, len: body.length, sig: body.slice(0, 300),
+              errors: [...new Set(errs)].slice(0, 8),
+              hasExpect: expectText ? low.includes(String(expectText).toLowerCase()) : null,
+              hasGone: expectGone ? low.includes(String(expectGone).toLowerCase()) : null,
+              busy: !!document.querySelector('[aria-busy="true"], .spinner, [class*="spinner" i], [class*="loading" i]'),
+            };
+          },
+        });
+        return r?.result;
+      };
+
+      const before = await snap();
+      if (!before) return { ok: false, error: 'Could not read page state (still loading?)' };
+
+      // Locate the submit control if the caller did not name one.
+      let selector = params.selector;
+      if (!selector) {
+        const [f] = await chrome.scripting.executeScript({
+          target: { tabId: tab.id }, world: 'MAIN',
+          func: () => {
+            if (!window.__bmcpRefEls) { window.__bmcpRefEls = {}; window.__bmcpRefSeq = 0; }
+            const vis = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+            const WORDS = /^(sign in|signin|log in|login|submit|continue|next|save|apply|send|confirm|pay|register|create account|finish|done|proceed)/i;
+            const cands = [...document.querySelectorAll('button[type="submit"], input[type="submit"], button, [role="button"]')].filter(vis).filter(el => !el.disabled);
+            const scored = cands.map(el => {
+              const t = (el.textContent || el.value || el.getAttribute('aria-label') || '').trim();
+              let s = 0;
+              if ((el.type || '') === 'submit') s += 40;
+              if (WORDS.test(t)) s += 50;
+              if (el.closest('form')) s += 15;
+              return { el, t, s };
+            }).filter(x => x.s > 0).sort((a, b) => b.s - a.s);
+            if (!scored.length) return null;
+            const el = scored[0].el;
+            const key = el.__bmcpRef && window.__bmcpRefEls[el.__bmcpRef] === el
+              ? el.__bmcpRef : 'ref_' + (++window.__bmcpRefSeq);
+            try { Object.defineProperty(el, '__bmcpRef', { value: key, configurable: true }); } catch {}
+            window.__bmcpRefEls[key] = el;
+            return { ref: key, text: scored[0].t.slice(0, 40) };
+          },
+        });
+        if (!f?.result) return { ok: false, error: 'No submit control found — pass selector explicitly.' };
+        selector = f.result.ref;
+      }
+
+      const clickRes = await dispatch(port, 'click', { selector });
+      if (clickRes && clickRes.ok === false) {
+        return { ok: false, outcome: 'click_failed', click: clickRes, error: clickRes.error };
+      }
+
+      // Poll for a REAL outcome instead of a blind fixed wait.
+      const started = Date.now();
+      let last = before;
+      while (Date.now() - started < timeout) {
+        await new Promise(r => setTimeout(r, 350));
+        let now;
+        try { now = await snap(); } catch { now = null; }
+        if (!now) { // injection failed => almost certainly a navigation in flight
+          await new Promise(r => setTimeout(r, 500));
+          const t2 = await chrome.tabs.get(tab.id).catch(() => null);
+          if (t2 && t2.url !== before.url) {
+            return { ok: true, outcome: 'navigated', url_before: before.url, url_after: t2.url, waited_ms: Date.now() - started, click: clickRes };
+          }
+          continue;
+        }
+        last = now;
+        if (now.url !== before.url) {
+          return { ok: true, outcome: 'navigated', url_before: before.url, url_after: now.url, title: now.title, waited_ms: Date.now() - started, click: clickRes };
+        }
+        const newErrors = now.errors.filter(e => !before.errors.includes(e));
+        if (newErrors.length) {
+          return { ok: false, outcome: 'validation_error', errors: newErrors, url: now.url, waited_ms: Date.now() - started, click: clickRes,
+            hint: 'The form was submitted and REJECTED. Fix these fields (browser_form_state shows which are invalid) and submit again.' };
+        }
+        if (params.expect_text && now.hasExpect && !before.hasExpect) {
+          return { ok: true, outcome: 'expected_text', matched: params.expect_text, url: now.url, waited_ms: Date.now() - started, click: clickRes };
+        }
+        if (params.expect_gone && before.hasGone && !now.hasGone) {
+          return { ok: true, outcome: 'expected_gone', url: now.url, waited_ms: Date.now() - started, click: clickRes };
+        }
+        if (!now.busy && now.sig !== before.sig && Math.abs(now.len - before.len) > Math.max(80, before.len * 0.12)) {
+          return { ok: true, outcome: 'page_changed', url: now.url, waited_ms: Date.now() - started, click: clickRes,
+            note: 'Content changed substantially but no navigation and no expected text — verify it is the state you wanted.' };
+        }
+      }
+      return {
+        ok: false, outcome: 'no_change', url: last.url, waited_ms: Date.now() - started, click: clickRes,
+        page_errors: last.errors,
+        hint: clickRes?.verified === false
+          ? 'The click never reached the page (verified:false). The control may be covered by an overlay or in an iframe — try browser_dismiss_overlays, browser_list_frames, or browser_click_xy from a screenshot.'
+          : 'The click landed but the page did not react within the timeout: the control may need a different trigger (press Enter in the field), the form may be blocked by hidden/invalid fields (check browser_form_state), or the request is slow (check browser_network_log).',
+      };
     }
 
     case 'network_log': {

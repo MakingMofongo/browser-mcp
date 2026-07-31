@@ -62,6 +62,19 @@ export const TOOLS = [
     },
   },
   {
+    name: 'browser_submit',
+    description: 'Submit a form and report WHAT ACTUALLY HAPPENED — the single most valuable tool for logins and applications. Clicks the submit control (auto-detected if you do not name one), then watches the page and returns a definite outcome: "navigated" (went somewhere new), "validation_error" (submitted and REJECTED, with the exact error messages), "expected_text" (your success text appeared), "page_changed", or "no_change" with a diagnosis of why. Use this INSTEAD of click-then-wait: a plain click cannot tell success from silent no-op, which is how one real login burned 11 minutes across three clicks that all reported ok.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        selector: { type: 'string', description: 'Submit control (CSS, text=, or ref_N). Omit to auto-detect the best submit button.' },
+        expect_text: { type: 'string', description: 'Text that should APPEAR on success, e.g. "Dashboard", "Application submitted"' },
+        expect_gone: { type: 'string', description: 'Text that should DISAPPEAR on success, e.g. "Sign In"' },
+        timeout: { type: 'number', description: 'Max ms to watch for an outcome (default 15000)' },
+      },
+    },
+  },
+  {
     name: 'browser_network_log',
     description: 'Read the HTTP requests this page made (XHR, fetch, documents, images) with method, URL, status, MIME type and duration. Recording starts the moment the debugger attaches, so the log is already there when you ask — unlike browser_wait_for_network, which only waits for a single future request. Filter with url_pattern, or only_failed:true to see just 4xx/5xx/network errors.',
     inputSchema: {
