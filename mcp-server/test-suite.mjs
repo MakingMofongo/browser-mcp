@@ -23,6 +23,13 @@ const send = (method, params = {}, timeoutMs = 90000) => new Promise((resolve, r
   ws.send(JSON.stringify({ id, method, params }));
 });
 
+// Run a group so a throw inside it is reported as that group failing, rather than
+// aborting the suite and hiding every check that follows.
+async function group(name, fn) {
+  try { await fn(); }
+  catch (e) { check(name + ' (threw)', false, String(e?.message || e).slice(0, 200)); }
+}
+
 function check(name, cond, detail = '') {
   results.push({ name, pass: !!cond });
   console.log(`${cond ? 'PASS' : 'FAIL'}  ${name}${detail ? '  — ' + String(detail).slice(0, 120) : ''}`);
@@ -207,6 +214,79 @@ async function suite() {
     paused.paused_at_row === 0 && paused.pending === 2, JSON.stringify({ at: paused.paused_at_row, pending: paused.pending }));
 
   await send('record', { action: 'delete', name: '__suite' }).catch(() => {});
+
+
+  await group('hardening', async () => {
+  // ── Hardening: decoys, mutation between read and act, refusals, pinned bugs ──
+  // Every fixture below carries a twin. A success-only assertion cannot tell
+  // "filled the right field" from "filled a field", and both bugs found in review
+  // were of the second kind.
+
+  // Decoy: two identical sections, act on one, assert the twin is untouched.
+  await send('navigate', { url: `${BASE}/login` });
+  await setup(`document.body.insertAdjacentHTML('beforeend',
+    '<div id=twins><fieldset><legend>Employer 1</legend><input name=role aria-label="Job title"></fieldset>' +
+    '<fieldset><legend>Employer 2</legend><input name=role aria-label="Job title"></fieldset></div>'); 'ok'`);
+  const twinRead = await send('read_page', {});
+  const twinRefs = [...twinRead.outline.matchAll(/textbox "Job title"[^\[]*\[(ref_\d+)\]/g)].map(m => m[1]);
+  await send('fill', { selector: twinRefs[1], value: 'SECOND ONLY' });
+  const twinVals = await send('execute_script', { code: "[...document.querySelectorAll('#twins input')].map(i=>i.value)" });
+  check('filling one of two identical fields leaves the twin empty',
+    twinVals.result[0] === '' && twinVals.result[1] === 'SECOND ONLY', JSON.stringify(twinVals.result));
+
+  // Mutation between read and act: inserting a row ABOVE the target shifts every
+  // index, which is exactly where position-based re-identification lands wrong.
+  await send('navigate', { url: `${BASE}/login` });
+  await setup(`document.body.insertAdjacentHTML('beforeend',
+    '<div id=rows><div aria-label="Row B"><input name=cell aria-label="Cell"></div></div>'); 'ok'`);
+  const beforeRead = await send('read_page', {});
+  const cellRef = (beforeRead.outline.match(/textbox "Cell"[^\[]*\[(ref_\d+)\]/) || [])[1];
+  await setup(`document.getElementById('rows').insertAdjacentHTML('afterbegin',
+    '<div aria-label="Row A"><input name=cell aria-label="Cell"></div>'); 'inserted above'`);
+  const afterInsert = await send('fill', { selector: cellRef, value: 'BELONGS TO B' });
+  const rowVals = await send('execute_script', { code: "[...document.querySelectorAll('#rows input')].map(i=>i.value)" });
+  // The original element still exists, so the ref must resolve to it — the newly
+  // inserted row is now index 0 and must not receive the value.
+  check('a row inserted above the target does not steal the write',
+    rowVals.result[0] === '' && rowVals.result[1] === 'BELONGS TO B', JSON.stringify(rowVals.result) + ' ' + (afterInsert.error || ''));
+
+  // Pinned bug: a consent banner whose Accept is type=submit inside a form. The
+  // guard that protects workflow modals must not refuse this one.
+  await send('navigate', { url: `${BASE}/login` });
+  await setup(`document.body.insertAdjacentHTML('beforeend',
+    '<div role=dialog aria-label="Cookie notice"><form><p>We use cookies for tracking</p>' +
+    '<button type=submit>Accept all</button><button type=submit>Reject all</button></form></div>'); 'ok'`);
+  const consent = await send('dismiss_overlays', {});
+  check('pinned: a consent banner with a submit-typed Accept is still dismissed',
+    consent.dismissed?.some(d => d.method === 'consent-reject'), JSON.stringify(consent.dismissed || consent.skipped));
+
+  // Pinned bug: several identical actions must come back ambiguous, with context.
+  await send('navigate', { url: `${BASE}/login` });
+  await setup(`document.body.insertAdjacentHTML('beforeend',
+    '<section aria-label="Step 1"><button>Continue</button></section>' +
+    '<section aria-label="Step 2"><button>Continue</button></section>' +
+    '<section aria-label="Step 3"><button>Continue</button></section>'); 'ok'`);
+  const many = await send('find', { query: 'continue button' });
+  check('pinned: identical actions are reported ambiguous with their context',
+    many.ambiguous === true && many.matches?.filter(m => m.name === 'Continue').length >= 3 &&
+    many.matches.some(m => /Step 2/.test(m.where || '')),
+    JSON.stringify(many.matches?.slice(0, 2).map(m => m.where)));
+
+  // Timing: a target that only exists after the page has settled must not be
+  // treated as absent by a single look.
+  await send('navigate', { url: `${BASE}/login` });
+  await setup(`setTimeout(() => { document.body.insertAdjacentHTML('beforeend',
+    '<div id=late><input name=lateField aria-label="Late field"></div>'); }, 700); 'armed'`);
+  const lateWait = await send('wait', { selector: '#late input', timeout: 5000 });
+  check('an element rendered after the page settles is still found',
+    lateWait.found === true && lateWait.waited_ms > 400, `waited=${lateWait.waited_ms}`);
+
+  // Refusal must stay a refusal: verification that cannot run has to stop the row,
+  // not pass silently.
+  const badVerify = await send('verify_data', { expect: { 'No Such Field': 'x' } });
+  check('verify_data reports a field it cannot find rather than passing',
+    badVerify.ok === false && badVerify.mismatched?.[0]?.found === null, JSON.stringify(badVerify.mismatched?.[0]));
+  });
 
   // ── save prints a page to PDF ───────────────────────────────────────────
   await send('navigate', { url: `${BASE}/login` });
