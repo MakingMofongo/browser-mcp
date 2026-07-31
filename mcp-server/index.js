@@ -31,6 +31,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const repoDir = dirname(__dirname); // parent of mcp-server/
 
 let extensionUpdated = false;
+let channelVersion = null;
 
 // Keep the installed extension current from the hosted channel. This is the path
 // that works for unpacked installs, which Chrome never auto-updates, and it needs
@@ -56,6 +57,10 @@ async function updateExtensionFromChannel() {
   try {
     const meta = await fetch(`${CHANNEL}/version.json`, { signal: ctl.signal }).then(r => r.ok ? r.json() : null);
     if (!meta?.version || !Array.isArray(meta.files)) return;
+    // Remembered so health can say when the browser is running something older
+    // than what the channel offers, which is what a stalled auto-update looks
+    // like from the outside: everything answers, nothing is current.
+    channelVersion = meta.version;
     if (cmp(meta.version, installed) <= 0) {
       process.stderr.write(`[MCP] Extension up to date (${installed})\n`);
       return;
@@ -528,6 +533,27 @@ mcpServer.setRequestHandler(CallToolRequestSchema, async (request) => {
                     method === 'save' ? 90000 :
                     method === 'submit' ? (args?.timeout || 15000) + 20000 : 30000;
     const result = await sendToExtension(method, args || {}, timeout);
+
+    // An install that has stopped updating is otherwise silent — it answers every
+    // command normally while running code from before every fix, and the only sign
+    // is behaviour nobody can account for. One machine here sat several dozen
+    // versions behind for a week without anything saying so, which is the whole
+    // reason this is here. Said once, on the call people make when something seems
+    // wrong, rather than logged to a stream nobody reads.
+    if (method === 'health' && result && typeof result === 'object' && channelVersion && result.extension_version) {
+      const older = (a, b) => {
+        const pa = String(a).split('.').map(Number), pb = String(b).split('.').map(Number);
+        for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+          const d = (pa[i] || 0) - (pb[i] || 0);
+          if (d) return d < 0;
+        }
+        return false;
+      };
+      if (older(result.extension_version, channelVersion)) {
+        result.update_available = `${result.extension_version} is running; ${channelVersion} is published`;
+        result.update_note = 'This browser is not picking up updates. Chrome installs from the channel on its own schedule and needs to have been restarted since the policy was set; an unpacked copy is refreshed by this server at startup, which only helps if this server is current too. Until one of those happens the browser is running older code than the tests are written against.';
+      }
+    }
 
     // browser_save returns raw bytes; write them to disk and hand back the path.
     // Base64 in the transcript would be unreadable and enormous.

@@ -7688,6 +7688,12 @@ async function dispatchCore(port, method, params) {
         session: { label: session.label, color: session.color, tabs: session.tabIds.size },
         debugger_attached: debuggerAttachedReal,
         scripting_works: scriptingOk,
+        // Which build is actually running. An install that stops updating is
+        // otherwise silent: it keeps answering normally while running code from
+        // before every fix, and the only clue is behaviour nobody can account for.
+        // One machine here sat on a version from before a week of work without
+        // anything ever saying so.
+        extension_version: chrome.runtime.getManifest().version,
         ready: scriptingOk,
         // Whether real input can be delivered to this window at all. It changes
         // which path every click and keystroke takes, and it is the difference
