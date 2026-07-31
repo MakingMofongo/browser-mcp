@@ -278,6 +278,19 @@ async function suite() {
     const sw = await send('switch_tab', { tab_id: nt.id });
     check('switch_tab makes that tab current', sw.id === nt.id, String(sw.id));
 
+    // A browser synthesizes dblclick from two press/release pairs, and does not
+    // do so for a window that is not in front — so this fired nothing at all
+    // while reporting success. Assert the event, not the call.
+    await send('navigate', { url: `${BASE}/login` });
+    await setup(`window.__dblSeen=0; document.querySelector('h2').addEventListener('dblclick',()=>window.__dblSeen++); 1`);
+    const dbl = await send('double_click', { selector: 'h2' });
+    const seen = await send('execute_script', { code: 'window.__dblSeen' });
+    check('double_click fires a real dblclick on the page',
+      dbl.ok === true && seen.result === 1, JSON.stringify({ path: dbl.path, seen: seen.result }));
+
+    const hov = await send('hover', { selector: 'h2', duration: 50 });
+    check('hover reports which path delivered it', hov.ok === true && !!hov.path, hov.path);
+
     await send('navigate', { url: `${BASE}/drag_and_drop` });
     const dragged = await send('drag', { from_selector: '#column-a', to_selector: '#column-b' });
     const order = await send('execute_script', { code: "[...document.querySelectorAll('#columns .column header')].map(h=>h.textContent)" });
