@@ -282,6 +282,23 @@ async function suite() {
 
     await second.call('navigate', { url: `${BASE}/login` });
     const theirs = await second.call('health', {});
+
+    // The held value is the sharpest case: this slot exists to move a credential
+    // between pages without it entering the conversation, so one session being
+    // able to paste or measure what another is holding defeats the purpose.
+    await send('navigate', { url: `${BASE}/login` });
+    await setup(`document.querySelector('#username').value='SESSION-ONE-SECRET'; 1`);
+    await send('clipboard', { action: 'copy', selector: '#username' });
+    const theirSlot = await second.call('clipboard', { action: 'inspect' });
+    check('one session cannot see what another is holding',
+      theirSlot.holding === false && theirSlot.length === 0, JSON.stringify(theirSlot));
+    const theirPaste = await second.call('clipboard', { action: 'paste', selector: '#username' });
+    const leaked = await second.call('execute_script', { code: "document.querySelector('#username').value" });
+    check('one session cannot paste what another copied',
+      theirPaste.ok === false && leaked.result !== 'SESSION-ONE-SECRET', JSON.stringify({ ok: theirPaste.ok, got: leaked.result }));
+    const mineStill = await send('clipboard', { action: 'inspect' });
+    check('the holding session still has its own value',
+      mineStill.holding === true && mineStill.length === 18, JSON.stringify(mineStill));
     check('each session gets its own call history rather than a shared one',
       mine.recent?.calls > 10 && theirs.recent?.calls <= 3,
       JSON.stringify({ mine: mine.recent?.calls, theirs: theirs.recent?.calls }));
