@@ -400,13 +400,17 @@ async function debuggerAttach(tabId) {
   // different extension" does not say WHICH page — so working out how a session
   // came to be pointed at one meant guessing, twice, wrongly. The URL is the whole
   // answer and it was one call away.
+  // Placed before the Chrome message rather than after it. Every layer that prints
+  // an error truncates it somewhere, and the first version of this put the URL at
+  // the end — where it was cut off by the very log that needed it, leaving the same
+  // unanswerable message as before. What identifies the problem goes first.
   let what = '';
   try {
     const t = await chrome.tabs.get(tabId);
-    what = ` The tab is at ${t.url || t.pendingUrl || '(no readable url)'}${t.title ? ` — "${t.title}"` : ''}.`;
-  } catch { what = ' The tab no longer exists.'; }
+    what = `${t.url || t.pendingUrl || '(no readable url)'}${t.title ? ` "${t.title}"` : ''}`;
+  } catch { what = 'tab no longer exists'; }
   throw new Error(
-    `Debugger attach failed after 6 force-grab attempts (tab ${tabId}). Last: ${lastMsg}.${what} ` +
+    `Debugger attach failed: tab ${tabId} is at ${what}. Chrome said: ${lastMsg}. ` +
     `Chrome allows ONE debugger client per tab — check for another automation extension ` +
     `(e.g. Claude in Chrome) or an open DevTools window on this tab, then call browser_reattach_debugger. ` +
     `Note: interactive tools still work via the synthetic fallback; only isTrusted=true is lost.`

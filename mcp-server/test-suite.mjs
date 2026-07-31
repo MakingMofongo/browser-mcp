@@ -44,12 +44,18 @@ const send = (method, params = {}, timeoutMs = 90000) => new Promise((resolve, r
 // aborting the suite and hiding every check that follows.
 async function group(name, fn) {
   try { await fn(); }
-  catch (e) { check(name + ' (threw)', false, String(e?.message || e).slice(0, 200)); }
+  catch (e) { check(name + ' (threw)', false, String(e?.message || e)); }
 }
 
 function check(name, cond, detail = '') {
   results.push({ name, pass: !!cond });
-  console.log(`${cond ? 'PASS' : 'FAIL'}  ${name}${detail ? '  — ' + String(detail).slice(0, 120) : ''}`);
+  // A passing check's detail is a courtesy and 120 characters of it is plenty. A
+  // failing one is the entire reason anybody is reading this, and cutting it to the
+  // same length has now twice removed the part that said what went wrong — once
+  // leaving "{}", once cutting off a URL that had been added specifically to answer
+  // the question. Failures get room.
+  const room = cond ? 120 : 700;
+  console.log(`${cond ? 'PASS' : 'FAIL'}  ${name}${detail ? '  — ' + String(detail).slice(0, room) : ''}`);
 }
 
 // Put arbitrary markup on a real page so a case can be built deterministically.
@@ -132,6 +138,98 @@ async function suite() {
     h.attachShadow({mode:'open'}).innerHTML='<input name=shadowField>'; 'ok'`);
   const shadowFill = await send('fill', { selector: 'input[name=shadowField]', value: 'INSIDE' });
   check('fill reaches inside a shadow root', shadowFill.ok === true && shadowFill.shadow_dom === true, shadowFill.error || '');
+
+  // ── a page whose CSP forbids eval ───────────────────────────────────────
+  // Gmail's constraint, reproduced locally. Both scripting worlds refuse string code
+  // here — ISOLATED on the extension's own policy, MAIN on the page's — leaving the
+  // debugger as the only path that works. That fallback has been in the code for
+  // weeks with nothing exercising it, because the only page anyone had to test it
+  // against was one you have to log into.
+  await group('a page whose CSP forbids eval', async () => {
+    await send('navigate', { url: `${BASE}/csp_eval` });
+
+    const secret = await send('execute_script', { code: 'window.__pageSecret' });
+    check('execute_script still reads page state under a no-eval CSP',
+      secret.result === 'SECRET-42', `${JSON.stringify(secret.result)} via ${secret.method}`);
+
+    const filled = await send('fill', { selector: '#field', value: 'CSP OK' });
+    const back = await send('execute_script', { code: "document.querySelector('#field').value" });
+    check('fill works under a no-eval CSP', filled.ok === true && back.result === 'CSP OK',
+      `${filled.ok} / ${JSON.stringify(back.result)}`);
+  });
+
+  // ── reading a page that is itself an error ──────────────────────────────
+  // An error page is a page. Throwing on one turns "the site returned 503" into a
+  // tool fault, and the run then reports a broken tool instead of the thing that
+  // actually happened — which is exactly what you need to read when a portal is
+  // having a bad day.
+  await group('error pages can still be read', async () => {
+    await send('navigate', { url: `${BASE}/server_error` });
+    const pc = await send('get_page_content', {});
+    check('get_page_content reads a 503 page instead of failing',
+      pc.ok !== false && /503|Service Temporarily Unavailable/i.test(pc.content || ''),
+      `${String(pc.content || pc.error || '').slice(0, 70)}`);
+    const rp = await send('read_page', {});
+    check('read_page reads a 503 page instead of failing',
+      rp.ok !== false && /503|unavailable/i.test(JSON.stringify(rp).slice(0, 2000)),
+      String(rp.error || 'read').slice(0, 70));
+  });
+
+  // ── a framework that rejects the write must not read as success ─────────
+  // The code that notices this has been in place for a while with nothing
+  // exercising it, which is the same as not knowing whether it works. A field that
+  // reverts saves blank, and a fill that returns ok on one is how an application
+  // gets submitted with an empty degree field.
+  await group('a controlled field that reverts is reported, not confirmed', async () => {
+    await send('navigate', { url: `${BASE}/controlled` });
+
+    const free = await send('fill', { selector: '#free', value: 'STAYS' });
+    const freeVal = await send('execute_script', { code: "document.querySelector('#free').value" });
+    check('an ordinary field fills and is confirmed',
+      free.ok === true && freeVal.result === 'STAYS', `${free.ok} / ${freeVal.result}`);
+
+    const ctrl = await send('fill', { selector: '#ctrl', value: 'WILL BE REVERTED' });
+    const ctrlVal = await send('execute_script', { code: "document.querySelector('#ctrl').value" });
+    check('a field the framework reverts does not come back ok',
+      ctrl.ok !== true && ctrlVal.result === '',
+      `ok=${ctrl.ok} value=${JSON.stringify(ctrlVal.result)} error=${String(ctrl.error || '').slice(0, 80)}`);
+    check('and the report says the value did not persist',
+      /persist|revert/i.test(JSON.stringify(ctrl)),
+      String(ctrl.error || ctrl.warning || '').slice(0, 110));
+  });
+
+  // ── shadow DOM as component libraries actually build it ─────────────────
+  // One open root one level deep is the easy case. The portals this drives nest
+  // hosts several deep, and some libraries use closed roots that page script cannot
+  // reach at all — where the only thing that matters is that a failure says so
+  // rather than reporting a write nobody made.
+  await group('nested and closed shadow roots', async () => {
+    await send('navigate', { url: `${BASE}/shadow` });
+
+    const deepFill = await send('fill', { selector: '#deep', value: 'THREE DEEP' });
+    const deepRead = await send('execute_script', {
+      code: `document.querySelector('#lvl1').shadowRoot.querySelector('#lvl2').shadowRoot
+               .querySelector('#lvl3').shadowRoot.querySelector('#deep').value`,
+    });
+    check('fill reaches an input three shadow roots down',
+      deepFill.ok === true && deepRead.result === 'THREE DEEP', `${deepFill.ok} / ${JSON.stringify(deepRead.result)}`);
+
+    const deepClick = await send('click', { selector: '#deepbtn' });
+    const clicked = await send('execute_script', { code: "document.querySelector('#clicked').textContent" });
+    check('click reaches a button three shadow roots down',
+      deepClick.ok === true && clicked.result === 'clicked', `${deepClick.ok} / ${clicked.result}`);
+
+    // A closed root is not reachable from page script by design. Whether this tool
+    // can reach it is less important than what it says when it cannot: a write that
+    // did not happen must not come back ok.
+    const closedFill = await send('fill', { selector: '#hidden', value: 'SHOULD NOT CLAIM' });
+    const closedRead = await send('execute_script', { code: 'window.__readClosed()' });
+    const wroteIt = closedRead.result === 'SHOULD NOT CLAIM';
+    check('a closed shadow root is either written or reported, never falsely confirmed',
+      wroteIt ? closedFill.ok === true : closedFill.ok !== true,
+      wroteIt ? 'reached into a closed root and said so'
+              : `did not reach it and reported ok=${closedFill.ok}: ${String(closedFill.error || '').slice(0, 90)}`);
+  });
 
   // ── refs re-identify after the framework replaces the node ──────────────
   await send('navigate', { url: `${BASE}/login` });
@@ -1467,7 +1565,9 @@ async function suite() {
   await send('navigate', { url: `${BASE}/login` });
   const pdf = await send('save', { mode: 'pdf' });
   const magic = pdf.data ? Buffer.from(pdf.data.slice(0, 8), 'base64').toString('latin1') : '';
-  check('save produces a real PDF', pdf.ok === true && magic.startsWith('%PDF'), `${pdf.bytes} bytes`);
+  check('save produces a real PDF', pdf.ok === true && magic.startsWith('%PDF'),
+    pdf.ok === true ? `${pdf.bytes} bytes, magic ${JSON.stringify(magic)}`
+                    : `ok=${pdf.ok} error=${pdf.error || '(none given)'} keys=${Object.keys(pdf).join(',')}`);
 
   // ── teardown: closing every tab must not end the session ────────────────
   const tabs = await send('list_tabs', {});

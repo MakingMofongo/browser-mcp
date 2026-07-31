@@ -223,6 +223,56 @@ export function startFixtures() {
           res.writeHead(200, { 'content-type': 'application/json' });
           return res.end(JSON.stringify({ tag: q.get('tag') || 'bulk', pad: 'x'.repeat(bytes) }));
         }
+        // Shadow DOM as component libraries actually build it. The suite covered one
+        // open root one level deep, which is the easy case and the rare one — the
+        // portals this is used against nest hosts several deep, and some libraries
+        // use closed roots that page script cannot reach at all. A closed root is
+        // here to check the honest answer, not to demand it work.
+        case '/shadow': return html(page('Shadow', `
+          <div id="lvl1"></div>
+          <div id="closedhost"></div>
+          <p id="clicked">not clicked</p>
+          <script>
+            const l1 = document.querySelector('#lvl1').attachShadow({ mode: 'open' });
+            l1.innerHTML = '<div id="lvl2"></div>';
+            const l2 = l1.querySelector('#lvl2').attachShadow({ mode: 'open' });
+            l2.innerHTML = '<div id="lvl3"></div>';
+            const l3 = l2.querySelector('#lvl3').attachShadow({ mode: 'open' });
+            l3.innerHTML = '<label for="deep">Deep field</label><input id="deep" name="deepField">' +
+                           '<button id="deepbtn" type="button">Deep button</button>';
+            l3.querySelector('#deepbtn').addEventListener('click', () => {
+              document.querySelector('#clicked').textContent = 'clicked';
+            });
+            const closed = document.querySelector('#closedhost').attachShadow({ mode: 'closed' });
+            closed.innerHTML = '<input id="hidden" name="closedField">';
+            window.__readClosed = () => closed.querySelector('#hidden').value;
+          </script>`));
+        // A controlled input, the way Salesforce LWC and React controlled components
+        // behave when a write bypasses their model: the DOM takes the value, the
+        // framework puts its own back on the next tick, and anything that checked
+        // immediately saw a success. Fields filled this way save blank, which is the
+        // failure that has actually cost submitted applications.
+        case '/controlled': return html(page('Controlled', `
+          <label for="free">Free field</label><input id="free" name="free">
+          <label for="ctrl">Controlled field</label><input id="ctrl" name="ctrl">
+          <script>
+            const ctrl = document.querySelector('#ctrl');
+            ctrl.addEventListener('input', () => { setTimeout(() => { ctrl.value = ''; }, 0); });
+          </script>`));
+        // Gmail's constraint, reproduced locally: a policy with no unsafe-eval and
+        // Trusted Types required, which is what stops new Function and eval in both
+        // scripting worlds. The debugger path is the only one that survives it, and
+        // whether it does has until now only been reasoned about — against a site
+        // nobody can put in a test.
+        case '/csp_eval': {
+          res.writeHead(200, {
+            'content-type': 'text/html; charset=utf-8',
+            'content-security-policy': "default-src 'self'; script-src 'self' 'unsafe-inline'; require-trusted-types-for 'script'",
+          });
+          return res.end(page('Strict CSP', `
+            <h3>Strict CSP</h3><input id="field" name="field">
+            <script>window.__pageSecret = 'SECRET-42';</script>`));
+        }
         case '/status_codes': return html(STATUS_CODES, 404);
         // What a server's own error page looks like: the status first, little else.
         case '/server_error': return html(page('503 Service Temporarily Unavailable', '<h1>503 Service Temporarily Unavailable</h1>'), 503);
