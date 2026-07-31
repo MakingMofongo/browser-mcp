@@ -58,9 +58,25 @@ function listen(i = 0) {
 }
 
 async function run() {
+  // Phase zero: simply stay connected, long enough to cross several of the
+  // watchdog's one-minute rounds.
+  //
+  // That watchdog replaces the offscreen document when it stops answering, and
+  // replacing it drops every session's connection at once. Two faults were found in
+  // it by reading — it condemned on a single missed reply, using a counter that a
+  // service worker loses on eviction — and both would have shown up here as a
+  // connection dying about once a minute for no reason. Nothing else can show that:
+  // the rule's unit tests prove it decides correctly when asked, not that it is
+  // being asked the right questions in a real browser.
+  const watchdogRounds = 4;
+  await new Promise((r) => setTimeout(r, watchdogRounds * 60000 + 5000));
+  check(`a healthy connection survives ${watchdogRounds} rounds of the watchdog`,
+    closedAt === null && ws?.readyState === 1,
+    closedAt === null ? `still connected after ${secs()}s` : `dropped at ${closedAt}s — the watchdog is replacing a document that was answering`);
+
   // Phase one: answer everything. The extension must keep the connection.
   await new Promise((r) => setTimeout(r, 40000));
-  check('the extension sends a heartbeat of its own', pings >= 1, `${pings} ping(s) in 40s`);
+  check('the extension sends a heartbeat of its own', pings >= 1, `${pings} ping(s)`);
   check('a connection that is answered is kept', closedAt === null && ws?.readyState === 1,
     closedAt === null ? 'still connected' : `closed at ${closedAt}s`);
 
@@ -68,12 +84,13 @@ async function run() {
   // connection on the pings it stops getting back.
   console.log(`[${secs()}s] — no longer answering —`);
   answering = false;
+  const silentFrom = secs();
   const before = pings;
   await new Promise((r) => setTimeout(r, 75000));
 
   check('it keeps asking after the answers stop', pings > before, `${pings - before} more ping(s)`);
   check('it hangs up on a connection that stopped answering', closedAt !== null,
-    closedAt !== null ? `closed ${closedAt - 40}s after the answers stopped` : 'still holding a dead connection');
+    closedAt !== null ? `closed ${closedAt - silentFrom}s after the answers stopped` : 'still holding a dead connection');
 
   const passed = results.filter(Boolean).length;
   console.log(`\n${passed}/${results.length} passed`);
