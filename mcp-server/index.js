@@ -454,8 +454,16 @@ mcpServer.setRequestHandler(CallToolRequestSchema, async (request) => {
     // A save nested inside a batch returns bytes too. Write them out the same way,
     // otherwise the base64 lands in the transcript — which is exactly what the
     // top-level handling above exists to prevent.
+    const batchImages = [];
     if (method === 'batch' && Array.isArray(result?.results)) {
       result.results.forEach((r, i) => {
+        const shot = r?.result?.screenshot;
+        if (shot?.data) {
+          const b64 = shot.data.replace(/^data:image\/(jpeg|png);base64,/, '');
+          batchImages.push({ type: 'image', data: b64, mimeType: shot.data.startsWith('data:image/png') ? 'image/png' : 'image/jpeg' });
+          delete shot.data;
+          shot.attached = true;
+        }
         const payload = r?.result;
         if (!payload?.data) return;
         const declared = args?.actions?.[i]?.params?.path || args?.actions?.[i]?.input?.path;
@@ -474,6 +482,21 @@ mcpServer.setRequestHandler(CallToolRequestSchema, async (request) => {
       });
     }
 
+    // An anomaly crop rides along on a normal tool result. Lift it into an image
+    // block so it renders, and keep the base64 out of the JSON text.
+    if (result?.screenshot?.data) {
+      const shot = result.screenshot;
+      const base64 = shot.data.replace(/^data:image\/(jpeg|png);base64,/, '');
+      const { data, ...meta } = shot;
+      result.screenshot = { ...meta, attached: true };
+      return {
+        content: [
+          { type: 'text', text: JSON.stringify(result, null, 2) },
+          { type: 'image', data: base64, mimeType: shot.data.startsWith('data:image/png') ? 'image/png' : 'image/jpeg' },
+        ],
+      };
+    }
+
     // Batch: hoist any screenshots taken inside the batch into proper image blocks
     // (base64 in JSON text would blow up the context and render as garbage).
     if (method === 'batch' && result?.results) {
@@ -489,7 +512,7 @@ mcpServer.setRequestHandler(CallToolRequestSchema, async (request) => {
           r.result.image = `[image ${images.length} attached below]`;
         }
       }
-      return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }, ...images] };
+      return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }, ...images, ...batchImages] };
     }
 
     if (name === 'browser_screenshot' && result?.image) {

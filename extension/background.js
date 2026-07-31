@@ -2581,11 +2581,24 @@ function bmcpPageSignature() {
     .filter(vis).map(d => (d.getAttribute('aria-label') || d.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 90));
   const errors = [...document.querySelectorAll('[role="alert"], [aria-invalid="true"], .error, .invalid-feedback')]
     .filter(vis).map(e => (e.textContent || '').trim().replace(/\s+/g, ' ')).filter(t => t && t.length < 160);
+  // Toggling a checkbox, picking a radio or typing into a field changes nothing in
+  // the page text, so a text-only comparison reports "nothing happened" for actions
+  // that plainly did. Control state is part of what changed.
+  const fields = {};
+  let idx = 0;
+  for (const el of document.querySelectorAll('input, select, textarea')) {
+    const key = el.name || el.id || `${el.tagName}#${idx++}`;
+    const t = (el.type || '').toLowerCase();
+    if (t === 'checkbox' || t === 'radio') fields[key] = el.checked ? '1' : '0';
+    else if (t === 'password') fields[key] = String(el.value || '').length;
+    else fields[key] = String(el.value || '').slice(0, 60);
+  }
   return {
     url: location.href, title: document.title, lines,
     dialogs: [...new Set(dialogs)].filter(Boolean).slice(0, 5),
     errors: [...new Set(errors)].slice(0, 6),
     scrollY: Math.round(window.scrollY),
+    fields,
   };
 }
 
@@ -2613,8 +2626,78 @@ function diffSignature(a, b, max = 8) {
   if (newDialogs.length) out.dialogs_opened = newDialogs;
   const newErrors = b.errors.filter(e => !a.errors.includes(e));
   if (newErrors.length) out.errors_shown = newErrors;
+  const fa = a.fields || {}, fb = b.fields || {};
+  const changedFields = Object.keys(fb).filter(k => String(fa[k]) !== String(fb[k]));
+  if (changedFields.length) out.fields_changed = changedFields.slice(0, 10);
   if (!Object.keys(out).length) out.no_visible_change = true;
   return out;
+}
+
+// Vision, but only where text has already failed. A full-page image after every
+// step costs ~1.5k tokens and is mostly unchanged pixels; a crop around the element
+// that just misbehaved is the one case where pixels beat a description.
+async function captureAnomalyShot(tabId, selector) {
+  let rect = null;
+  if (selector) {
+    try {
+      const [r] = await chrome.scripting.executeScript({
+        target: { tabId }, world: 'MAIN', args: [selector],
+        func: (sel) => {
+          const rm = /^ref[_=](\d+)$/.exec(sel || '');
+          let el = null;
+          if (rm) el = (window.__bmcpRefEls || {})['ref_' + rm[1]];
+          else { try { el = document.querySelector(sel); } catch (e) {} }
+          if (!el || !el.isConnected) return null;
+          const b = el.getBoundingClientRect();
+          return { x: b.x, y: b.y, w: b.width, h: b.height, vw: innerWidth, vh: innerHeight };
+        },
+      });
+      rect = r?.result || null;
+    } catch { /* fall through to viewport */ }
+  }
+  try {
+    await debuggerAttach(tabId);
+    const PAD = 60;
+    let clip;
+    if (rect && rect.w > 0 && rect.h > 0) {
+      const x = Math.max(0, rect.x - PAD);
+      const y = Math.max(0, rect.y - PAD);
+      clip = {
+        x, y,
+        width: Math.min(rect.vw - x, rect.w + PAD * 2),
+        height: Math.min(rect.vh - y, rect.h + PAD * 2),
+        scale: 0.6,
+      };
+    } else {
+      const [vp] = await chrome.scripting.executeScript({
+        target: { tabId }, world: 'MAIN', func: () => ({ vw: innerWidth, vh: innerHeight }),
+      }).catch(() => [null]);
+      const v = vp?.result || { vw: 1280, vh: 800 };
+      clip = { x: 0, y: 0, width: v.vw, height: Math.min(v.vh, 900), scale: 0.4 };
+    }
+    const shot = await cdpSend(tabId, 'Page.captureScreenshot', {
+      format: 'jpeg', quality: 55, clip, captureBeyondViewport: false,
+    });
+    if (!shot?.data) return null;
+    return {
+      data: 'data:image/jpeg;base64,' + shot.data,
+      region: { x: Math.round(clip.x), y: Math.round(clip.y), width: Math.round(clip.width), height: Math.round(clip.height) },
+      scale: clip.scale,
+      cropped_to_element: !!(rect && rect.w > 0),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function isAnomalous(result) {
+  if (!result || typeof result !== 'object') return null;
+  if (result.ok === false) return 'action reported failure';
+  if (result.verified === false) return 'no event reached the page';
+  if (result.outcome === 'no_change') return 'submit produced no change';
+  if (result.found === false) return 'element or text not found';
+  if (result.changed && result.changed.no_visible_change) return 'nothing on the page changed';
+  return null;
 }
 
 const OBSERVABLE = new Set([
@@ -2667,6 +2750,23 @@ async function dispatch(port, method, params) {
 }
 
 async function dispatchInner(port, method, params) {
+  const wantsShot = params && (params.screenshot === 'anomaly' || params.screenshot === 'always');
+  if (wantsShot && OBSERVABLE.has(method)) {
+    const result = await dispatchObserved(port, method, params);
+    const why = params.screenshot === 'always' ? 'requested' : isAnomalous(result);
+    if (why && result && typeof result === 'object') {
+      try {
+        const tab = await getSessionTab(port);
+        const shot = await captureAnomalyShot(tab.id, params.selector);
+        if (shot) result.screenshot = { ...shot, reason: why };
+      } catch { /* an image is a nice-to-have; never fail the action for it */ }
+    }
+    return result;
+  }
+  return dispatchObserved(port, method, params);
+}
+
+async function dispatchObserved(port, method, params) {
   if (!params || !params.observe || !OBSERVABLE.has(method)) {
     return dispatchCore(port, method, params);
   }

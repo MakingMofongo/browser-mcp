@@ -67,6 +67,7 @@ export const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
+        screenshot: { type: 'string', enum: ['anomaly', 'always'], description: 'Attach an image cropped to the target element. "anomaly" only sends one when the action did not take effect, which is when pixels tell you something the text result cannot.' },
         observe: { type: 'boolean', description: 'Also report what changed on the page after the action: text that appeared or disappeared, dialogs opened, errors shown, navigation. Cheaper than a screenshot.' },
         selector: { type: 'string', description: 'Submit control (CSS, text=, or ref_N). Omit to auto-detect the best submit button.' },
         expect_text: { type: 'string', description: 'Text that should APPEAR on success, e.g. "Dashboard", "Application submitted"' },
@@ -165,6 +166,7 @@ export const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
+        screenshot: { type: 'string', enum: ['anomaly', 'always'], description: 'Attach an image cropped to the target element. "anomaly" only sends one when the action did not take effect, which is when pixels tell you something the text result cannot.' },
         observe: { type: 'boolean', description: 'Also report what changed on the page after the action: text that appeared or disappeared, dialogs opened, errors shown, navigation. Cheaper than a screenshot.' },
         from_selector: { type: 'string', description: 'Source element (CSS, text=, or ref_N)' },
         to_selector: { type: 'string', description: 'Target element (CSS, text=, or ref_N)' },
@@ -180,6 +182,7 @@ export const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
+        screenshot: { type: 'string', enum: ['anomaly', 'always'], description: 'Attach an image cropped to the target element. "anomaly" only sends one when the action did not take effect, which is when pixels tell you something the text result cannot.' },
         observe: { type: 'boolean', description: 'Also report what changed on the page after the action: text that appeared or disappeared, dialogs opened, errors shown, navigation. Cheaper than a screenshot.' }, selector: { type: 'string', description: 'CSS, text, or ref selector' } },
       required: ['selector'],
     },
@@ -296,6 +299,7 @@ export const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
+        screenshot: { type: 'string', enum: ['anomaly', 'always'], description: 'Attach an image cropped to the target element. "anomaly" only sends one when the action did not take effect, which is when pixels tell you something the text result cannot.' },
         observe: { type: 'boolean', description: 'Also report what changed on the page after the action: text that appeared or disappeared, dialogs opened, errors shown, navigation. Cheaper than a screenshot.' },
         selector: { type: 'string', description: 'CSS or text selector' },
       },
@@ -319,6 +323,7 @@ export const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
+        screenshot: { type: 'string', enum: ['anomaly', 'always'], description: 'Attach an image cropped to the target element. "anomaly" only sends one when the action did not take effect, which is when pixels tell you something the text result cannot.' },
         observe: { type: 'boolean', description: 'Also report what changed on the page after the action: text that appeared or disappeared, dialogs opened, errors shown, navigation. Cheaper than a screenshot.' },
         x: { type: 'number', description: 'X coordinate (CSS pixels, from left of viewport)' },
         y: { type: 'number', description: 'Y coordinate (CSS pixels, from top of viewport)' },
@@ -337,6 +342,7 @@ export const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
+        screenshot: { type: 'string', enum: ['anomaly', 'always'], description: 'Attach an image cropped to the target element. "anomaly" only sends one when the action did not take effect, which is when pixels tell you something the text result cannot.' },
         observe: { type: 'boolean', description: 'Also report what changed on the page after the action: text that appeared or disappeared, dialogs opened, errors shown, navigation. Cheaper than a screenshot.' },
         selector: { type: 'string', description: 'CSS selector, text selector ("text=Click me", "button:text(Submit)"), or ref handle ("ref_12")' },
       },
@@ -349,6 +355,7 @@ export const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
+        screenshot: { type: 'string', enum: ['anomaly', 'always'], description: 'Attach an image cropped to the target element. "anomaly" only sends one when the action did not take effect, which is when pixels tell you something the text result cannot.' },
         observe: { type: 'boolean', description: 'Also report what changed on the page after the action: text that appeared or disappeared, dialogs opened, errors shown, navigation. Cheaper than a screenshot.' },
         selector: { type: 'string', description: 'CSS selector, text selector, or ref handle ("ref_7") for the input field' },
         value: { type: 'string', description: 'Value to fill in' },
@@ -362,6 +369,7 @@ export const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
+        screenshot: { type: 'string', enum: ['anomaly', 'always'], description: 'Attach an image cropped to the target element. "anomaly" only sends one when the action did not take effect, which is when pixels tell you something the text result cannot.' },
         observe: { type: 'boolean', description: 'Also report what changed on the page after the action: text that appeared or disappeared, dialogs opened, errors shown, navigation. Cheaper than a screenshot.' },
         key: { type: 'string', description: 'Key to press: "Enter", "Tab", "Escape", "ArrowDown", "ArrowUp", "Backspace", "a", "1", etc.' },
         code: { type: 'string', description: 'Key code (optional, defaults to key name). E.g. "KeyA" for "a"' },
@@ -379,6 +387,7 @@ export const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
+        screenshot: { type: 'string', enum: ['anomaly', 'always'], description: 'Attach an image cropped to the target element. "anomaly" only sends one when the action did not take effect, which is when pixels tell you something the text result cannot.' },
         observe: { type: 'boolean', description: 'Also report what changed on the page after the action: text that appeared or disappeared, dialogs opened, errors shown, navigation. Cheaper than a screenshot.' },
         selector: { type: 'string', description: 'CSS or text selector to scroll to (element scrolled into center of viewport)' },
         x: { type: 'number', description: 'Pixels to scroll horizontally (positive = right)' },
@@ -405,6 +414,7 @@ export const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
+        screenshot: { type: 'string', enum: ['anomaly', 'always'], description: 'Attach an image cropped to the target element. "anomaly" only sends one when the action did not take effect, which is when pixels tell you something the text result cannot.' },
         observe: { type: 'boolean', description: 'Also report what changed on the page after the action: text that appeared or disappeared, dialogs opened, errors shown, navigation. Cheaper than a screenshot.' },
         selector: { type: 'string', description: 'CSS or text selector to hover over' },
         duration: { type: 'number', description: 'How long to hold hover in ms (default: 500)' },
@@ -418,6 +428,7 @@ export const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
+        screenshot: { type: 'string', enum: ['anomaly', 'always'], description: 'Attach an image cropped to the target element. "anomaly" only sends one when the action did not take effect, which is when pixels tell you something the text result cannot.' },
         observe: { type: 'boolean', description: 'Also report what changed on the page after the action: text that appeared or disappeared, dialogs opened, errors shown, navigation. Cheaper than a screenshot.' },
         selector: { type: 'string', description: 'CSS or text selector for the dropdown trigger / <select> element' },
         option: { type: 'string', description: 'Text of the option to select (partial match supported)' },
@@ -443,6 +454,7 @@ export const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
+        screenshot: { type: 'string', enum: ['anomaly', 'always'], description: 'Attach an image cropped to the target element. "anomaly" only sends one when the action did not take effect, which is when pixels tell you something the text result cannot.' },
         observe: { type: 'boolean', description: 'Also report what changed on the page after the action: text that appeared or disappeared, dialogs opened, errors shown, navigation. Cheaper than a screenshot.' },
         selector: { type: 'string', description: 'CSS selector for the combobox/autocomplete input' },
         value: { type: 'string', description: 'Single value to select (use this OR values)' },
@@ -473,6 +485,7 @@ export const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
+        screenshot: { type: 'string', enum: ['anomaly', 'always'], description: 'Attach an image cropped to the target element. "anomaly" only sends one when the action did not take effect, which is when pixels tell you something the text result cannot.' },
         observe: { type: 'boolean', description: 'Also report what changed on the page after the action: text that appeared or disappeared, dialogs opened, errors shown, navigation. Cheaper than a screenshot.' },
         selector: { type: 'string', description: 'CSS selector for the date input element' },
         date: { type: 'string', description: 'ISO date string (YYYY-MM-DD), e.g. "2026-05-15"' },
