@@ -75,7 +75,7 @@ function heartbeat() {
   for (const [port, ws] of connections) {
     if (!ws || ws.readyState !== WebSocket.OPEN) continue;
     const h = health.get(port) || {};
-    if (h.everPonged && (h.unanswered || 0) >= UNANSWERED_LIMIT) {
+    if (self.bmcpHeartbeatPolicy.shouldDrop(h)) {
       console.warn(`[Offscreen] port ${port} ignored ${h.unanswered} pings; closing so it can be replaced`);
       try { ws.close(); } catch {}
       connections.delete(port);
