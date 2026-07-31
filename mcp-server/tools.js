@@ -236,12 +236,13 @@ export const TOOLS = [
   },
   {
     name: 'browser_wait',
-    description: 'Wait for an element to appear on the page. Supports CSS and text-based selectors.',
+    description: 'Wait for an element to become VISIBLE (not merely present — pages often pre-render success text in a hidden div, which would match instantly and leave you reading a mid-transition page). Supports CSS, text, and ref selectors. Returns waited_ms; pass visible:false to match presence only.',
     inputSchema: {
       type: 'object',
       properties: {
         selector: { type: 'string', description: 'CSS selector or text selector (e.g. "text=Success", "button:text(Next)") to wait for' },
         timeout: { type: 'number', description: 'Max wait time in ms (default: 10000)' },
+        visible: { type: 'boolean', description: 'Require the element to be visible (default: true). false = presence is enough.' },
       },
       required: ['selector'],
     },

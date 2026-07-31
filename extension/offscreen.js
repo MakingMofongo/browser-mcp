@@ -12,22 +12,23 @@ const BASE_PORT = 9876;
 const MAX_PORT = 9895;
 const connections = new Map(); // port → WebSocket
 
-// Stable identity for this browser installation (persisted in extension storage).
-// Label is user-editable via chrome.storage ('bmcpLabel') — default derives from platform.
+// Stable identity for this browser installation. IMPORTANT: offscreen documents
+// can only use chrome.runtime APIs — chrome.storage is NOT available here, so the
+// persisted id/label come from the service worker via message. Everything has a
+// fallback: hello must ALWAYS be sent, even if identity lookup fails.
 let instanceCache = null;
 async function getInstanceInfo() {
   if (instanceCache) return instanceCache;
-  const stored = await chrome.storage.local.get(['bmcpInstanceId', 'bmcpLabel']);
-  let id = stored.bmcpInstanceId;
-  if (!id) {
-    id = crypto.randomUUID();
-    await chrome.storage.local.set({ bmcpInstanceId: id });
-  }
   const platform = (navigator.userAgentData && navigator.userAgentData.platform) || navigator.platform || 'unknown';
   const chromeVer = (navigator.userAgent.match(/Chrome\/([\d.]+)/) || [])[1] || '?';
+  let id = null, label = null;
+  try {
+    const r = await chrome.runtime.sendMessage({ type: 'bmcp_get_instance' });
+    if (r) { id = r.id; label = r.label; }
+  } catch {}
   instanceCache = {
-    id,
-    label: stored.bmcpLabel || `Chrome on ${platform}`,
+    id: id || 'ephemeral-' + Math.random().toString(36).slice(2, 10),
+    label: label || `Chrome on ${platform}`,
     platform,
     chrome_version: chromeVer,
   };
@@ -56,17 +57,22 @@ function tryConnect(port) {
     if (ws.readyState !== WebSocket.OPEN) ws.close();
   }, 2000);
 
-  ws.onopen = async () => {
+  ws.onopen = () => {
     clearTimeout(connectTimeout);
     connections.set(port, ws);
     console.log(`[Offscreen] Connected to MCP server on port ${port} (${connections.size} total)`);
-    // v2.0 hello handshake: identify this browser instance so the MCP server can
-    // track multiple connected Chromes (profiles/machines) and let the model pick
-    // one via browser_list_browsers / browser_select_browser.
+    // v2.0 hello handshake, two-phase so it can NEVER be skipped:
+    // 1) immediate hello with synchronously available data (the server merges
+    //    repeated hellos, so a partial one is never wrong, only incomplete);
+    // 2) upgraded hello once the persisted identity arrives from the SW.
+    const platform = (navigator.userAgentData && navigator.userAgentData.platform) || navigator.platform || 'unknown';
+    const chromeVer = (navigator.userAgent.match(/Chrome\/([\d.]+)/) || [])[1] || '?';
     try {
-      const instance = await getInstanceInfo();
-      ws.send(JSON.stringify({ type: 'hello', instance }));
+      ws.send(JSON.stringify({ type: 'hello', instance: { id: 'pending', label: `Chrome on ${platform}`, platform, chrome_version: chromeVer } }));
     } catch {}
+    getInstanceInfo()
+      .then(instance => { try { ws.send(JSON.stringify({ type: 'hello', instance })); } catch {} })
+      .catch(() => {});
     updateStatus();
   };
 

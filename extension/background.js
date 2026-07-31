@@ -520,12 +520,18 @@ async function debuggerClick(tabId, x, y) {
     const verdictRes = await cdpSend(tabId, 'Runtime.evaluate', {
       returnByValue: true,
       expression: `(() => {
-        const el = window.__bmcpClickTarget;
+        let el = window.__bmcpClickTarget;
         const landed = window.__bmcpClicked === true;
         try { window.__bmcpClickListener && document.removeEventListener('click', window.__bmcpClickListener, true); } catch (e) {}
         try { delete window.__bmcpClickTarget; delete window.__bmcpClicked; delete window.__bmcpClickListener; } catch (e) {}
         if (landed) return { landed: true, path: 'trusted' };  // FIX-13: trusted click landed — do NOT double-fire
         if (!el || !el.isConnected) return { landed: true, path: 'navigated' };  // page navigated/re-rendered — click had effect
+        // Resolve to the ACTIONABLE control before synthetic dispatch: elementFromPoint
+        // returns the deepest element (e.g. the <i> icon inside a submit button), and
+        // HTMLElement.click() only runs activation behavior (form submit, checkbox
+        // toggle) on the control itself — clicking the icon submits nothing.
+        const actionable = (el.closest && el.closest('a,button,input,select,textarea,label,summary,[role="button"],[role="link"],[role="menuitem"],[role="tab"],[role="option"],[role="checkbox"],[role="radio"],[onclick]'));
+        if (actionable) el = actionable;
         const opts = { bubbles: true, cancelable: true, composed: true, view: window, clientX: ${x}, clientY: ${y} };
         try { el.dispatchEvent(new PointerEvent('pointerdown', opts)); } catch (e) {}
         el.dispatchEvent(new MouseEvent('mousedown', opts));
@@ -588,7 +594,44 @@ async function evalAttached(tabId, expression) {
   return result.result?.value;
 }
 
+// Focus + clear a SPECIFIC element via injected JS. Replaces select-all+Backspace
+// in the fill paths: those CDP keystrokes go wherever focus happens to be, so when
+// a preceding CDP focus/click is swallowed they silently wipe the PREVIOUS field
+// (observed: filling password erased the already-filled username, and the form
+// submitted empty). Targeting the element directly cannot damage its neighbours.
+async function focusAndClearElement(tabId, selectorOrRef) {
+  try {
+    const [r] = await chrome.scripting.executeScript({
+      target: { tabId },
+      world: 'MAIN',
+      args: [selectorOrRef],
+      func: (sel) => {
+        let el = null;
+        if (sel && sel.startsWith('ref_')) el = window.__bmcpRefEls && window.__bmcpRefEls[sel];
+        else if (sel) { try { el = document.querySelector(sel); } catch {} }
+        if (!el || !el.isConnected) return { ok: false };
+        el.scrollIntoView({ block: 'center', behavior: 'instant' });
+        el.focus();
+        if ('value' in el) {
+          const proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+          const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+          if (setter) setter.call(el, ''); else el.value = '';
+          el.dispatchEvent(new Event('input', { bubbles: true }));
+        } else if (el.isContentEditable) {
+          el.textContent = '';
+        }
+        return { ok: true, focused: document.activeElement === el };
+      },
+    });
+    return r?.result || { ok: false };
+  } catch {
+    return { ok: false };
+  }
+}
+
 // Select-all + Backspace. Assumes the debugger is already attached.
+// NOTE: only for widget flows (date pickers, comboboxes) where the widget owns
+// focus. Never use it in a plain fill — see focusAndClearElement above.
 async function clearFieldAttached(tabId) {
   await cdpSend(tabId, 'Input.dispatchKeyEvent', {
     type: 'keyDown', key: 'a', code: 'KeyA', modifiers: SELECT_ALL_MODS,
@@ -631,12 +674,12 @@ async function debuggerFill(tabId, selector, value) {
     return;
   }
 
-  // Standard input/textarea — focus, clear, fill
-  await debuggerFocus(tabId, selector);
+  // Standard input/textarea — focus + clear THIS element (element-scoped, so a
+  // swallowed CDP focus can never make the clear wipe a different field), then fill.
+  await focusAndClearElement(tabId, selector);
+  await debuggerFocus(tabId, selector).catch(() => {});
   await debuggerAttach(tabId);
   try {
-    await clearFieldAttached(tabId);
-
     // Fast path: one trusted InputEvent instead of N key events. This is the same
     // primitive set_combobox and set_date already rely on, it avoids per-key `code`
     // mapping entirely, and it turns a 40-character value from ~3 seconds of
@@ -658,8 +701,32 @@ async function debuggerFill(tabId, selector, value) {
       })()
     `);
     if (!landed) {
-      await clearFieldAttached(tabId);
+      await focusAndClearElement(tabId, selector);
       await typeCharsAttached(tabId, value);
+      // Last resort: if trusted typing was also swallowed, set the value natively.
+      const still = await evalAttached(tabId, `
+        (function() {
+          const el = document.querySelector(${JSON.stringify(selector)});
+          if (!el) return null;
+          return ('value' in el) ? el.value : el.textContent;
+        })()
+      `).catch(() => null);
+      if (!still) {
+        await chrome.scripting.executeScript({
+          target: { tabId }, world: 'MAIN', args: [selector, value],
+          func: (sel, val) => {
+            const el = document.querySelector(sel);
+            if (!el) return;
+            el.focus();
+            const proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+            const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+            if (setter && 'value' in el) setter.call(el, val); else if ('value' in el) el.value = val;
+            else if (el.isContentEditable) el.textContent = val;
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+          },
+        }).catch(() => {});
+      }
     }
   } finally {
     await debuggerDetach(tabId);
@@ -978,6 +1045,19 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         })
         .catch(err => sendResponse({ __error: err.message || String(err) }));
     }).catch(err => sendResponse({ __error: err.message || String(err) })); // else a storage-restore reject hangs the caller
+    return true; // async response
+  }
+
+  if (msg.type === 'bmcp_get_instance') {
+    // Offscreen doc can't use chrome.storage — serve the persisted browser identity.
+    chrome.storage.local.get(['bmcpInstanceId', 'bmcpLabel']).then(async (stored) => {
+      let id = stored.bmcpInstanceId;
+      if (!id) {
+        id = crypto.randomUUID();
+        await chrome.storage.local.set({ bmcpInstanceId: id });
+      }
+      sendResponse({ id, label: stored.bmcpLabel || null });
+    }).catch(() => sendResponse(null));
     return true; // async response
   }
 
@@ -2010,6 +2090,18 @@ async function dispatch(port, method, params) {
             ? v.then(x => ({ __ok: true, value: x }), asErr)  // async rejection → structured error, never unhandled
             : { __ok: true, value: v };
         };
+        // REPL "completion value": for statement code, return the LAST expression.
+        // "const a=6; const b=7; a*b" → rewrite tail to "return (a*b)". Only applied
+        // when the tail doesn't start with a statement keyword; syntax errors fall
+        // through to the plain-body variant.
+        const withLastExprReturn = () => {
+          const parts = codeStr.split(/;(?![^(]*\))/);
+          while (parts.length && !parts[parts.length - 1].trim()) parts.pop();
+          if (!parts.length) return null;
+          const tail = parts.pop().trim();
+          if (/^(const|let|var|if|for|while|do|return|function|class|throw|try|switch|break|continue|\})/.test(tail)) return null;
+          return parts.join(';') + ';\nreturn (' + tail + '\n);';
+        };
         try {
           return tryEval(() => new Function('return (' + codeStr + '\n)'));
         } catch (e1) {
@@ -2020,6 +2112,12 @@ async function dispatch(port, method, params) {
             return tryEval(() => new Function('return (async () => { return (' + codeStr + '\n); })()'));
           } catch (e1b) {
             if (e1b?.name !== 'SyntaxError') return asErr(e1b);
+            const rewritten = withLastExprReturn();
+            if (rewritten != null) {
+              try {
+                return tryEval(() => new Function('return (async () => {\n' + rewritten + '\n})()'));
+              } catch { /* fall through to plain body */ }
+            }
             try {
               // Statement code / top-level return: async-body wrap
               return tryEval(() => new Function('return (async () => {\n' + codeStr + '\n})()'));
@@ -2187,21 +2285,51 @@ async function dispatch(port, method, params) {
       const before = await readField();
       const describe = (f) => f == null ? undefined : (f.redacted ? `[redacted ${f.len} chars]` : f.value);
 
-      // For text-based selectors, click the element first then type
+      // For text/ref selectors, click the element first then type
       if (parsed.type === 'text' || parsed.type === 'ref') {
         const el = await resolveElement(tab.id, params.selector);
         if (!el) return { ok: false, error: 'Element not found: ' + params.selector };
-        await debuggerClick(tab.id, el.x, el.y);
-        await new Promise(r => setTimeout(r, 100));
-        await debuggerAttach(tab.id);
+        const target = parsed.type === 'ref' ? parsed.ref : null;
+        let method = 'debugger';
         try {
-          await clearFieldAttached(tab.id);
-          await cdpSend(tab.id, 'Input.insertText', { text: params.value });
-        } finally {
-          await debuggerDetach(tab.id);
+          await debuggerClick(tab.id, el.x, el.y);
+          await new Promise(r => setTimeout(r, 80));
+          // Element-scoped focus+clear (never touches neighbouring fields), then a
+          // trusted insert so React/Angular validators see real input events.
+          await focusAndClearElement(tab.id, target);
+          await debuggerAttach(tab.id);
+          try {
+            await cdpSend(tab.id, 'Input.insertText', { text: params.value });
+          } finally {
+            await debuggerDetach(tab.id);
+          }
+        } catch { /* fall through to read-back check */ }
+        let after = await readField();
+        // CDP input events can be silently swallowed (e.g. another automation
+        // extension holds the input channel). Never trust — verify by LENGTH
+        // (value is hidden for password fields, but len is always reported),
+        // then fall back to the native value-setter, which nothing can block.
+        if (parsed.type === 'ref' && (!after || !after.len)) {
+          const [fb] = await chrome.scripting.executeScript({
+            target: { tabId: tab.id },
+            world: 'MAIN',
+            args: [parsed.ref, params.value],
+            func: (refKey, val) => {
+              const el = window.__bmcpRefEls && window.__bmcpRefEls[refKey];
+              if (!el || !el.isConnected) return { ok: false, error: 'ref-stale' };
+              el.focus();
+              const proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+              const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+              if (setter && 'value' in el) setter.call(el, val); else if ('value' in el) el.value = val;
+              else if (el.isContentEditable) el.textContent = val;
+              el.dispatchEvent(new Event('input', { bubbles: true }));
+              el.dispatchEvent(new Event('change', { bubbles: true }));
+              return { ok: true };
+            },
+          });
+          if (fb?.result?.ok) { method = 'native-setter-fallback'; after = await readField(); }
         }
-        const after = await readField();
-        return { ok: true, method: 'debugger', value_before: describe(before), value_after: describe(after) };
+        return { ok: true, method, value_before: describe(before), value_after: describe(after) };
       }
 
       // Always use debugger for input/textarea — React/Angular/Vue need real keyboard events
@@ -2338,24 +2466,55 @@ async function dispatch(port, method, params) {
       if (tab.url.startsWith('chrome://')) throw new Error('Cannot interact with chrome:// pages');
       const timeout = params.timeout || 10000;
       const sel = params.selector;
+      const requireVisible = params.visible !== false; // default: wait for VISIBLE
       const start = Date.now();
+      // Visibility matters: pages routinely pre-render the success element hidden
+      // (the-internet's dynamic_loading holds "Hello World!" in a display:none div
+      // from first paint). Matching on mere presence returned instantly and the
+      // caller then read the page mid-transition. Default is now visible-only.
+      let sawHidden = false;
       while (Date.now() - start < timeout) {
-        // Text-based selectors use debugger directly
-        if (sel.startsWith('text=') || sel.match(/^\w+:text\(/)) {
-          const el = await resolveElement(tab.id, sel);
-          if (el) return { found: true, method: 'debugger' };
-        } else {
-          const scriptResult = await safeExecuteScript(tab.id, (s) => !!document.querySelector(s), [sel]);
-          if (scriptResult.cspBlocked) {
-            const found = await debuggerEval(tab.id, `!!document.querySelector(${JSON.stringify(sel)})`);
-            if (found) return { found: true, method: 'debugger' };
-          } else if (scriptResult.result) {
-            return { found: true };
-          }
+        const [res] = await chrome.scripting.executeScript({
+          target: { tabId: tab.id },
+          world: 'MAIN',
+          args: [sel, requireVisible],
+          func: (sel, requireVisible) => {
+            const isVisible = (el) => {
+              if (!el || !el.isConnected) return false;
+              const r = el.getBoundingClientRect();
+              if (r.width <= 0 || r.height <= 0) return false;
+              const st = getComputedStyle(el);
+              return st.visibility !== 'hidden' && st.display !== 'none' && Number(st.opacity) !== 0;
+            };
+            let els = [];
+            const tagText = sel.match(/^(\w+):text\((.+)\)$/);
+            const isText = sel.startsWith('text=') || tagText;
+            if (isText) {
+              const needle = (tagText ? tagText[2] : sel.slice(5)).trim();
+              const scope = tagText ? tagText[1] : '*';
+              els = [...document.querySelectorAll(scope)]
+                .filter(e => (e.textContent || '').trim().includes(needle))
+                .filter(e => ![...e.children].some(c => (c.textContent || '').trim().includes(needle)));
+            } else {
+              try { els = [...document.querySelectorAll(sel)]; } catch { return { error: 'bad-selector' }; }
+            }
+            if (!els.length) return { present: false, visible: false };
+            return { present: true, visible: els.some(isVisible) };
+          },
+        }).catch(() => [null]);
+        const r = res?.result;
+        if (r?.error === 'bad-selector') return { found: false, error: 'Invalid selector: ' + sel };
+        if (r?.present) {
+          if (!requireVisible || r.visible) return { found: true, visible: !!r.visible, waited_ms: Date.now() - start };
+          sawHidden = true;
         }
-        await new Promise(r => setTimeout(r, 500));
+        await new Promise(r2 => setTimeout(r2, 300));
       }
-      return { found: false };
+      return {
+        found: false,
+        waited_ms: Date.now() - start,
+        ...(sawHidden ? { note: 'Element EXISTS but stayed hidden for the whole timeout. Pass visible:false to match presence only.' } : {}),
+      };
     }
 
     case 'press_key': {
@@ -3399,7 +3558,9 @@ async function dispatch(port, method, params) {
         debugger_attached: debuggerAttachedReal,
         scripting_works: scriptingOk,
         ready: scriptingOk,
-        hint: !scriptingOk ? 'Scripting injection failing — tab may be chrome:// or still loading.' :
+        hint: !scriptingOk ? (!tab.url || tab.url.startsWith('about:') || tab.url.startsWith('chrome://')
+                ? `Active tab is a blank placeholder (${tab.url || 'about:blank'}) — injection is impossible there by design, and this is NOT a fault. Navigate to a real page first.`
+                : 'Scripting injection failing — tab may still be loading, or is a protected page.') :
               !debuggerAttachedReal ? 'Debugger not currently attached (attaches on demand for clicks/keys). If clicks fail with attach errors, another automation extension may be holding the debugger — disable it or use browser_reattach_debugger.' :
               'All channels operational.',
       };
@@ -3421,7 +3582,9 @@ async function dispatch(port, method, params) {
         if (m === 'ask_user' || m === 'solve_captcha') { results.push({ index: i, ok: false, error: m + ' not allowed inside batch (needs interactive timeout) — call it standalone' }); break; }
         try {
           const r = await dispatch(port, m, p);
-          const failed = r && typeof r === 'object' && (r.ok === false || r.__error || r.error);
+          // found:false (wait) counts as failure: a chain that waited for something
+          // that never appeared must not keep acting on the wrong page state.
+          const failed = r && typeof r === 'object' && (r.ok === false || r.__error || r.error || r.found === false);
           results.push({ index: i, action: m, ok: !failed, result: r });
           if (failed) {
             results.push({ index: i + 1, note: `stopped: action ${i} (${m}) failed — ${results[i].result?.error || 'see result'}; ${actions.length - i - 1} action(s) skipped` });

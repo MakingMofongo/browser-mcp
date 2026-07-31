@@ -118,6 +118,24 @@ function autoUpdateExtension() {
     const installed = JSON.parse(readFileSync(installedManifest, 'utf8'));
     const source = JSON.parse(readFileSync(sourceManifest, 'utf8'));
 
+    // Never DOWNGRADE the installed extension. The old check fired on any version
+    // mismatch, so a stale npm copy silently overwrote a newer locally-built one —
+    // observed 2026-07-31: a v1.25.0 npx run clobbered an installed v2.0.0 manifest,
+    // which dropped the content_scripts block and disabled console capture with no
+    // error anywhere. Only ever move forward.
+    const cmp = (a, b) => {
+      const pa = String(a).split('.').map(Number), pb = String(b).split('.').map(Number);
+      for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+        const d = (pa[i] || 0) - (pb[i] || 0);
+        if (d) return d;
+      }
+      return 0;
+    };
+    if (cmp(source.version, installed.version) < 0) {
+      process.stderr.write(`[MCP] Installed extension (${installed.version}) is NEWER than this package (${source.version}) — leaving it alone.\n`);
+      return;
+    }
+
     if (installed.version !== source.version) {
       cpSync(sourceExtension, extensionDir, { recursive: true });
       process.stderr.write(`[MCP] Extension auto-updated: ${installed.version} → ${source.version}\n`);
