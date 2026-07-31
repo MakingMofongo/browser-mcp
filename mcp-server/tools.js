@@ -224,7 +224,7 @@ export const TOOLS = [
   },
   {
     name: 'browser_health',
-    description: 'Check the automation channels for the active tab: whether script injection works, whether the debugger is attached, which tab is active and how many tabs the session holds. Also reports a CAPTCHA or a sign-in challenge when one is present, since those stop a flow without anything being broken. Use to diagnose failures in click, fill or key presses.',
+    description: 'Check the automation channels for the active tab: whether script injection works, whether the debugger is attached, which tab is active and how many tabs the session holds. Also reports a CAPTCHA or a sign-in challenge when one is present, since those stop a flow without anything being broken, whether real input can reach this window, and a summary of the recent tool calls with their timings and which of them completed on a fallback path. Use to diagnose failures in click, fill or key presses, or to check how a long run is behaving.',
     inputSchema: { type: 'object', properties: {} },
   },
   {

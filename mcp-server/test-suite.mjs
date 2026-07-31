@@ -535,6 +535,23 @@ async function suite() {
     const clean = await send('health', {});
     check('health does not invent a CAPTCHA on an ordinary page',
       !clean.captcha && !clean.auth_wall && clean.ready === true, JSON.stringify({ c: clean.captcha, a: clean.auth_wall }));
+
+    // A stall or a silent drop to a fallback is invisible in any single result,
+    // which is how a click spent five seconds each time for months. health is
+    // where an operator looks when a run feels wrong, so it carries the history.
+    await send('click', { selector: 'h1' });
+    await send('press_key', { key: 'Tab' });
+    const withHistory = await send('health', {});
+    const byTool = withHistory.recent?.by_tool || [];
+    check('health reports how long the recent calls took',
+      withHistory.recent?.calls > 0 && byTool.some(t => t.method === 'click' && typeof t.mean_ms === 'number'),
+      JSON.stringify(byTool.find(t => t.method === 'click')));
+    check('health says when a tool completed on a fallback rather than the real path',
+      byTool.some(t => t.used_fallback > 0) && /fallback/.test(withHistory.recent?.note || ''),
+      withHistory.recent?.note);
+    check('health states whether real input can reach this window',
+      typeof withHistory.trusted_input === 'string' && withHistory.trusted_input.length > 10,
+      String(withHistory.trusted_input).slice(0, 60));
   });
 
   // ── clipboard: one tool, and never the content ──
