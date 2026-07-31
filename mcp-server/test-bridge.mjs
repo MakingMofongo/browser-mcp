@@ -38,7 +38,7 @@ const check = (name, pass, detail = '') => {
 const server = spawn('node', ['index.js'], {
   cwd: new URL('.', import.meta.url).pathname.replace(/^\//, ''),
   stdio: ['pipe', 'pipe', 'pipe'],
-  env: { ...process.env, BMCP_BASE_PORT: String(PORT), BMCP_HEARTBEAT_MS: '600', BMCP_SILENT_MS: '2000' },
+  env: { ...process.env, BMCP_BASE_PORT: String(PORT), BMCP_HEARTBEAT_MS: '600', BMCP_UNANSWERED_LIMIT: '2' },
 });
 let stderr = '';
 server.stderr.on('data', (d) => { stderr += d.toString(); });

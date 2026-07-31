@@ -130,7 +130,8 @@ function pickFailover() {
 // Overridable so the recovery behaviour can be tested in seconds rather than
 // by waiting out a real minute of silence.
 const HEARTBEAT_MS = Number(process.env.BMCP_HEARTBEAT_MS) || 15000;
-const SILENT_LIMIT_MS = Number(process.env.BMCP_SILENT_MS) || 50000;
+// How many pings may go unanswered before a connection is treated as gone.
+const UNANSWERED_LIMIT = Number(process.env.BMCP_UNANSWERED_LIMIT) || 3;
 
 function connHealth(ws) {
   let h = extConnections.get(ws);
@@ -138,12 +139,17 @@ function connHealth(ws) {
   return h;
 }
 
+// Counts unanswered pings rather than measuring elapsed time, matching the
+// extension. Elapsed time is the wrong measure on both ends for the same reason:
+// it assumes the gap between checks is the gap it thinks it is. A laptop that
+// sleeps makes Date.now() jump by hours, and every connection is condemned at once
+// on waking — when what actually wants deciding is whether anything answers now.
 function proven(ws) {
   const h = extConnections.get(ws);
   // Not yet judged either way — a connection that has never answered a ping is
   // given the benefit of the doubt, so an older extension keeps working.
   if (!h?.everPonged) return true;
-  return !h.lastSeen || (Date.now() - h.lastSeen) < SILENT_LIMIT_MS;
+  return (h.unanswered || 0) < UNANSWERED_LIMIT;
 }
 
 // Timers hoisted to module scope so gracefulShutdown can clear them deterministically.
@@ -189,7 +195,7 @@ function createWSS(port = BASE_PORT) {
 
       // Anything arriving is proof this socket carries data, which is the only
       // evidence that counts for keeping it.
-      connHealth(ws).lastSeen = Date.now();
+      connHealth(ws).unanswered = 0;
 
       if (msg.type === 'ping') {
         try { ws.send(JSON.stringify({ type: 'pong' })); } catch {}
@@ -198,7 +204,9 @@ function createWSS(port = BASE_PORT) {
       // A pong additionally proves the far end speaks the heartbeat, which is what
       // makes it fair to hang up on this connection later for going silent.
       if (msg.type === 'pong') {
-        connHealth(ws).everPonged = true;
+        const h = connHealth(ws);
+        h.everPonged = true;
+        h.unanswered = 0;
         return;
       }
 
@@ -266,7 +274,11 @@ function createWSS(port = BASE_PORT) {
         if (activeExt === ws) { activeExt = null; pickFailover(); }
         continue;
       }
-      try { ws.send(JSON.stringify({ type: 'ping' })); } catch {}
+      try {
+        ws.send(JSON.stringify({ type: 'ping' }));
+        const h = connHealth(ws);
+        h.unanswered = (h.unanswered || 0) + 1;
+      } catch {}
     }
     if (Date.now() - lastActivity > 4 * 60 * 60 * 1000) {
       gracefulShutdown('Idle timeout (4h)');

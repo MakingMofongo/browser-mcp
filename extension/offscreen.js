@@ -52,27 +52,41 @@ async function getInstanceInfo() {
 // never answers, is never judged, and behaves exactly as it does today. This can
 // close a connection it has proven dead, and no other kind.
 const HEARTBEAT_MS = 15000;
-const SILENT_LIMIT_MS = 50000;
-const health = new Map(); // port → { lastSeen, everPonged }
+const UNANSWERED_LIMIT = 3;
+const health = new Map(); // port → { unanswered, everPonged }
 
 function noteAlive(port) {
   const h = health.get(port) || {};
-  h.lastSeen = Date.now();
+  h.unanswered = 0;
   health.set(port, h);
 }
 
+// Counts unanswered pings rather than measuring elapsed time, and the difference
+// is not academic. This document is permanently hidden, and Chrome throttles
+// timers in hidden documents — as far down as once a minute. A rule like "closed
+// if nothing has arrived for fifty seconds" then fires on every healthy
+// connection the moment the interval slips past fifty, because the gap it is
+// measuring is its own. It would have disconnected everything, once a minute,
+// for ever: precisely the fault it was written to cure.
+//
+// A count cannot slip. Three pings sent with nothing coming back means nothing is
+// there, whether they went out over forty-five seconds or three minutes.
 function heartbeat() {
   for (const [port, ws] of connections) {
     if (!ws || ws.readyState !== WebSocket.OPEN) continue;
-    const h = health.get(port);
-    if (h?.everPonged && h.lastSeen && Date.now() - h.lastSeen > SILENT_LIMIT_MS) {
-      console.warn(`[Offscreen] port ${port} stopped answering; closing so it can be replaced`);
+    const h = health.get(port) || {};
+    if (h.everPonged && (h.unanswered || 0) >= UNANSWERED_LIMIT) {
+      console.warn(`[Offscreen] port ${port} ignored ${h.unanswered} pings; closing so it can be replaced`);
       try { ws.close(); } catch {}
       connections.delete(port);
       health.delete(port);
       continue;
     }
-    try { ws.send(JSON.stringify({ type: 'ping' })); } catch {}
+    try {
+      ws.send(JSON.stringify({ type: 'ping' }));
+      h.unanswered = (h.unanswered || 0) + 1;
+      health.set(port, h);
+    } catch {}
   }
 }
 
@@ -128,7 +142,7 @@ function tryConnect(port) {
     if (cmd.type === 'pong') {
       const h = health.get(port) || {};
       h.everPonged = true;
-      h.lastSeen = Date.now();
+      h.unanswered = 0;
       health.set(port, h);
       return;
     }
