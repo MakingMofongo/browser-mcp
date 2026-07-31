@@ -95,11 +95,12 @@ export const TOOLS = [
   },
   {
     name: 'browser_record',
-    description: 'Record a flow so it can be replayed later. Start recording, run the flow once, then stop to save it. Only page-changing actions are recorded, and each target is stored by a durable identity rather than a reference ID so it survives a fresh page load. Also lists, shows and deletes saved flows.',
+    description: 'Record a flow so it can be replayed later. Start recording, run the flow once, then stop to save it. Only page-changing actions are recorded, and each target is stored by a durable identity rather than a reference ID so it survives a fresh page load. Record a second pass with mode "extend" to teach the flow a branch that only some records take. Also lists, shows and deletes saved flows.',
     inputSchema: {
       type: 'object',
       properties: {
         action: { type: 'string', enum: ['start', 'stop', 'list', 'show', 'delete'], description: 'Default is start' },
+        mode: { type: 'string', enum: ['new', 'extend'], description: 'extend records another pass over an existing flow. Steps that appear in both passes stay required; steps that appear in only one become conditional and run at replay only when their target is present, which is how a flow covers a data-dependent branch.' },
         name: { type: 'string', description: 'Flow name, required for start, show and delete' },
       },
     },
