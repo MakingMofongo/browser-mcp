@@ -596,8 +596,18 @@ async function suite() {
     const dlg = await send('handle_dialog', { accept: true, timeout: 1500 });
     check('handle_dialog says so when no dialog is open', dlg.ok === false && /No dialog/i.test(dlg.error || ''), dlg.error);
 
+    // Asked for a size, and told what it got. Chrome does not always give the
+    // exact number — window chrome and display scaling move it a pixel or two, and
+    // it came back 1201x801 once — so demanding equality tests the window manager
+    // rather than the tool. What matters is that it resized, and that the number
+    // reported is the real one rather than the number requested.
+    const smaller = await send('resize_window', { width: 900, height: 700 });
     const win = await send('resize_window', { width: 1200, height: 800 });
-    check('resize_window reports the size it achieved', win.ok === true && win.window?.width === 1200, JSON.stringify(win.window));
+    const near = (a, b) => typeof a === 'number' && Math.abs(a - b) <= 12;
+    check('resize_window resizes and reports what it actually got',
+      win.ok === true && near(win.window?.width, 1200) && near(win.window?.height, 800) &&
+      smaller.window?.width !== win.window?.width,
+      JSON.stringify({ asked: '1200x800', got: win.window, was: smaller.window?.width }));
 
     const frames = await send('list_frames', {});
     check('list_frames names the page it is looking at',
