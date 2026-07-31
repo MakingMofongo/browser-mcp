@@ -354,6 +354,10 @@ mcpServer.setRequestHandler(CallToolRequestSchema, async (request) => {
       browser_find: 'find',
       browser_health: 'health',
       browser_form_state: 'form_state',
+      browser_network_log: 'network_log',
+      browser_drag: 'drag',
+      browser_triple_click: 'triple_click',
+      browser_resize_window: 'resize_window',
       browser_attach_tab: 'attach_tab',
       browser_detach_tab: 'detach_tab',
     };

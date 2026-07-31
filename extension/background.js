@@ -308,6 +308,9 @@ async function debuggerAttach(tabId) {
       if (await verifyAttachedWithChrome(tabId)) {
         debuggerAttached.add(tabId);
         stickyTabs.add(tabId); // hold this tab across future navigations
+        // Start recording network from the moment we own the tab, so the log is
+        // there when someone asks — not only after they think to ask.
+        chrome.debugger.sendCommand({ tabId }, 'Network.enable', {}).catch(() => {});
         return;
       }
       // Ghost — detach cleanly so the next attempt starts fresh, then retry.
@@ -369,6 +372,46 @@ function debuggerForceDetach(tabId) {
     chrome.debugger.detach({ tabId });
   } catch {}
 }
+
+// ── Network request log (parity gap vs Claude-in-Chrome) ───────────────────
+// wait_for_network only ever waited for ONE request. This keeps a rolling log per
+// tab from the moment the debugger attaches, so "what did this page call?" is
+// answerable retroactively — the same reasoning as capturing console at
+// document_start instead of at first read.
+const networkLogs = new Map(); // tabId → [{id, method, url, status, type, ms, failed}]
+const NET_MAX = 300;
+
+function netBuf(tabId) {
+  let b = networkLogs.get(tabId);
+  if (!b) { b = []; networkLogs.set(tabId, b); }
+  return b;
+}
+
+chrome.debugger.onEvent.addListener((source, method, params) => {
+  const tabId = source.tabId;
+  if (!tabId || !method.startsWith('Network.')) return;
+  const buf = netBuf(tabId);
+  if (method === 'Network.requestWillBeSent') {
+    buf.push({
+      id: params.requestId,
+      method: params.request?.method,
+      url: (params.request?.url || '').slice(0, 300),
+      type: params.type,
+      started: params.timestamp,
+    });
+    if (buf.length > NET_MAX) buf.splice(0, buf.length - NET_MAX);
+  } else if (method === 'Network.responseReceived') {
+    const e = buf.find(x => x.id === params.requestId);
+    if (e) { e.status = params.response?.status; e.mime = params.response?.mimeType; }
+  } else if (method === 'Network.loadingFinished' || method === 'Network.loadingFailed') {
+    const e = buf.find(x => x.id === params.requestId);
+    if (e) {
+      if (e.started != null && params.timestamp != null) e.ms = Math.round((params.timestamp - e.started) * 1000);
+      if (method === 'Network.loadingFailed') { e.failed = true; e.error = params.errorText; }
+      delete e.started;
+    }
+  }
+});
 
 // Sync local Set when Chrome auto-detaches (navigation, idle, devtools opened, etc.)
 chrome.debugger.onDetach.addListener((source, reason) => {
@@ -1986,6 +2029,20 @@ async function dispatch(port, method, params) {
       const session = getSession(port);
       let tab = await getSessionTab(port);
 
+      // History navigation parity: url:"back" / "forward"
+      const nav = String(params.url || '').toLowerCase();
+      if (nav === 'back' || nav === 'forward') {
+        try {
+          if (nav === 'back') await chrome.tabs.goBack(tab.id);
+          else await chrome.tabs.goForward(tab.id);
+        } catch (e) {
+          return { ok: false, error: `Cannot go ${nav}: ${e.message} (no entry in this tab's history)` };
+        }
+        await new Promise(r => setTimeout(r, 600));
+        const t = await chrome.tabs.get(tab.id);
+        return { ok: true, went: nav, title: t.title, url: t.url, tab_id: t.id };
+      }
+
       // Always reuse the active tab — navigate in place, don't create new tabs
       // Only create new tab if explicitly requested via new_tab param
       if (params.new_tab) {
@@ -2808,6 +2865,119 @@ async function dispatch(port, method, params) {
       }
       const verdict = await debuggerClick(tab.id, params.x, params.y);
       return { ok: verdict.landed, clicked_at: { x: params.x, y: params.y }, click_path: verdict.path, verified: verdict.landed };
+    }
+
+    case 'network_log': {
+      const tab = await getSessionTab(port);
+      await debuggerAttach(tab.id).catch(() => {}); // ensures Network.enable ran
+      const buf = networkLogs.get(tab.id) || [];
+      const pat = params.url_pattern || '';
+      // Other extensions' content scripts fetch their own assets through the page,
+      // and those chrome-extension:// requests drowned the page's real traffic.
+      // They are never what the caller means by "what did this page request".
+      let out = buf.filter(e =>
+        (params.include_extension_requests || !(e.url || '').startsWith('chrome-extension://')) &&
+        (!pat || (e.url || '').includes(pat)) &&
+        (!params.only_failed || e.failed || (e.status >= 400)));
+      const total = out.length;
+      out = out.slice(-(params.limit || 50)).map(({ id, started, ...rest }) => rest);
+      if (params.clear) networkLogs.set(tab.id, []);
+      return {
+        requests: out, total_matched: total, buffered: buf.length,
+        ...(buf.length === 0 ? { note: 'Empty — recording starts when the debugger attaches to a tab. Reload the page to capture its full load sequence.' } : {}),
+      };
+    }
+
+    case 'drag': {
+      // Real drag: press, move in steps (frameworks need intermediate moves), release.
+      // Falls back to HTML5 drag-and-drop events for dropzones that listen for
+      // dragstart/dragover/drop rather than raw mouse movement.
+      const tab = await getSessionTab(port, true);
+      if (tab.url.startsWith('chrome://')) throw new Error('Cannot interact with chrome:// pages');
+      const from = params.from_selector ? await resolveElement(tab.id, params.from_selector)
+        : (typeof params.from_x === 'number' ? { x: params.from_x, y: params.from_y } : null);
+      const to = params.to_selector ? await resolveElement(tab.id, params.to_selector)
+        : (typeof params.to_x === 'number' ? { x: params.to_x, y: params.to_y } : null);
+      if (!from) return { ok: false, error: 'from_selector not found or from_x/from_y missing' };
+      if (!to) return { ok: false, error: 'to_selector not found or to_x/to_y missing' };
+      const steps = Math.max(2, Math.min(40, params.steps || 12));
+      try {
+        await debuggerAttach(tab.id);
+        await cdpSend(tab.id, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x: from.x, y: from.y });
+        await cdpSend(tab.id, 'Input.dispatchMouseEvent', { type: 'mousePressed', x: from.x, y: from.y, button: 'left', buttons: 1, clickCount: 1 });
+        for (let i = 1; i <= steps; i++) {
+          const t = i / steps;
+          await cdpSend(tab.id, 'Input.dispatchMouseEvent', {
+            type: 'mouseMoved', button: 'left', buttons: 1,
+            x: Math.round(from.x + (to.x - from.x) * t),
+            y: Math.round(from.y + (to.y - from.y) * t),
+          });
+          await new Promise(r => setTimeout(r, 16));
+        }
+        await cdpSend(tab.id, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x: to.x, y: to.y, button: 'left', buttons: 0, clickCount: 1 });
+        return { ok: true, method: 'trusted-mouse', from: { x: from.x, y: from.y }, to: { x: to.x, y: to.y } };
+      } catch (e) {
+        // HTML5 DnD fallback (sortable lists, upload dropzones)
+        const [r] = await chrome.scripting.executeScript({
+          target: { tabId: tab.id }, world: 'MAIN',
+          args: [from.x, from.y, to.x, to.y],
+          func: (fx, fy, tx, ty) => {
+            const src = document.elementFromPoint(fx, fy);
+            const dst = document.elementFromPoint(tx, ty);
+            if (!src || !dst) return { ok: false, error: 'endpoint element not found' };
+            const dt = new DataTransfer();
+            const mk = (type, el, x, y) => el.dispatchEvent(new DragEvent(type, { bubbles: true, cancelable: true, composed: true, clientX: x, clientY: y, dataTransfer: dt }));
+            mk('dragstart', src, fx, fy); mk('dragenter', dst, tx, ty);
+            mk('dragover', dst, tx, ty); mk('drop', dst, tx, ty); mk('dragend', src, tx, ty);
+            return { ok: true };
+          },
+        });
+        return r?.result?.ok
+          ? { ok: true, method: 'html5-dnd-fallback', note: 'trusted mouse drag failed: ' + (e?.message || e) }
+          : { ok: false, error: 'both trusted drag and HTML5 DnD failed: ' + (e?.message || e) };
+      }
+    }
+
+    case 'triple_click': {
+      // Selects a whole line/paragraph — the reliable way to replace text in
+      // rich editors before typing.
+      const tab = await getSessionTab(port, true);
+      const el = await resolveElement(tab.id, params.selector);
+      if (!el) return { ok: false, error: 'Element not found: ' + params.selector };
+      await debuggerAttach(tab.id);
+      const { x, y } = el;
+      await cdpSend(tab.id, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x, y });
+      for (let n = 1; n <= 3; n++) {
+        await cdpSend(tab.id, 'Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', buttons: 1, clickCount: n });
+        await cdpSend(tab.id, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', buttons: 0, clickCount: n });
+        await new Promise(r => setTimeout(r, 30));
+      }
+      const [sel] = await chrome.scripting.executeScript({
+        target: { tabId: tab.id }, world: 'MAIN',
+        func: () => (window.getSelection?.().toString() || '').slice(0, 120),
+      }).catch(() => [null]);
+      return { ok: true, tag: el.tag, selected_text: sel?.result ?? null };
+    }
+
+    case 'resize_window': {
+      const tab = await getSessionTab(port);
+      const w = params.width, h = params.height;
+      if (typeof w !== 'number' || typeof h !== 'number') return { ok: false, error: 'width and height (numbers) required' };
+      const win = await chrome.windows.get(tab.windowId);
+      if (win.state === 'maximized' || win.state === 'fullscreen') {
+        await chrome.windows.update(tab.windowId, { state: 'normal' });
+      }
+      const updated = await chrome.windows.update(tab.windowId, { width: Math.round(w), height: Math.round(h) });
+      const [vp] = await chrome.scripting.executeScript({
+        target: { tabId: tab.id }, world: 'MAIN',
+        func: () => ({ w: innerWidth, h: innerHeight, dpr: devicePixelRatio }),
+      }).catch(() => [null]);
+      return {
+        ok: true,
+        window: { width: updated.width, height: updated.height, state: updated.state },
+        viewport: vp?.result || null,
+        note: 'Window (not viewport) size — the viewport is smaller by the browser chrome.',
+      };
     }
 
     case 'reattach_debugger': {
@@ -3797,8 +3967,51 @@ async function dispatch(port, method, params) {
             upload: ['input[type="file"]'],
             date: ['input[type="date"]', 'input[placeholder*="date" i]'],
           };
+          // Intent synonyms: a query says what the user WANTS, the page says what
+          // the designer CALLED it. "submit" must reach a button labelled
+          // "Continue", "login" must reach "Sign in". Claude-in-Chrome solves this
+          // by shipping the whole a11y tree to an LLM and asking; matching the
+          // vocabulary locally gets most of that benefit with no round-trip.
+          const SYN = {
+            submit: ['submit', 'continue', 'next', 'save', 'send', 'confirm', 'apply', 'proceed', 'done', 'finish'],
+            login: ['login', 'log in', 'sign in', 'signin', 'continue'],
+            logout: ['logout', 'log out', 'sign out', 'signout'],
+            search: ['search', 'find', 'query', 'lookup'],
+            email: ['email', 'e-mail', 'mail', 'username', 'user name'],
+            password: ['password', 'passcode', 'pwd'],
+            cancel: ['cancel', 'close', 'dismiss', 'back', 'discard'],
+            upload: ['upload', 'attach', 'choose file', 'browse', 'add file'],
+            delete: ['delete', 'remove', 'trash', 'discard'],
+            edit: ['edit', 'change', 'modify', 'update'],
+            phone: ['phone', 'telephone', 'mobile', 'tel', 'contact number'],
+            address: ['address', 'street', 'city', 'postal', 'zip'],
+            accept: ['accept', 'agree', 'ok', 'yes', 'allow', 'consent'],
+          };
           const qLower = query.toLowerCase().trim();
           let tokens = qLower.split(/\s+/).filter(t => t.length > 1);
+          // Expand each token with its synonym family (a match on any counts)
+          const expand = (t) => {
+            for (const fam of Object.values(SYN)) if (fam.includes(t)) return fam;
+            return [t];
+          };
+          // Cheap typo tolerance: <=1 edit INCLUDING transposition. Transpositions
+          // ("passwrod", "feild") are the most common real typo, and a plain
+          // Levenshtein walk scores them as 2 edits and rejects them — which is
+          // exactly what happened the first time this shipped.
+          const near = (a, b) => {
+            if (Math.abs(a.length - b.length) > 1 || a[0] !== b[0] || a.length < 4) return false;
+            let i = 0, j = 0, diff = 0;
+            while (i < a.length && j < b.length) {
+              if (a[i] === b[j]) { i++; j++; continue; }
+              if (++diff > 1) return false;
+              if (a.length === b.length) {
+                if (a[i + 1] === b[j] && a[i] === b[j + 1]) { i += 2; j += 2; continue; } // swap
+                i++; j++;
+              } else if (a.length > b.length) i++;
+              else j++;
+            }
+            return true;
+          };
           const hintSelectors = [];
           tokens = tokens.filter(t => {
             const hint = ROLE_HINTS[t.replace(/s$/, '')] || ROLE_HINTS[t];
@@ -3830,8 +4043,22 @@ async function dispatch(port, method, params) {
               else if (name.startsWith(textQuery)) { score += 60; reasons.push('starts-with'); }
               else if (name.includes(textQuery)) { score += 45; reasons.push('contains'); }
               else {
-                const hit = tokens.filter(t => name.includes(t)).length;
-                if (hit) { score += Math.round(35 * hit / tokens.length); reasons.push(`${hit}/${tokens.length} words`); }
+                let hit = 0, synHit = 0, fuzzyHit = 0;
+                const nameWords = name.split(/[^a-z0-9]+/).filter(Boolean);
+                for (const t of tokens) {
+                  if (name.includes(t)) { hit++; continue; }
+                  if (expand(t).some(s => s !== t && name.includes(s))) { synHit++; continue; }
+                  if (nameWords.some(w => near(t, w))) fuzzyHit++;
+                }
+                const matched = hit + synHit + fuzzyHit;
+                if (matched) {
+                  score += Math.round((hit * 35 + synHit * 28 + fuzzyHit * 18) / tokens.length);
+                  const bits = [];
+                  if (hit) bits.push(`${hit} word${hit > 1 ? 's' : ''}`);
+                  if (synHit) bits.push(`${synHit} synonym${synHit > 1 ? 's' : ''}`);
+                  if (fuzzyHit) bits.push(`${fuzzyHit} fuzzy`);
+                  reasons.push(bits.join('+'));
+                }
               }
             } else if (textQuery && !name) {
               continue;

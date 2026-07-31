@@ -62,6 +62,55 @@ export const TOOLS = [
     },
   },
   {
+    name: 'browser_network_log',
+    description: 'Read the HTTP requests this page made (XHR, fetch, documents, images) with method, URL, status, MIME type and duration. Recording starts the moment the debugger attaches, so the log is already there when you ask — unlike browser_wait_for_network, which only waits for a single future request. Filter with url_pattern, or only_failed:true to see just 4xx/5xx/network errors.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        url_pattern: { type: 'string', description: 'Substring filter, e.g. "/api/" or "graphql"' },
+        only_failed: { type: 'boolean', description: 'Only failed requests and HTTP >= 400' },
+        limit: { type: 'number', description: 'Max entries returned (default: 50)' },
+        clear: { type: 'boolean', description: 'Clear the buffer after reading' },
+        include_extension_requests: { type: 'boolean', description: 'Include chrome-extension:// asset requests from other installed extensions (excluded by default as noise)' },
+      },
+    },
+  },
+  {
+    name: 'browser_drag',
+    description: 'Drag from one point/element to another with real trusted mouse events moved in steps (sliders, reorderable lists, canvas, kanban cards), with an automatic HTML5 drag-and-drop fallback for dropzones that listen for dragstart/dragover/drop. Give from_selector/to_selector (CSS, text, or ref) or raw from_x/from_y/to_x/to_y coordinates.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        from_selector: { type: 'string', description: 'Source element (CSS, text=, or ref_N)' },
+        to_selector: { type: 'string', description: 'Target element (CSS, text=, or ref_N)' },
+        from_x: { type: 'number' }, from_y: { type: 'number' },
+        to_x: { type: 'number' }, to_y: { type: 'number' },
+        steps: { type: 'number', description: 'Intermediate move events, more = smoother (default 12)' },
+      },
+    },
+  },
+  {
+    name: 'browser_triple_click',
+    description: 'Triple-click to select an entire line/paragraph — the reliable way to replace existing text in rich editors (contenteditable, Quill, ProseMirror) before typing. Returns the text that got selected so you can confirm you grabbed the right thing.',
+    inputSchema: {
+      type: 'object',
+      properties: { selector: { type: 'string', description: 'CSS, text, or ref selector' } },
+      required: ['selector'],
+    },
+  },
+  {
+    name: 'browser_resize_window',
+    description: 'Resize the browser window (responsive testing, or making more of a long form visible at once). Returns both the window size and the resulting inner viewport size.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        width: { type: 'number', description: 'Window width in pixels' },
+        height: { type: 'number', description: 'Window height in pixels' },
+      },
+      required: ['width', 'height'],
+    },
+  },
+  {
     name: 'browser_health',
     description: 'Pre-flight check of the automation channels on the active tab: is script injection working, is the debugger attachable, which tab is active, how many session tabs exist. Call when interactive tools start failing (attach errors, timeouts) to diagnose instead of retrying blind — the hint field says what to do.',
     inputSchema: { type: 'object', properties: {} },
@@ -88,7 +137,7 @@ export const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
-        url: { type: 'string', description: 'URL to navigate to' },
+        url: { type: 'string', description: 'URL to navigate to, or "back" / "forward" to move through this tab\'s history' },
         new_tab: { type: 'boolean', description: 'Open in new tab instead of reusing current (default: false)' },
       },
       required: ['url'],
