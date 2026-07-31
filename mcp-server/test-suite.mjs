@@ -234,6 +234,56 @@ async function suite() {
       amb.ok === true && amb.selected === 'Option 2', amb.selected || amb.error);
   });
 
+  await group('press_key actually presses', async () => {
+    await send('navigate', { url: `${BASE}/login` });
+    await send('execute_script', { code: "document.querySelector('#username').focus(); 1" });
+    const typed = await send('press_key', { key: 'a' });
+    const val = await send('execute_script', { code: "document.querySelector('#username').value" });
+    check('a character key reaches the focused field', typed.ok === true && val.result === 'a', JSON.stringify({ path: typed.path, val: val.result }));
+    const tab = await send('press_key', { key: 'Tab' });
+    const focused = await send('execute_script', { code: 'document.activeElement.id' });
+    check('Tab moves focus and says where it went', tab.ok === true && focused.result === 'password', JSON.stringify({ effect: tab.effect, id: focused.result }));
+    await send('execute_script', { code: "document.querySelector('#username').value='tomsmith';document.querySelector('#password').value='SuperSecretPassword!';document.querySelector('#password').focus();1" });
+    await send('press_key', { key: 'Enter' });
+    await send('wait', { selector: 'text=Secure Area', timeout: 9000 }).catch(() => {});
+    const where = await send('execute_script', { code: 'location.pathname' });
+    check('Enter in a form submits it', where.result === '/secure', where.result);
+
+    // A page that handles the key itself must not also get the default action.
+    await send('navigate', { url: `${BASE}/login` });
+    await setup(`document.querySelector('#username').addEventListener('keydown',e=>{if(e.key==='Enter')e.preventDefault()});document.querySelector('#username').focus();1`);
+    await send('press_key', { key: 'Enter' });
+    const stayed = await send('execute_script', { code: 'location.pathname' });
+    check('a cancelled Enter does not submit anyway', stayed.result === '/login', stayed.result);
+  });
+
+  await group('combobox verifies', async () => {
+    // A widget that renders options, accepts the click, and never commits the
+    // selection — how React-Select behaves when it wants mousedown.
+    await send('navigate', { url: `${BASE}/login` });
+    await setup(`document.body.insertAdjacentHTML('beforeend',
+      '<div id=cbwrap><input id=cb role=combobox aria-expanded=false autocomplete=off>' +
+      '<div id=cblist role=listbox style="min-height:20px"></div></div>');
+      const cb=document.getElementById('cb'), list=document.getElementById('cblist');
+      cb.addEventListener('input',()=>{ list.innerHTML='';
+        ['Osmania University','Oxford University'].filter(o=>o.toLowerCase().includes(cb.value.toLowerCase()))
+          .forEach(o=>{ const d=document.createElement('div'); d.setAttribute('role','option');
+            d.textContent=o; d.style.cssText='padding:4px'; list.appendChild(d); });
+        cb.setAttribute('aria-expanded','true'); }); 'ok'`);
+    const swallowed = await send('set_combobox', { selector: '#cb', values: 'Osmania University' });
+    check('a combobox that ignores the click is reported, not called done',
+      swallowed.ok === false && /needs a real press|still shows/.test(JSON.stringify(swallowed.results || [])),
+      JSON.stringify(swallowed.results));
+
+    // Twin: the same widget, now committing on click as a working one would.
+    await setup(`document.getElementById('cblist').addEventListener('click',(e)=>{
+      if(e.target.getAttribute('role')==='option'){ document.getElementById('cb').value=e.target.textContent; }}); 'ok'`);
+    const works = await send('set_combobox', { selector: '#cb', values: 'Osmania University' });
+    const val = await send('execute_script', { code: "document.getElementById('cb').value" });
+    check('a combobox that does commit is reported as done',
+      works.ok === true && val.result === 'Osmania University', JSON.stringify({ ok: works.ok, val: val.result }));
+  });
+
   await group('storage and cookies verify', async () => {
     await send('navigate', { url: `${BASE}/login` });
     const ls = await send('set_local_storage', { key: 'bmcp_probe', value: 'kept' });
