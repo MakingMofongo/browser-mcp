@@ -67,6 +67,19 @@ if (bgCopy !== bgSrc) fail('mcp-server/extension/background.js out of sync with 
 // Anything genuinely unreachable from a headless run belongs below WITH a reason.
 // An entry here is a claim that the tool cannot be tested, not that testing it was
 // inconvenient, and it is the first place to look when one of these breaks.
+// 6b. Replayed steps must go through the same path a caller's action does.
+//
+// Three separate checks were built on top of dispatch and were dead during replay
+// because replayed steps went straight to dispatchCore — the request capture, the
+// shape comparison, and the record of what a row wrote. All three had passing
+// tests, since tests drive the tools the way a caller does, and all three were
+// found by accident. This is a crude check for a structural rule, but the rule is
+// worth more than the elegance: whatever wraps an action has to wrap it for
+// unattended runs too, which is where it matters most.
+if (!/out = await runAction\(port, step\.method, p, \{ core: true \}\)/.test(bgSrc)) {
+  fail('replayed steps no longer go through runAction — anything wrapped around an action will be missing from replay, which is the path long unattended runs take');
+}
+
 const suiteSrc = readFileSync(new URL('./test-suite.mjs', import.meta.url), 'utf8');
 const UNTESTABLE = {
   browser_list_browsers: 'needs a second browser connected to mean anything',

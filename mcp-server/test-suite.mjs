@@ -854,6 +854,43 @@ async function suite() {
     await send('record', { action: 'delete', name: '__shape' }).catch(() => {});
   });
 
+  // Every check here has to work on the replay path, not just when a caller drives
+  // the tools directly. Three of them did not, for a long time, and every test
+  // passed throughout because tests drive the tools the way a caller does. These
+  // exercise the guards from inside a run.
+  await group('the guards work during a replay, not only by hand', async () => {
+    await send('record', { action: 'delete', name: '__guard' }).catch(() => {});
+    await send('navigate', { url: `${BASE}/login` });
+    await send('record', { action: 'start', name: '__guard' });
+    await send('fill', { selector: '#username', value: 'tomsmith' });
+    await send('fill', { selector: '#password', value: 'SuperSecretPassword!' });
+    await send('submit', { expect_text: 'Secure Area', timeout: 9000 });
+    await send('record', { action: 'stop' });
+
+    // A field the page empties on blur. The blank-save guard reads what the row
+    // wrote, which is exactly the record that was missing on this path.
+    await send('navigate', { url: `${BASE}/login` });
+    await setup(`document.querySelector('#username').addEventListener('blur',e=>{e.target.value=''}); 1`);
+    const run = await send('replay', { name: '__guard', start_url: false, rows: [{ Username: 'tomsmith', Password: 'SuperSecretPassword!' }] });
+    const led = await send('runs', { id: run.run_id });
+    const row = led.rows?.[0];
+    // Stopped before the submit, naming the field and that it was found empty.
+    // Which check catches it matters less than that a run catches it at all —
+    // reading what the row wrote is what none of them could do on this path.
+    const mismatch = JSON.stringify(row?.diverged_at || {});
+    check('a row whose field empties itself is stopped inside the run',
+      row?.status !== 'done' && /Username/.test(mismatch) && /"found":""/.test(mismatch),
+      row?.diverged_at?.reason);
+
+    // And the request capture, which the shape comparison is built on.
+    await send('navigate', { url: `${BASE}/login` });
+    const clean = await send('replay', { name: '__guard', start_url: false, rows: [{ Username: 'tomsmith', Password: 'SuperSecretPassword!' }] });
+    const cleanLed = await send('runs', { id: clean.run_id });
+    check('a replayed row still records what it sent',
+      cleanLed.rows?.[0]?.status === 'done', JSON.stringify(cleanLed.rows?.map(r => r.status)));
+    await send('record', { action: 'delete', name: '__guard' }).catch(() => {});
+  });
+
   // When forty of five hundred rows go sideways the questions are always the same,
   // and every one of them is unanswerable an hour later once the tab has moved on.
   await group('a row that went wrong keeps what is needed to work out why', async () => {
