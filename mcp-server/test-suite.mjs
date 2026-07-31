@@ -8,6 +8,15 @@
  * OUTCOME rather than a return code: a tool reporting success while the page
  * disagrees is the failure mode this whole line of work exists to remove, so
  * asserting on ok:true would miss precisely the bugs worth catching.
+ *
+ * The same applies one step further in, and it is easier to get wrong. Asserting
+ * that a result has a field, that an array came back, or that something matched
+ * is not asserting that the right thing happened. find returned the wrong element
+ * for a long time behind "at least one match"; get_cookies was satisfied by an
+ * empty array; hover was satisfied by naming a route it had not taken. Assert the
+ * value: this href, this url, this cookie, an event the page actually saw. A test
+ * that passes when the behaviour is wrong is worse than no test, because it turns
+ * a gap in coverage into a reason to stop looking.
  */
 import { WebSocketServer } from 'ws';
 import { startFixtures } from './fixtures.mjs';
@@ -51,7 +60,7 @@ async function suite() {
   const tbl = await send('extract', { selector: '#table1', max_rows: 5 });
   check('extract reads a table with headers', tbl.source === 'table' && tbl.columns?.includes('Email') && tbl.rows?.length >= 4,
     `${tbl.source} cols=${tbl.columns?.length} rows=${tbl.rows?.length}`);
-  check('extract keeps cell links', !!tbl.rows?.[0]?.Action_href, tbl.rows?.[0]?.Action_href);
+  check('extract keeps cell links', /\/edit\/0$/.test(tbl.rows?.[0]?.Action_href || ''), tbl.rows?.[0]?.Action_href);
 
   // ── extract: inferred repeated structure, no selector ───────────────────
   await send('navigate', { url: 'https://quotes.toscrape.com/' });
@@ -449,7 +458,9 @@ async function suite() {
     check('resize_window reports the size it achieved', win.ok === true && win.window?.width === 1200, JSON.stringify(win.window));
 
     const frames = await send('list_frames', {});
-    check('list_frames lists the main frame', Array.isArray(frames.frames) && frames.frames.length >= 1, String(frames.frames?.length));
+    check('list_frames names the page it is looking at',
+      /\/login$/.test(frames.frames?.[0]?.url || '') && frames.frames?.[0]?.frame_id === 0,
+      JSON.stringify(frames.frames?.[0]));
 
     // get_new_tab exists to catch a tab that appeared — an OAuth popup, a target
     // _blank. Asking before one has is meant to find nothing, so open one first
@@ -458,7 +469,8 @@ async function suite() {
     check('get_new_tab finds nothing when no new tab has appeared', !before.id, JSON.stringify(before));
     await send('navigate', { url: `${BASE}/dropdown`, new_tab: true });
     const nt = await send('get_new_tab', {});
-    check('get_new_tab returns the tab that just appeared', nt.ok === true && !!nt.id, JSON.stringify({ id: nt.id, m: nt.matched }));
+    check('get_new_tab returns the tab that just appeared',
+      nt.ok === true && /\/dropdown$/.test(nt.url || ''), JSON.stringify({ id: nt.id, url: nt.url }));
     const sw = await send('switch_tab', { tab_id: nt.id });
     check('switch_tab makes that tab current', sw.id === nt.id, String(sw.id));
 
@@ -472,8 +484,11 @@ async function suite() {
     check('double_click fires a real dblclick on the page',
       dbl.ok === true && seen.result === 1, JSON.stringify({ path: dbl.path, seen: seen.result }));
 
+    await setup(`window.__hovSeen = 0; document.querySelector('h2').addEventListener('mouseover', () => window.__hovSeen++); 1`);
     const hov = await send('hover', { selector: 'h2', duration: 50 });
-    check('hover reports which path delivered it', hov.ok === true && !!hov.path, hov.path);
+    const hovSeen = await send('execute_script', { code: 'window.__hovSeen' });
+    check('hover actually reaches the element',
+      hov.ok === true && !!hov.path && hovSeen.result >= 1, JSON.stringify({ path: hov.path, seen: hovSeen.result }));
 
     await send('navigate', { url: `${BASE}/drag_and_drop` });
     const dragged = await send('drag', { from_selector: '#column-a', to_selector: '#column-b' });
@@ -520,8 +535,11 @@ async function suite() {
     check('wait_for_network returns a verdict rather than hanging',
       typeof netWait.ok === 'boolean', JSON.stringify(netWait).slice(0, 80));
 
-    const ck = await send('get_cookies', { domain: 'the-internet.herokuapp.com' });
-    check('get_cookies returns cookies for the domain', Array.isArray(ck.cookies), String(ck.cookies?.length));
+    await send('set_cookies', { cookies: [{ name: 'bmcp_probe', value: 'yes', domain: '127.0.0.1', url: BASE, secure: false }] });
+    const ck = await send('get_cookies', { domain: '127.0.0.1' });
+    check('get_cookies returns the cookie that was just set',
+      (ck.cookies || []).some(c => c.name === 'bmcp_probe' && c.value === 'yes'),
+      JSON.stringify((ck.cookies || []).map(c => c.name).slice(0, 5)));
     await send('set_local_storage', { key: 'bmcp_cov', value: 'yes' });
     const lsv = await send('get_local_storage', { key: 'bmcp_cov' });
     check('get_local_storage reads back what set_local_storage wrote', lsv.value === 'yes', String(lsv.value));
@@ -1174,7 +1192,11 @@ async function suite() {
   const tabs = await send('list_tabs', {});
   for (const t of tabs.tabs || []) await send('close_tab', { tab_id: t.id }).catch(() => {});
   const alive = await send('health', {}, 20000).catch(e => ({ err: e.message }));
-  check('the session survives closing its last tab', alive.ok === true, alive.err || '');
+  const stillWorks = await send('navigate', { url: `${BASE}/login` });
+  const stillReads = await send('execute_script', { code: 'document.title' });
+  check('the session survives closing its last tab',
+    alive.ok === true && stillWorks.ok === true && typeof stillReads.result === 'string' && stillReads.result.length > 0,
+    JSON.stringify({ alive: alive.ok, nav: stillWorks.ok, title: stillReads.result }));
   const leftover = await send('list_tabs', {});
   for (const t of leftover.tabs || []) await send('close_tab', { tab_id: t.id }).catch(() => {});
 }
