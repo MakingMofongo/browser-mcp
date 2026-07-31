@@ -654,7 +654,14 @@ async function suite() {
       dragged.ok === true && order.result.join('') === 'BA', JSON.stringify({ m: dragged.method, order: order.result }));
 
     await send('navigate', { url: `${BASE}/iframe` });
-    const frames2 = await send('list_frames', {});
+    // The frame is not there the instant the page is. Asking before it exists
+    // fails on frame_index 1 not being a frame yet, which says nothing about
+    // whether code can run inside one.
+    let frames2 = await send('list_frames', {});
+    for (let i = 0; i < 10 && (frames2.frames || []).length < 2; i++) {
+      await new Promise(r => setTimeout(r, 200));
+      frames2 = await send('list_frames', {});
+    }
     const inFrame = await send('select_frame', { frame_index: 1, code: 'document.body.innerText.slice(0,40)' });
     check('select_frame runs code inside the frame',
       inFrame.ok === true && /content goes here/i.test(String(inFrame.result || '')), JSON.stringify(inFrame.result));
@@ -789,7 +796,10 @@ async function suite() {
   // fill time and saves blank. The only place to catch it is just before commit.
   await group('submit refuses to save blanks', async () => {
     await send('navigate', { url: `${BASE}/login` });
-    await setup(`document.querySelector('#username').addEventListener('blur',e=>{e.target.value=''}); 1`);
+    await setup(`const u=document.querySelector('#username');
+      // A component re-rendering from its own state when a sibling changes, which is
+      // the reactive-framework case. Deterministic: no timer to lose a race with.
+      document.querySelector('#password').addEventListener('input', () => { u.value = ''; }, { once: true }); 1`);
     await send('fill', { selector: '#username', value: 'tomsmith' });
     await send('fill', { selector: '#password', value: 'SuperSecretPassword!' });
     const refused = await send('submit', { timeout: 8000 });
@@ -832,7 +842,8 @@ async function suite() {
 
     // Twin: a field the page reformats is not a lost field, and must still submit.
     await send('navigate', { url: `${BASE}/login` });
-    await setup(`document.querySelector('#username').addEventListener('blur',e=>{e.target.value=e.target.value.toUpperCase()}); 1`);
+    await setup(`const u=document.querySelector('#username');
+      document.querySelector('#password').addEventListener('input', () => { u.value = u.value.toUpperCase(); }, { once: true }); 1`);
     await send('fill', { selector: '#username', value: 'tomsmith' });
     await send('fill', { selector: '#password', value: 'wrong' });
     const went = await send('submit', { timeout: 9000 });
@@ -1132,7 +1143,10 @@ async function suite() {
     // A field the page empties on blur. The blank-save guard reads what the row
     // wrote, which is exactly the record that was missing on this path.
     await send('navigate', { url: `${BASE}/login` });
-    await setup(`document.querySelector('#username').addEventListener('blur',e=>{e.target.value=''}); 1`);
+    await setup(`const u=document.querySelector('#username');
+      // A component re-rendering from its own state when a sibling changes, which is
+      // the reactive-framework case. Deterministic: no timer to lose a race with.
+      document.querySelector('#password').addEventListener('input', () => { u.value = ''; }, { once: true }); 1`);
     const run = await send('replay', { name: '__guard', start_url: false, rows: [{ Username: 'tomsmith', Password: 'SuperSecretPassword!' }] });
     const led = await send('runs', { id: run.run_id });
     const row = led.rows?.[0];

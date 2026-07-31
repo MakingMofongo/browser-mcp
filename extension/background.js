@@ -1095,6 +1095,31 @@ function bmcpFillOp(op, selOrExpected, TAG, extra) {
     const collateral = [];
     const alsoChanged = [];
     const secretLeak = [];
+
+    // Written first, then the neighbours are looked at — in that order, because
+    // the write is what this is looking for the effects of.
+    //
+    // These ran the other way round, which worked only while the value always
+    // arrived by trusted typing before this point. Once typing was skipped for a
+    // window without focus, the write moved into the repair below, so the
+    // comparison happened before anything had been written and every mirrored
+    // field went unreported. The check was intact; it was simply looking too early.
+    if (now !== expected) {
+      if (el.isContentEditable) {
+        el.focus();
+        el.textContent = '';
+        try { document.execCommand('insertText', false, expected); } catch (e) { el.textContent = expected; }
+      } else {
+        const proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+        const d = Object.getOwnPropertyDescriptor(proto, 'value');
+        if (d && d.set) d.set.call(el, expected); else el.value = expected;
+      }
+      el.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+      repaired = true;
+      now = String(readVal(el));
+    }
+
     const snap = window.__bmcpFieldSnapshot || [];
     for (const s of snap) {
       if (!s.el || !s.el.isConnected || s.el === el) continue;
@@ -1115,21 +1140,6 @@ function bmcpFillOp(op, selOrExpected, TAG, extra) {
         // is worth mentioning without treating it as a fault.
         alsoChanged.push(name + (cur ? ' → ' + cur.slice(0, 30) : ' (cleared)'));
       }
-    }
-    if (now !== expected) {
-      if (el.isContentEditable) {
-        el.focus();
-        el.textContent = '';
-        try { document.execCommand('insertText', false, expected); } catch (e) { el.textContent = expected; }
-      } else {
-        const proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-        const d = Object.getOwnPropertyDescriptor(proto, 'value');
-        if (d && d.set) d.set.call(el, expected); else el.value = expected;
-      }
-      el.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
-      el.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
-      repaired = true;
-      now = String(readVal(el));
     }
     return { gone: false, value: now, repaired, collateral, secret_leak: secretLeak, also_changed: alsoChanged.slice(0, 6) };
   }
