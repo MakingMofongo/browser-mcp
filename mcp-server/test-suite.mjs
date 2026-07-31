@@ -234,6 +234,38 @@ async function suite() {
       amb.ok === true && amb.selected === 'Option 2', amb.selected || amb.error);
   });
 
+  // The expensive kind of failure: the target ends up correct, so every check
+  // passes, and the value is ALSO sitting in a field nobody looked at.
+  await group('a write that leaks into another field', async () => {
+    await send('navigate', { url: `${BASE}/login` });
+    await setup(`document.querySelector('#username').addEventListener('input',e=>{document.querySelector('#password').value=e.target.value}); 1`);
+    const leaked = await send('fill', { selector: '#username', value: 'tomsmith' });
+    const both = await send('execute_script', { code: "[document.querySelector('#username').value, document.querySelector('#password').value]" });
+    check('a value that also lands elsewhere is not reported as success',
+      leaked.ok === false && /password/.test(JSON.stringify(leaked.collateral_written || [])),
+      JSON.stringify(leaked.collateral_written));
+    check('the target itself was still written correctly',
+      both.result[0] === 'tomsmith' && both.result[1] === 'tomsmith', JSON.stringify(both.result));
+
+    // Twin: a page that fills a DIFFERENT dependent value is behaving normally
+    // and must not be called a fault, or every real form would fail.
+    await send('navigate', { url: `${BASE}/login` });
+    await setup(`document.body.insertAdjacentHTML('beforeend','<form id=addr><input name=postcode><input name=city></form>');
+      document.querySelector('[name=postcode]').addEventListener('input',()=>{document.querySelector('[name=city]').value='Hyderabad'}); 1`);
+    const normal = await send('fill', { selector: '[name=postcode]', value: '500008' });
+    check('a dependent field the page fills in is noted, not treated as a fault',
+      normal.ok === true && /city/.test(JSON.stringify(normal.also_changed || [])),
+      JSON.stringify({ ok: normal.ok, also: normal.also_changed }));
+
+    // A stray write into a password field must be named without its contents.
+    await send('navigate', { url: `${BASE}/login` });
+    await setup(`document.querySelector('#username').addEventListener('input',()=>{document.querySelector('#password').value='UNRELATED-SECRET'}); 1`);
+    const pw = await send('fill', { selector: '#username', value: 'tomsmith' });
+    const blob = JSON.stringify(pw);
+    check('a changed password field is reported without leaking its value',
+      /password/.test(blob) && !blob.includes('UNRELATED-SECRET'), JSON.stringify(pw.also_changed));
+  });
+
   // A field the framework empties again once focus leaves reads back correctly at
   // fill time and saves blank. The only place to catch it is just before commit.
   await group('submit refuses to save blanks', async () => {
