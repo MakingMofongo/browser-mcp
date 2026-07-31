@@ -589,6 +589,34 @@ async function suite() {
     const forced = await send('submit', { timeout: 8000, verify_fields: false });
     check('verify_fields:false submits anyway', forced.outcome !== 'fields_lost', forced.outcome);
 
+    // A field can hold the right value on screen and still not be in the payload:
+    // disabled controls, controls with no name, and anything outside the form all
+    // read as filled and are simply not sent. Reading the DOM cannot see this —
+    // only what the form will serialise can.
+    for (const [label, prep] of [
+      ['a control with no name', `document.querySelector('#username').removeAttribute('name')`],
+      ['a disabled control', `document.querySelector('#username').disabled = true`],
+      ['a control outside the form', `document.body.appendChild(document.querySelector('#username'))`],
+    ]) {
+      await send('navigate', { url: `${BASE}/login` });
+      await send('fill', { selector: '#username', value: 'tomsmith' });
+      await send('fill', { selector: '#password', value: 'SuperSecretPassword!' });
+      await setup(prep + '; 1');
+      const r = await send('submit', { timeout: 8000 });
+      const stayed = await send('execute_script', { code: 'location.pathname' });
+      check(`${label} stops the submit rather than losing the value`,
+        r.ok === false && r.outcome === 'fields_not_submitted' && stayed.result === '/login',
+        JSON.stringify(r.fields));
+    }
+
+    // And the ordinary case still goes through, or this would block every form.
+    await send('navigate', { url: `${BASE}/login` });
+    await send('fill', { selector: '#username', value: 'tomsmith' });
+    await send('fill', { selector: '#password', value: 'SuperSecretPassword!' });
+    const fine = await send('submit', { expect_text: 'Secure Area', timeout: 9000 });
+    check('a form whose fields all serialise submits normally',
+      fine.ok === true && fine.outcome !== 'fields_not_submitted', fine.outcome);
+
     // Twin: a field the page reformats is not a lost field, and must still submit.
     await send('navigate', { url: `${BASE}/login` });
     await setup(`document.querySelector('#username').addEventListener('blur',e=>{e.target.value=e.target.value.toUpperCase()}); 1`);
