@@ -26,7 +26,7 @@ const check = (name, pass, detail = '') => {
 };
 
 let ws = null, hello = null;
-let pings = 0, answering = true, closedAt = null;
+let pings = 0, answering = true, closedAt = null, started2 = false, reconnectedAt = null;
 const started = Date.now();
 const secs = () => Math.round((Date.now() - started) / 1000);
 
@@ -37,8 +37,9 @@ function listen(i = 0) {
   server.on('error', (e) => e.code === 'EADDRINUSE' ? listen(i + 1) : console.error(e));
   server.on('listening', () => console.log(`listening on ${PORTS[i]} — waiting for the extension…`));
   server.on('connection', (sock) => {
-    if (ws) return;
+    if (ws) return; // one at a time; a reconnect arrives only after the first is gone
     ws = sock;
+    if (closedAt !== null && reconnectedAt === null) reconnectedAt = secs();
     console.log(`[${secs()}s] extension connected`);
     sock.on('message', (d) => {
       let m; try { m = JSON.parse(d.toString()); } catch { return; }
@@ -51,8 +52,9 @@ function listen(i = 0) {
     });
     sock.on('close', () => {
       if (closedAt === null) { closedAt = secs(); console.log(`[${closedAt}s] the extension closed the connection`); }
+      if (ws === sock) ws = null;
     });
-    run();
+    if (!started2) { started2 = true; run(); }
   });
   setTimeout(() => { if (!ws) { console.error('no extension connected in 45s'); process.exit(1); } }, 45000);
 }
@@ -91,6 +93,40 @@ async function run() {
   check('it keeps asking after the answers stop', pings > before, `${pings - before} more ping(s)`);
   check('it hangs up on a connection that stopped answering', closedAt !== null,
     closedAt !== null ? `closed ${closedAt - silentFrom}s after the answers stopped` : 'still holding a dead connection');
+
+  // Phase three: the point of all of it. The connection is gone; nothing has been
+  // restarted and nobody has intervened. The extension rescans every two seconds,
+  // so it should come back on its own and take commands again.
+  answering = true;
+  const wasClosedAt = closedAt;
+  // Does not discard whatever is connected first. The extension rescans every two
+  // seconds, so by the time this phase is reached it has usually already come back
+  // — and clearing the socket to "wait for a reconnection" threw away the very
+  // reconnection being waited for, then timed out declaring it never happened.
+  const back = await new Promise((resolve) => {
+    if (ws && ws.readyState === 1) return resolve(true);
+    const t = setInterval(() => { if (ws && ws.readyState === 1) { clearInterval(t); resolve(true); } }, 500);
+    setTimeout(() => { clearInterval(t); resolve(false); }, 30000);
+  });
+  check('it reconnects on its own after the connection died', back,
+    back ? `reconnected on its own ${reconnectedAt !== null ? reconnectedAt - wasClosedAt : '?'}s after dropping` : 'never came back');
+
+  // And is actually usable, not merely attached — a socket that answers the
+  // handshake and nothing else is the state this whole exercise began with.
+  let served = false;
+  if (back) {
+    served = await new Promise((resolve) => {
+      const id = 99;
+      const onMsg = (d) => {
+        let m; try { m = JSON.parse(d.toString()); } catch { return; }
+        if (m.id === id) { ws.off('message', onMsg); resolve(m.result?.ok === true); }
+      };
+      ws.on('message', onMsg);
+      ws.send(JSON.stringify({ id, method: 'health', params: {} }));
+      setTimeout(() => resolve(false), 15000);
+    });
+  }
+  check('and answers a command over the new connection', served);
 
   const passed = results.filter(Boolean).length;
   console.log(`\n${passed}/${results.length} passed`);
