@@ -235,6 +235,66 @@ async function suite() {
       amb.ok === true && amb.selected === 'Option 2', amb.selected || amb.error);
   });
 
+  // More than one Claude session drives this extension at once — that is the
+  // normal case here, and it has already produced one bug where two sessions
+  // collided over shared state. The call history is per session; if it were not,
+  // one run's timings would be attributed to another's, and one session would be
+  // shown what another was doing.
+  await group('a second session sees only its own history', async () => {
+    const mine = await send('health', {});
+
+    // Has to be a port the extension actually scans; it looks at 9876-9895 and
+    // nothing else, so a random high port is never found.
+    const freePort = await new Promise((res, rej) => {
+      const tryPort = (p) => {
+        if (p > 9895) return rej(new Error('no free port in the scanned range'));
+        const s = new WebSocketServer({ host: '127.0.0.1', port: p });
+        s.on('error', () => tryPort(p + 1));
+        s.on('listening', () => s.close(() => res(p)));
+      };
+      tryPort(9876);
+    });
+
+    const second = await new Promise((resolve, reject) => {
+      const srv = new WebSocketServer({ host: '127.0.0.1', port: freePort });
+      const to = setTimeout(() => reject(new Error('second session never connected')), 20000);
+      srv.on('connection', (sock) => {
+        let id = 0; const waiting = new Map();
+        sock.on('message', (d) => {
+          let m; try { m = JSON.parse(d.toString()); } catch { return; }
+          if (m.type === 'hello') {
+            clearTimeout(to);
+            return resolve({
+              srv, sock,
+              call: (method, params = {}) => new Promise((res, rej) => {
+                const cid = ++id;
+                waiting.set(cid, { res, rej });
+                sock.send(JSON.stringify({ id: cid, method, params }));
+                setTimeout(() => rej(new Error('timeout ' + method)), 20000);
+              }),
+            });
+          }
+          const w = waiting.get(m.id);
+          if (w) { waiting.delete(m.id); m.error ? w.rej(new Error(m.error)) : w.res(m.result); }
+        });
+      });
+    });
+
+    await second.call('navigate', { url: `${BASE}/login` });
+    const theirs = await second.call('health', {});
+    check('each session gets its own call history rather than a shared one',
+      mine.recent?.calls > 10 && theirs.recent?.calls <= 3,
+      JSON.stringify({ mine: mine.recent?.calls, theirs: theirs.recent?.calls }));
+    check('the second session is a separate session, not the same one',
+      theirs.session?.label && theirs.session.label !== mine.session?.label,
+      JSON.stringify({ mine: mine.session?.label, theirs: theirs.session?.label }));
+
+    // Closing it releases its tabs through the normal disconnect path.
+    second.sock.close();
+    second.srv.close();
+    await new Promise(r => setTimeout(r, 1500));
+  });
+
   // The failure half of the contract. Every tool caught reporting success while
   // doing nothing was caught by looking at what came back; these check the shape
   // that answer has to have when the work genuinely cannot be done — ok:false and
