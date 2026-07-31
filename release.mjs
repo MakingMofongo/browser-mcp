@@ -49,8 +49,16 @@ const gate = (label, cmd, cwd) => {
   } catch (e) {
     console.log('FAILED');
     const out = `${e.stdout || ''}${e.stderr || ''}`.trim();
-    console.error(out.split('\n').slice(-25).join('\n'));
+    // Written to a file as well as printed. A gate failure is read through
+    // whatever pipe the caller happened to use, and the one time this stopped a
+    // release the diagnosis went into a tail -2 and was gone — leaving nothing to
+    // do but run it again, which is the exact habit a gate exists to prevent.
+    const logPath = join(ROOT, 'release-gate-failure.log');
+    try { writeFileSync(logPath, `${label}\n${new Date().toISOString()}\n\n${out}\n`); } catch {}
+    const failed = out.split('\n').filter(l => /^FAIL|failed:|Error|error:/.test(l));
+    console.error(failed.length ? failed.slice(0, 20).join('\n') : out.split('\n').slice(-25).join('\n'));
     console.error(`\nRelease stopped: ${label} did not pass. Nothing was written or published.`);
+    console.error(`Full output: ${logPath}`);
     process.exit(1);
   }
 };

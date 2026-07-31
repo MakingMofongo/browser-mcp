@@ -436,6 +436,31 @@ async function suite() {
     check('clipboard attribute copies the attribute, not the field value',
       copied.ok === true && landed.result === 'ABC-123', JSON.stringify({ chars: copied.copied_chars, got: landed.result }));
 
+    // Response bodies carry whatever the site sent back, which on a portal is the
+    // record itself. Off unless asked for is a safety property here, not a
+    // preference about verbosity.
+    await send('navigate', { url: `${BASE}/login` });
+    await send('network_log', { clear: true });
+    await setup(`fetch('/robots.txt').then(r => r.text()); 1`);
+    await send('wait_idle', { timeout: 4000 });
+    const quietLog = await send('network_log', { url_pattern: 'robots' });
+    const loudLog = await send('network_log', { url_pattern: 'robots', include_body: true });
+    check('network_log withholds response bodies unless asked',
+      !JSON.stringify(quietLog).includes('User-agent') && (quietLog.requests || []).length >= 1,
+      JSON.stringify((quietLog.requests || [])[0] || {}).slice(0, 90));
+    check('include_body returns them when it is asked',
+      JSON.stringify(loudLog).includes('User-agent'), String((loudLog.requests || []).length));
+
+    // Pagination that quietly stops after page one returns a tidy wrong answer.
+    await send('navigate', { url: `${BASE}/records` });
+    const onePage = await send('extract', { selector: '#list' });
+    const allPages = await send('extract', { selector: '#list', paginate: true, next_selector: '#next', max_pages: 3 });
+    check('extract without paginate returns only the page it is on',
+      (onePage.rows || []).length === 3, String(onePage.rows?.length));
+    check('extract with paginate follows the next link and says how far it went',
+      (allPages.rows || []).length === 9 && allPages.pages_read === 3,
+      JSON.stringify({ rows: allPages.rows?.length, pages: allPages.pages_read }));
+
     // The switches that turn a guard off. Each one exists so a person who has
     // looked at the site can overrule the run, and each one is the most expensive
     // thing in the system to get wrong — so the default has to be the safe side,

@@ -127,6 +127,15 @@ function updateStatus() {
   }).catch(() => {});
 }
 
+// Answers the watchdog. A document whose script has died stops replying, which is
+// the difference between existing and working — and the only way the service
+// worker can tell that it needs replacing rather than left alone.
+chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+  if (msg?.type !== 'bmcp_offscreen_ping') return;
+  sendResponse({ alive: true, ports: [...connections.keys()] });
+  return true;
+});
+
 // Listen for terminate signals from background.js (sent when last tab in a session closes)
 chrome.runtime.onMessage.addListener((msg) => {
   if (msg.type !== 'terminate_mcp_session' || typeof msg.port !== 'number') return;

@@ -278,9 +278,32 @@ async function getSessionTab(port, activate = false) {
         if (win && win.state === 'minimized') {
           await chrome.windows.update(target.windowId, { state: 'normal' }); // no focused:true
         }
+        // The tab is left where the user put it.
+        //
+        // This used to make its own tab active before any real input, because
+        // Chrome will not route CDP input to a tab that is not the active one in
+        // its window. That reasoning is self-defeating: Chrome also will not
+        // deliver it to a window that is not focused, which is the situation
+        // whenever somebody is working in another window or another application —
+        // so the view was taken away and nothing was gained, and the synthetic
+        // path did the work regardless.
+        //
+        // So the tab is only made active when doing so costs the user nothing:
+        // its window has focus and no other tab in it is showing. Otherwise the
+        // action goes through the synthetic path, which every input tool has and
+        // which the suite covers. Somebody's browser is not ours to rearrange
+        // while they are using it.
+        if (win && win.focused && !target.active) {
+          const active = await chrome.tabs.query({ windowId: target.windowId, active: true });
+          const showing = active && active[0];
+          // Only when what is currently showing is one of ours — never when it is
+          // something the user opened.
+          if (showing && session.tabIds.has(showing.id)) {
+            await chrome.tabs.update(target.id, { active: true });
+            await new Promise(r => setTimeout(r, 150));
+          }
+        }
       }
-      if (!target.active) await chrome.tabs.update(target.id, { active: true });
-      await new Promise(r => setTimeout(r, 150));
       target = await chrome.tabs.get(target.id);
     } catch { /* best-effort; capture path surfaces the real error */ }
   }
@@ -1695,6 +1718,29 @@ async function ensureOffscreen() {
       reasons: ['WORKERS'],
       justification: 'Maintain persistent WebSocket connection to local MCP server',
     });
+    return;
+  }
+  // A document that exists is not a document that works, and this is the only
+  // thing that ever brings the connection back. Asking hasDocument() and stopping
+  // there is why a wedged offscreen document stayed wedged for four and a half
+  // hours: it existed the whole time, so the watchdog had nothing to do.
+  //
+  // Ask it whether it is alive instead. Nothing answering means the page is gone
+  // or its script has died, and neither recovers on its own — so it is replaced.
+  const alive = await Promise.race([
+    chrome.runtime.sendMessage({ type: 'bmcp_offscreen_ping' }).then((r) => r?.alive === true).catch(() => false),
+    new Promise((r) => setTimeout(() => r(false), 2000)),
+  ]);
+  if (!alive) {
+    try { await chrome.offscreen.closeDocument(); } catch {}
+    try {
+      await chrome.offscreen.createDocument({
+        url: 'offscreen.html',
+        reasons: ['WORKERS'],
+        justification: 'Maintain persistent WebSocket connection to local MCP server',
+      });
+      console.warn('[bmcp] offscreen document was not responding; replaced it');
+    } catch (e) { console.error('[bmcp] could not replace the offscreen document:', e); }
   }
 }
 

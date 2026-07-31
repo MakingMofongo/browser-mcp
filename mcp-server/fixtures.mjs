@@ -195,6 +195,25 @@ export function startFixtures() {
         case '/upload': return html(UPLOAD);
         case '/iframe': return html(IFRAME);
         case '/drag_and_drop': return html(DRAG);
+        // Three pages of records behind a next link. Pagination that silently
+        // stops after the first page returns a clean-looking, wrong answer, which
+        // is the failure worth having a fixture for.
+        case '/records':
+        case '/records/1':
+        case '/records/2':
+        case '/records/3': {
+          const n = Number((url.match(/\/records\/(\d)/) || [])[1] || 1);
+          // Enough text per record to look like a record. The detector ignores
+          // repeated elements averaging under a dozen characters, which is right —
+          // otherwise every row of navigation links reads as data.
+          const rows = Array.from({ length: 3 }, (_, i) => {
+            const id = (n - 1) * 3 + i + 1;
+            return `<div class="rec"><span class="who">Applicant Number ${id}</span>` +
+              `<span class="mail">applicant${id}@example.com</span></div>`;
+          }).join('');
+          const next = n < 3 ? `<a id="next" href="/records/${n + 1}">Next</a>` : '';
+          return html(page(`Records ${n}`, `<h3>Records page ${n}</h3><div id="list">${rows}</div>${next}`));
+        }
         case '/status_codes': return html(STATUS_CODES, 404);
         // What a server's own error page looks like: the status first, little else.
         case '/server_error': return html(page('503 Service Temporarily Unavailable', '<h1>503 Service Temporarily Unavailable</h1>'), 503);
