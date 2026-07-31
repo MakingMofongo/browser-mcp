@@ -536,6 +536,13 @@ async function suite() {
     const good = await send('navigate', { url: `${BASE}/login` });
     check('an ordinary navigation still reports where it landed',
       good.ok === true && /\/login$/.test(good.url || ''), good.url);
+
+    // A server error page loads correctly and is the wrong page. Fetching one on
+    // purpose is legitimate, so this is said rather than treated as a failure.
+    const errPage = await send('navigate', { url: `${BASE}/server_error` });
+    check('a page the server answered with an error status says so',
+      errPage.ok === true && errPage.http_status === 503 && /503/.test(errPage.note || ''), errPage.note);
+    check('an ordinary page carries no error status', !good.http_status, String(good.http_status));
     // Following a redirect must report where the tab ended up, not the address
     // that was asked for — that difference is how a sign-in wall shows itself.
     const moved = await send('navigate', { url: `${BASE}/redirect` });

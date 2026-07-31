@@ -148,6 +148,8 @@ export function startFixtures() {
         case '/iframe': return html(IFRAME);
         case '/drag_and_drop': return html(DRAG);
         case '/status_codes': return html(STATUS_CODES, 404);
+        // What a server's own error page looks like: the status first, little else.
+        case '/server_error': return html(page('503 Service Temporarily Unavailable', '<h1>503 Service Temporarily Unavailable</h1>'), 503);
         // A real 302, so the check that navigate reports where it LANDED rather
         // than where it was pointed is testing an actual redirect.
         case '/redirect': res.writeHead(302, { location: '/status_codes' }); return res.end();
