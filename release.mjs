@@ -93,6 +93,11 @@ gate('scripts load', 'node test-worker-loads.mjs', join(ROOT, 'mcp-server'));
 gate('drop and replace rules', 'node test-heartbeat-policy.mjs', join(ROOT, 'mcp-server'));
 gate('bridge recovery', 'node test-bridge.mjs', join(ROOT, 'mcp-server'));
 gate('tool wiring', 'node test-wiring.mjs', join(ROOT, 'mcp-server'));
+// The descriptions are the only part of this a model reads before choosing what to
+// call, and they are edited by hand every time a tool changes. They were brought
+// into one register once; without something checking, the next edit starts the drift
+// again — and nobody reviews a description the way they review code.
+gate('tool descriptions', 'node audit-descriptions.mjs', join(ROOT, 'mcp-server'));
 
 // Releasing runs the live suite, which takes over the browser for a couple of
 // minutes. That is the same disturbance as running the suite by hand, so it needs

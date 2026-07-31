@@ -335,7 +335,21 @@ async function verifyAttachedWithChrome(tabId, attempts = 4) {
   return false;
 }
 
+// Set by reattach_debugger({disable:true}) so the contested-slot path can be tested
+// on demand instead of waiting for another extension to cause it. Restored from
+// session storage because a service worker is evicted between calls and would
+// otherwise forget it mid-test.
+let pretendNoDebugger = false;
+chrome.storage.session.get('bmcpPretendNoDebugger')
+  .then((r) => { if (r?.bmcpPretendNoDebugger) pretendNoDebugger = true; })
+  .catch(() => {});
+
 async function debuggerAttach(tabId) {
+  if (pretendNoDebugger) {
+    // The same shape of error Chrome gives when another client owns the tab, so the
+    // code under test cannot tell this apart from the real thing.
+    throw new Error('Cannot access a chrome-extension:// URL of different extension');
+  }
   // First check local cache — fast path
   if (debuggerAttached.has(tabId)) {
     // Verify with Chrome before trusting cache (cheap, ~1ms)
@@ -409,8 +423,26 @@ async function debuggerAttach(tabId) {
     const t = await chrome.tabs.get(tabId);
     what = `${t.url || t.pendingUrl || '(no readable url)'}${t.title ? ` "${t.title}"` : ''}`;
   } catch { what = 'tab no longer exists'; }
+
+  // Name the extension when that is what this is about. The message "cannot access
+  // a chrome-extension:// URL of different extension" reads as though the TAB were
+  // an extension page, and it sent two separate investigations after the tab — which
+  // turned out to be an ordinary http page every time. What Chrome means is that
+  // attaching to a tab attaches to its frames, and another extension has injected
+  // one. That is a fact about which extension is installed, and it is enumerable.
+  let culprits = '';
+  if (/different extension|Cannot access a chrome-extension/i.test(lastMsg)) {
+    try {
+      const targets = await chrome.debugger.getTargets();
+      const mine = chrome.runtime.id;
+      const others = [...new Set(targets
+        .filter((t) => (t.url || '').startsWith('chrome-extension://') && !(t.url || '').includes(mine))
+        .map((t) => `${(t.url.split('/')[2])}${t.title ? ` (${t.title})` : ''}`))];
+      if (others.length) culprits = ` Another extension has a frame or page in the way: ${others.slice(0, 4).join(', ')}.`;
+    } catch {}
+  }
   throw new Error(
-    `Debugger attach failed: tab ${tabId} is at ${what}. Chrome said: ${lastMsg}. ` +
+    `Debugger attach failed: tab ${tabId} is at ${what}. Chrome said: ${lastMsg}.${culprits} ` +
     `Chrome allows ONE debugger client per tab — check for another automation extension ` +
     `(e.g. Claude in Chrome) or an open DevTools window on this tab, then call browser_reattach_debugger. ` +
     `Note: interactive tools still work via the synthetic fallback; only isTrusted=true is lost.`
@@ -4509,8 +4541,15 @@ async function dispatchCore(port, method, params) {
         document.addEventListener('keydown', window.__bmcpKeySpy, true);
       });
 
-      await debuggerAttach(tab.id);
-      try {
+      // Another extension holding this tab's one debugger slot is not a reason to
+      // fail. Everything below is built for exactly that case and reports which way
+      // the key went — but the attach was unguarded, so it threw straight past a
+      // working fallback and took the whole call with it. Chrome allows one debugger
+      // client per tab, and on a machine with Claude in Chrome installed the slot is
+      // contested as a matter of course, not as a fault.
+      let haveDebugger = true;
+      try { await debuggerAttach(tab.id); } catch { haveDebugger = false; }
+      if (haveDebugger) try {
         await cdpSend(tab.id, 'Input.dispatchKeyEvent', {
           type: 'keyDown',
           key,
@@ -6562,6 +6601,25 @@ async function dispatchCore(port, method, params) {
     }
 
     case 'reattach_debugger': {
+      // Treat the debugger as unavailable until told otherwise. Chrome allows one
+      // debugger client per tab, so on any machine with another automation extension
+      // installed the slot is contested as a matter of course — and every tool here
+      // has a fallback for that which, until now, only ran when the contention
+      // happened to occur during a test. It could not be reproduced on purpose, so
+      // three of those fallbacks were broken for an unknown length of time and were
+      // found by accident. This makes the condition something a test can ask for.
+      if (typeof params.disable === 'boolean') {
+        pretendNoDebugger = params.disable;
+        await chrome.storage.session.set({ bmcpPretendNoDebugger: params.disable });
+        if (params.disable) { try { await chrome.debugger.detach({ tabId: (await getSessionTab(port)).id }); } catch {} }
+        return {
+          ok: true,
+          debugger_disabled: params.disable,
+          note: params.disable
+            ? 'The debugger is now treated as unavailable. Tools will use their fallback paths, as they do when another extension holds the tab.'
+            : 'The debugger is available again.',
+        };
+      }
       // FORCE-GRAB recovery: activate the tab (input only reaches active tabs),
       // clear every stale claim, re-attach, then PROVE it by dispatching a real
       // mouse event and checking whether the page actually received it.

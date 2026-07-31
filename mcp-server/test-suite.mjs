@@ -139,6 +139,51 @@ async function suite() {
   const shadowFill = await send('fill', { selector: 'input[name=shadowField]', value: 'INSIDE' });
   check('fill reaches inside a shadow root', shadowFill.ok === true && shadowFill.shadow_dom === true, shadowFill.error || '');
 
+  // ── when another extension owns the tab's debugger ──────────────────────
+  // Chrome allows one debugger client per tab. On any machine with another
+  // automation extension installed — Claude in Chrome is the common one — the slot
+  // is contested as an ordinary condition, not a fault. Every interactive tool has a
+  // fallback for it, and until this group existed those fallbacks only ran when the
+  // contention happened to occur mid-test: three of them were broken, for an unknown
+  // length of time, and were found by accident rather than by a check.
+  await group('the debugger slot is taken by another extension', async () => {
+    await send('navigate', { url: `${BASE}/login` });
+    const off = await send('reattach_debugger', { disable: true });
+    try {
+      check('the debugger can be treated as unavailable on request', off.debugger_disabled === true, JSON.stringify(off).slice(0, 100));
+
+      const typed = await send('fill', { selector: '#username', value: 'no-debugger' });
+      const typedBack = await send('execute_script', { code: "document.querySelector('#username').value" });
+      check('fill still works with no debugger', typed.ok === true && typedBack.result === 'no-debugger',
+        `ok=${typed.ok} value=${JSON.stringify(typedBack.result)}`);
+
+      const key = await send('press_key', { key: 'Tab' });
+      check('press_key falls back instead of failing', key.ok === true && key.path === 'synthetic',
+        `ok=${key.ok} path=${key.path} error=${String(key.error || '').slice(0, 80)}`);
+
+      const clicked = await send('click', { selector: 'button[type=submit]' });
+      check('click falls back instead of failing', clicked.ok === true,
+        `ok=${clicked.ok} path=${clicked.path} error=${String(clicked.error || '').slice(0, 80)}`);
+
+      await send('navigate', { url: `${BASE}/upload` });
+      const up = await send('upload_file', { selector: '#file-upload', files: ['C:/Projects/browser-mcp/package.json'] });
+      // Attaching a file needs CDP and has no in-page equivalent. Saying so is the
+      // correct outcome; claiming the file was attached would not be.
+      check('upload_file either attaches the file or says it cannot',
+        up.ok === true ? up.verified === true : /debugger|attach/i.test(String(up.error || '')),
+        `ok=${up.ok} ${String(up.error || '').slice(0, 90)}`);
+
+      const pdf = await send('save', { mode: 'pdf' });
+      check('save reports that a PDF needs the debugger rather than throwing',
+        pdf.ok === false && /debugger|attach/i.test(String(pdf.error || '')),
+        `ok=${pdf.ok} error=${String(pdf.error || '(none)').slice(0, 90)}`);
+    } finally {
+      // Always restore, including when a check above throws — leaving this on would
+      // silently degrade every group that follows.
+      await send('reattach_debugger', { disable: false }).catch(() => {});
+    }
+  });
+
   // ── a page whose CSP forbids eval ───────────────────────────────────────
   // Gmail's constraint, reproduced locally. Both scripting worlds refuse string code
   // here — ISOLATED on the extension's own policy, MAIN on the page's — leaving the

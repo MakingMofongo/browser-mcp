@@ -332,8 +332,16 @@ export const TOOLS = [
   },
   {
     name: 'browser_reattach_debugger',
-    description: 'Force the Chrome debugger to detach and reattach on the current tab, then verify recovery by dispatching a real input event and checking that the page received it. Use when click, fill or key presses begin failing with attach errors.',
-    inputSchema: { type: 'object', properties: {} },
+    description: 'Force the Chrome debugger to detach and reattach on the current tab, then verify recovery by dispatching a real input event and checking that the page received it. Use when click, fill or key presses begin failing with attach errors. Pass disable:true to treat the debugger as unavailable so tools use their fallback paths, and disable:false to restore it.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        disable: {
+          type: 'boolean',
+          description: 'Treat the debugger as unavailable until set back to false. Chrome allows one debugger client per tab, so this reproduces the state where another extension holds it and tools must fall back to synthetic events.',
+        },
+      },
+    },
   },
   {
     name: 'browser_click',
@@ -587,7 +595,7 @@ export const TOOLS = [
   },
   {
     name: 'browser_set_cookies',
-    description: 'Set one or more cookies for a domain.',
+    description: 'Set a cookie for a domain, or several at once by passing an array to cookies. Each takes a name and value, with optional path, secure, httpOnly and sameSite; give either a domain or a url to scope it. Returns the cookies that were written, with the values the browser stored. Use to restore a session without going through a login form.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -606,7 +614,7 @@ export const TOOLS = [
   },
   {
     name: 'browser_set_local_storage',
-    description: 'Set a localStorage key and value on the current page.',
+    description: "Write a key and value into the current page's localStorage, scoped to its origin. Values are stored as strings; serialise objects before passing them. Returns the key that was written and the origin it belongs to. The page is not reloaded, so code that read the key at load time keeps its earlier value until the page is reloaded.",
     inputSchema: {
       type: 'object',
       properties: {
