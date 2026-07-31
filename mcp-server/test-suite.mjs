@@ -854,6 +854,36 @@ async function suite() {
     await send('record', { action: 'delete', name: '__shape' }).catch(() => {});
   });
 
+  // When forty of five hundred rows go sideways the questions are always the same,
+  // and every one of them is unanswerable an hour later once the tab has moved on.
+  await group('a row that went wrong keeps what is needed to work out why', async () => {
+    await send('record', { action: 'delete', name: '__ev' }).catch(() => {});
+    await send('navigate', { url: `${BASE}/login` });
+    await send('record', { action: 'start', name: '__ev' });
+    await send('fill', { selector: '#username', value: 'tomsmith' });
+    await send('fill', { selector: '#password', value: 'SuperSecretPassword!' });
+    await send('submit', { expect_text: 'Secure Area', timeout: 9000 });
+    await send('record', { action: 'stop' });
+
+    const run = await send('replay', { name: '__ev', rows: [
+      { Username: 'bad', Password: 'bad' },
+      { Username: 'tomsmith', Password: 'SuperSecretPassword!' },
+    ] });
+    const led = await send('runs', { id: run.run_id });
+    const bad = (led.rows || []).find(r => r.status !== 'done');
+    const good = (led.rows || []).find(r => r.status === 'done');
+    check('the failed row keeps the page it failed on and what the site said',
+      /login/.test(bad?.evidence?.url || '') && /invalid/i.test(JSON.stringify(bad?.evidence?.errors || [])),
+      JSON.stringify(bad?.evidence?.errors));
+    check('it records the state each field was left in',
+      (bad?.evidence?.fields || []).length >= 2 && bad.evidence.fields.every(f => f.field && f.state),
+      JSON.stringify(bad?.evidence?.fields));
+    check('the values themselves are not kept',
+      !JSON.stringify(bad?.evidence || {}).includes('SuperSecretPassword'), 'checked the whole record');
+    check('a row that worked carries no evidence to sift through',
+      good && !good.evidence, JSON.stringify({ status: good?.status, has: !!good?.evidence }));
+  });
+
   // A row that ran to the end is not the same as a row that landed. Without a
   // reference, "done" is a claim rather than evidence, and a run that reports two
   // hundred of them gives nobody anything to check.
