@@ -76,6 +76,21 @@ export const TOOLS = [
     },
   },
   {
+    name: 'browser_extract',
+    description: 'Extract structured rows from the page. Uses a real table when there is one, otherwise infers the repeated block behind a card or list layout and lines the items up into columns. Returns the columns, the rows and where they came from. Set paginate to follow the next-page control and merge the pages.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        selector: { type: 'string', description: 'CSS selector for the container to read (default: the whole page)' },
+        mode: { type: 'string', enum: ['auto', 'table', 'list'], description: 'auto (default) prefers a table and falls back to repeated items; list skips tables' },
+        max_rows: { type: 'number', description: 'Maximum rows to return across all pages (default: 200)' },
+        paginate: { type: 'boolean', description: 'Follow the next-page control and merge results' },
+        max_pages: { type: 'number', description: 'Page limit when paginate is set (default: 10)' },
+        next_selector: { type: 'string', description: 'CSS selector for the next-page control, when it cannot be found automatically' },
+      },
+    },
+  },
+  {
     name: 'browser_wait_idle',
     description: 'Wait until the page settles: no requests in flight, no DOM mutations for a quiet period, no visible spinner and document ready. Returns as soon as that is true, with how long it waited and why it stopped. Use after an action that triggers loading instead of guessing a fixed timeout.',
     inputSchema: {
