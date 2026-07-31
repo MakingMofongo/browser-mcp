@@ -436,6 +436,51 @@ async function suite() {
     check('clipboard attribute copies the attribute, not the field value',
       copied.ok === true && landed.result === 'ABC-123', JSON.stringify({ chars: copied.copied_chars, got: landed.result }));
 
+    // The switches that turn a guard off. Each one exists so a person who has
+    // looked at the site can overrule the run, and each one is the most expensive
+    // thing in the system to get wrong — so the default has to be the safe side,
+    // and the override has to actually override.
+    await send('record', { action: 'delete', name: '__sw' }).catch(() => {});
+    await send('navigate', { url: `${BASE}/apply` });
+    await send('record', { action: 'start', name: '__sw' });
+    await send('fill', { selector: '#name', value: 'First' });
+    await send('submit', { expect_text: 'submitted', timeout: 4000 });
+    await send('record', { action: 'stop' });
+
+    // A row that completes without a reference is held, and resume leaves it.
+    const held = await send('replay', { name: '__sw', rows: [{ 'Full name': 'NOREF' }] });
+    check('a row with no reference is held back by default',
+      held.submitted_unconfirmed === 1, JSON.stringify({ unconfirmed: held.submitted_unconfirmed }));
+    const resumed = await send('replay', { name: '__sw', resume: held.run_id });
+    const afterPlain = await send('runs', { id: held.run_id });
+    check('resume without retry_committed does not send it again',
+      afterPlain.rows?.[0]?.status === 'submitted_unconfirmed' && !resumed.done,
+      JSON.stringify({ status: afterPlain.rows?.[0]?.status, done: resumed.done }));
+
+    // And with the override, it runs — which is the whole reason the flag exists.
+    const forced = await send('replay', { name: '__sw', resume: held.run_id, retry_committed: true });
+    const afterForced = await send('runs', { id: held.run_id });
+    check('retry_committed re-runs the row it was held back from',
+      afterForced.rows?.[0]?.at !== afterPlain.rows?.[0]?.at || forced.rows_total === 1,
+      JSON.stringify({ before: afterPlain.rows?.[0]?.at, after: afterForced.rows?.[0]?.at }));
+    await send('record', { action: 'delete', name: '__sw' }).catch(() => {});
+
+    // dismiss_overlays: the default refuses a dialog holding form data, because
+    // clearing one discards what somebody typed. aggressive says do it anyway.
+    await send('navigate', { url: `${BASE}/login` });
+    await setup(`document.body.insertAdjacentHTML('beforeend',
+      '<div role=dialog id=formdlg><h3>Details</h3><input name=notes><button type=submit>OK</button></div>'); 1`);
+    const careful = await send('dismiss_overlays', {});
+    // "OK" could mean anything, and the dialog holds something somebody typed.
+    // An unambiguous "Close" would be used even by default — the rule is about
+    // what the affordance means, not about whether one exists.
+    check('a dialog holding typed-in data is not cleared on an ambiguous button',
+      (careful.dismissed || []).length === 0 && /editable|form/i.test(JSON.stringify(careful.skipped || [])),
+      JSON.stringify(careful.skipped?.[0] || careful.dismissed?.[0]));
+    const forcedDismiss = await send('dismiss_overlays', { scope: 'aggressive' });
+    check('scope aggressive dismisses the dialog the default protects',
+      (forcedDismiss.dismissed || []).length >= 1, JSON.stringify(forcedDismiss.dismissed?.[0]));
+
     // pace_ms was added a day before this test and had never been passed.
     const t0 = Date.now();
     await send('record', { action: 'delete', name: '__pp' }).catch(() => {});
