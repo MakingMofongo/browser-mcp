@@ -40,6 +40,24 @@ if (!existsSync(PEM)) {
 // The checks run BEFORE anything is written, so a failure leaves no half-bumped
 // version behind.
 const skipLive = process.argv.includes('--no-live');
+const dryRun = process.argv.includes('--dry-run');
+const publishUnverified = process.argv.includes('--publish-unverified');
+
+// --no-live used to skip the behavioural checks and publish anyway, which put
+// "do not verify this" and "send it to every install" behind one flag. I reached
+// for it to test the gate wiring and released a version I had not meant to. The
+// two ideas are separate now: skipping the suite is allowed, shipping something
+// that has not been through it has to be said out loud.
+if (skipLive && !publishUnverified && !dryRun) {
+  console.error('--no-live skips the checks that run against a real browser.');
+  console.error('');
+  console.error('  --dry-run              run every check that does not need a browser, publish nothing');
+  console.error('  --no-live --publish-unverified   publish without the browser checks, on purpose');
+  console.error('');
+  console.error('If the browser is free, the ordinary path runs everything:');
+  console.error('  BMCP_BROWSER_IS_FREE=1 node release.mjs');
+  process.exit(2);
+}
 
 const gate = (label, cmd, cwd) => {
   process.stdout.write(`  ${label} … `);
@@ -64,26 +82,45 @@ const gate = (label, cmd, cwd) => {
 };
 
 console.log('Checks:');
+// Everything that can be proven without a browser runs first, and runs even when
+// the live suite is skipped. These were written after a night of the extension
+// being broken in ways nothing caught, and leaving them out of the gate would have
+// been the same mistake in a different place: a check nobody runs is not a check.
+//
+// The order is deliberate — whether the thing loads at all, before whether its
+// parts are right, before whether it is wired to anything.
+gate('scripts load', 'node test-worker-loads.mjs', join(ROOT, 'mcp-server'));
+gate('drop and replace rules', 'node test-heartbeat-policy.mjs', join(ROOT, 'mcp-server'));
+gate('bridge recovery', 'node test-bridge.mjs', join(ROOT, 'mcp-server'));
 gate('tool wiring', 'node test-wiring.mjs', join(ROOT, 'mcp-server'));
 
 // Releasing runs the live suite, which takes over the browser for a couple of
 // minutes. That is the same disturbance as running the suite by hand, so it needs
 // the same acknowledgement rather than being waved through because it happens to
 // be a release.
-if (!skipLive && !process.env.BMCP_BROWSER_IS_FREE) {
+// A dry run touches no browser, so it has no business asking whether one is free.
+if (!skipLive && !dryRun && !process.env.BMCP_BROWSER_IS_FREE) {
   console.error('Releasing runs the live suite, which drives the real browser for about two minutes.');
   console.error('When the browser is free:  BMCP_BROWSER_IS_FREE=1 node release.mjs');
-  console.error('To publish without those checks (and it will say so):  node release.mjs --no-live');
+  console.error('To check everything else without touching it:  node release.mjs --dry-run');
   process.exit(2);
 }
 
-if (skipLive) {
+if (skipLive || dryRun) {
   // Allowed, but never silently: the live suite is what has caught every
   // behavioural regression so far, and a release that skipped it should say so.
-  console.log('  live suite … SKIPPED (--no-live)');
+  console.log(`  live suite … SKIPPED (${dryRun ? "--dry-run" : "--no-live"})`);
   console.log('  note: the behavioural checks did not run for this build.');
 } else {
   gate('live suite (needs Chrome with the extension loaded)', 'node test-suite.mjs', join(ROOT, 'mcp-server'));
+}
+
+// Everything above this line reads; everything below it writes. A dry run stops
+// here, having proved what it can prove, with no version bumped and nothing
+// pushed — which is what checking the gate should have done in the first place.
+if (dryRun) {
+  console.log('\nDry run: every check that does not need a browser passed. Nothing was written or published.');
+  process.exit(0);
 }
 
 // ── version ────────────────────────────────────────────────────────────────
