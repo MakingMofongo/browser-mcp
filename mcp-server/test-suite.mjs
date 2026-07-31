@@ -234,6 +234,55 @@ async function suite() {
       amb.ok === true && amb.selected === 'Option 2', amb.selected || amb.error);
   });
 
+  // Tools nothing else exercises. Both of the worst bugs found so far — scroll
+  // hanging on every page, upload_file throwing before it attached anything —
+  // survived because no assertion ever ran them. Thin coverage that calls a tool
+  // and reads the result back beats none by a wide margin.
+  await group('tools with no other coverage', async () => {
+    await send('navigate', { url: `${BASE}/upload` });
+    const up = await send('upload_file', { selector: '#file-upload', files: ['C:/Projects/browser-mcp/package.json'] });
+    const onInput = await send('execute_script', { code: "[...document.querySelector('#file-upload').files].map(f=>f.name)" });
+    check('upload_file puts the file on the input and confirms it',
+      up.ok === true && up.verified === true && onInput.result[0] === 'package.json', JSON.stringify(onInput.result));
+
+    await send('navigate', { url: `${BASE}/login` });
+    await setup(`document.body.insertAdjacentHTML('beforeend','<input id=dob type=date><input id=mdob placeholder="MM/DD/YYYY">'); 1`);
+    const native = await send('set_date', { selector: '#dob', date: '2003-05-30' });
+    const masked = await send('set_date', { selector: '#mdob', date: '2003-05-30' });
+    const dates = await send('execute_script', { code: "[document.querySelector('#dob').value, document.querySelector('#mdob').value]" });
+    check('set_date fills a native date input', native.ok === true && dates.result[0] === '2003-05-30', dates.result[0]);
+    check('set_date types into a masked text input in its own format',
+      masked.ok === true && dates.result[1] === '05/30/2003', dates.result[1]);
+
+    const got = await send('fetch', { url: `${BASE}/robots.txt` });
+    check('fetch reaches an external URL and returns the body',
+      got.ok === true && got.status === 200 && /User-agent/.test(got.body || ''), String(got.status));
+
+    const pc = await send('get_page_content', {});
+    check('get_page_content returns the visible text', /Login Page|Username/.test(pc.content || ''), String(pc.length));
+
+    const shot = await send('screenshot', {});
+    check('screenshot returns a real PNG', /^data:image\/png;base64,iVBOR/.test(shot.image || ''), String((shot.image || '').length));
+
+    const dlg = await send('handle_dialog', { accept: true, timeout: 1500 });
+    check('handle_dialog says so when no dialog is open', dlg.ok === false && /No dialog/i.test(dlg.error || ''), dlg.error);
+
+    const win = await send('resize_window', { width: 1200, height: 800 });
+    check('resize_window reports the size it achieved', win.ok === true && win.window?.width === 1200, JSON.stringify(win.window));
+
+    const frames = await send('list_frames', {});
+    check('list_frames lists the main frame', Array.isArray(frames.frames) && frames.frames.length >= 1, String(frames.frames?.length));
+
+    const nt = await send('get_new_tab', {});
+    check('get_new_tab returns a tab in this session', nt.ok === true && !!nt.id, JSON.stringify({ id: nt.id, m: nt.matched }));
+    const sw = await send('switch_tab', { tab_id: nt.id });
+    check('switch_tab makes that tab current', sw.id === nt.id, String(sw.id));
+
+    const dd = await send('drop_file', { selector: '#username', files: ['C:/Projects/browser-mcp/package.json'] });
+    check('drop_file refuses a target with no file input rather than pretending',
+      dd.ok === false && /no-file-input-found/.test(dd.error || ''), dd.error);
+  });
+
   // The expensive kind of failure: the target ends up correct, so every check
   // passes, and the value is ALSO sitting in a field nobody looked at.
   await group('a write that leaks into another field', async () => {
