@@ -234,6 +234,33 @@ async function suite() {
       amb.ok === true && amb.selected === 'Option 2', amb.selected || amb.error);
   });
 
+  // A field the framework empties again once focus leaves reads back correctly at
+  // fill time and saves blank. The only place to catch it is just before commit.
+  await group('submit refuses to save blanks', async () => {
+    await send('navigate', { url: `${BASE}/login` });
+    await setup(`document.querySelector('#username').addEventListener('blur',e=>{e.target.value=''}); 1`);
+    await send('fill', { selector: '#username', value: 'tomsmith' });
+    await send('fill', { selector: '#password', value: 'SuperSecretPassword!' });
+    const refused = await send('submit', { timeout: 8000 });
+    const stillThere = await send('execute_script', { code: 'location.pathname' });
+    check('a field that emptied itself stops the submit',
+      refused.ok === false && refused.outcome === 'fields_lost' && refused.fields?.[0]?.selector === '#username',
+      JSON.stringify(refused.fields));
+    check('nothing was clicked when the submit was refused',
+      stillThere.result === '/login' && refused.submitted === false, stillThere.result);
+    const forced = await send('submit', { timeout: 8000, verify_fields: false });
+    check('verify_fields:false submits anyway', forced.outcome !== 'fields_lost', forced.outcome);
+
+    // Twin: a field the page reformats is not a lost field, and must still submit.
+    await send('navigate', { url: `${BASE}/login` });
+    await setup(`document.querySelector('#username').addEventListener('blur',e=>{e.target.value=e.target.value.toUpperCase()}); 1`);
+    await send('fill', { selector: '#username', value: 'tomsmith' });
+    await send('fill', { selector: '#password', value: 'wrong' });
+    const went = await send('submit', { timeout: 9000 });
+    check('a reformatted value is reported but does not block the submit',
+      went.outcome !== 'fields_lost' && !!went.reformatted, JSON.stringify(went.reformatted));
+  });
+
   await group('navigate tells the truth about landing', async () => {
     const dead = await send('navigate', { url: 'https://this-host-does-not-exist-bmcp-test.invalid/page' });
     check('a page that did not load is reported as not loaded',

@@ -63,7 +63,7 @@ export const TOOLS = [
   },
   {
     name: 'browser_submit',
-    description: 'Submit a form and report the outcome. Clicks the submit control, auto-detecting it when no selector is given, then observes the page and returns one of: navigated, validation_error with the messages shown, expected_text, page_changed, or no_change with a diagnosis. Distinguishes a successful submit from a rejected one and from a click that had no effect.',
+    description: 'Submit a form and report the outcome. Clicks the submit control, auto-detecting it when no selector is given, then observes the page and returns one of: navigated, validation_error with the messages shown, expected_text, page_changed, or no_change with a diagnosis. Distinguishes a successful submit from a rejected one and from a click that had no effect. Before clicking it re-reads the fields this session filled, and refuses to submit when any has gone empty again, which is how a form saves blanks after appearing to accept the values.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -72,6 +72,7 @@ export const TOOLS = [
         selector: { type: 'string', description: 'Submit control (CSS, text=, or ref_N). Omit to auto-detect the best submit button.' },
         expect_text: { type: 'string', description: 'Text that should APPEAR on success, e.g. "Dashboard", "Application submitted"' },
         expect_gone: { type: 'string', description: 'Text that should DISAPPEAR on success, e.g. "Sign In"' },
+        verify_fields: { type: 'boolean', description: 'Check the fields filled this session still hold their values before clicking (default: true). Set false to submit regardless.' },
         timeout: { type: 'number', description: 'Max ms to watch for an outcome (default 15000)' },
       },
     },
