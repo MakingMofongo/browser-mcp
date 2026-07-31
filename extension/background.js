@@ -2256,7 +2256,90 @@ async function dropFileOnTarget(tabId, selector, files) {
 
 // ── Command Dispatcher ──────────────────────────────────────────────────────
 
+// ── Post-action observation ────────────────────────────────────────────────
+// An image after every interaction is the obvious way to answer "what happened?",
+// and the wrong one: it costs ~1500 tokens a call and most of the frame is
+// unchanged. This captures the same answer semantically — what text appeared or
+// disappeared, dialogs that opened, errors that surfaced, navigation — for a few
+// dozen tokens, and only when the caller asks with observe:true.
+
+function bmcpPageSignature() {
+  const vis = (el) => {
+    const r = el.getBoundingClientRect();
+    if (r.width <= 0 || r.height <= 0) return false;
+    const st = getComputedStyle(el);
+    return st.visibility !== 'hidden' && st.display !== 'none';
+  };
+  const lines = (document.body ? document.body.innerText || '' : '')
+    .split('\n').map(s => s.trim()).filter(Boolean);
+  const dialogs = [...document.querySelectorAll('[role="dialog"], [role="alertdialog"], dialog[open]')]
+    .filter(vis).map(d => (d.getAttribute('aria-label') || d.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 90));
+  const errors = [...document.querySelectorAll('[role="alert"], [aria-invalid="true"], .error, .invalid-feedback')]
+    .filter(vis).map(e => (e.textContent || '').trim().replace(/\s+/g, ' ')).filter(t => t && t.length < 160);
+  return {
+    url: location.href, title: document.title, lines,
+    dialogs: [...new Set(dialogs)].filter(Boolean).slice(0, 5),
+    errors: [...new Set(errors)].slice(0, 6),
+    scrollY: Math.round(window.scrollY),
+  };
+}
+
+async function pageSignature(tabId) {
+  const [r] = await chrome.scripting.executeScript({ target: { tabId }, world: 'MAIN', func: bmcpPageSignature });
+  return r?.result || null;
+}
+
+function diffSignature(a, b, max = 8) {
+  const out = {};
+  if (a.url !== b.url) out.navigated_to = b.url;
+  if (a.title !== b.title) out.title = b.title;
+  const sa = new Set(a.lines), sb = new Set(b.lines);
+  const appeared = b.lines.filter(l => !sa.has(l));
+  const disappeared = a.lines.filter(l => !sb.has(l));
+  if (appeared.length) {
+    out.appeared = appeared.slice(0, max);
+    if (appeared.length > max) out.appeared_more = appeared.length - max;
+  }
+  if (disappeared.length) {
+    out.disappeared = disappeared.slice(0, max);
+    if (disappeared.length > max) out.disappeared_more = disappeared.length - max;
+  }
+  const newDialogs = b.dialogs.filter(d => !a.dialogs.includes(d));
+  if (newDialogs.length) out.dialogs_opened = newDialogs;
+  const newErrors = b.errors.filter(e => !a.errors.includes(e));
+  if (newErrors.length) out.errors_shown = newErrors;
+  if (!Object.keys(out).length) out.no_visible_change = true;
+  return out;
+}
+
+const OBSERVABLE = new Set([
+  'click', 'fill', 'press_key', 'select_option', 'drag', 'triple_click',
+  'double_click', 'click_xy', 'submit', 'set_date', 'set_combobox', 'hover', 'scroll',
+]);
+
 async function dispatch(port, method, params) {
+  if (!params || !params.observe || !OBSERVABLE.has(method)) {
+    return dispatchCore(port, method, params);
+  }
+  let before = null, tabId = null;
+  try {
+    const t = await getSessionTab(port, true);
+    tabId = t.id;
+    before = await pageSignature(tabId);
+  } catch { /* observation is best-effort and must never block the action */ }
+
+  const result = await dispatchCore(port, method, params);
+
+  if (before && tabId && result && typeof result === 'object' && !Array.isArray(result)) {
+    await new Promise(r => setTimeout(r, Math.min(3000, params.observe_delay || 400)));
+    const after = await pageSignature(tabId).catch(() => null);
+    if (after) result.changed = diffSignature(before, after);
+    else result.changed = { navigated_or_unreadable: true };
+  }
+  return result;
+}
+
+async function dispatchCore(port, method, params) {
   // Real input only reaches ACTIVE tabs (see INPUT_METHODS above). Activating here,
   // once, means every input tool gets trusted events instead of silently degrading.
   if (INPUT_METHODS.has(method)) {

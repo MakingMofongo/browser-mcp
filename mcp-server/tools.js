@@ -67,6 +67,7 @@ export const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
+        observe: { type: 'boolean', description: 'Also report what changed on the page after the action: text that appeared or disappeared, dialogs opened, errors shown, navigation. Cheaper than a screenshot.' },
         selector: { type: 'string', description: 'Submit control (CSS, text=, or ref_N). Omit to auto-detect the best submit button.' },
         expect_text: { type: 'string', description: 'Text that should APPEAR on success, e.g. "Dashboard", "Application submitted"' },
         expect_gone: { type: 'string', description: 'Text that should DISAPPEAR on success, e.g. "Sign In"' },
@@ -94,6 +95,7 @@ export const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
+        observe: { type: 'boolean', description: 'Also report what changed on the page after the action: text that appeared or disappeared, dialogs opened, errors shown, navigation. Cheaper than a screenshot.' },
         from_selector: { type: 'string', description: 'Source element (CSS, text=, or ref_N)' },
         to_selector: { type: 'string', description: 'Target element (CSS, text=, or ref_N)' },
         from_x: { type: 'number' }, from_y: { type: 'number' },
@@ -107,7 +109,8 @@ export const TOOLS = [
     description: 'Triple-click an element to select its entire line or paragraph, typically before replacing text in a rich text editor. Returns the text that was selected.',
     inputSchema: {
       type: 'object',
-      properties: { selector: { type: 'string', description: 'CSS, text, or ref selector' } },
+      properties: {
+        observe: { type: 'boolean', description: 'Also report what changed on the page after the action: text that appeared or disappeared, dialogs opened, errors shown, navigation. Cheaper than a screenshot.' }, selector: { type: 'string', description: 'CSS, text, or ref selector' } },
       required: ['selector'],
     },
   },
@@ -223,6 +226,7 @@ export const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
+        observe: { type: 'boolean', description: 'Also report what changed on the page after the action: text that appeared or disappeared, dialogs opened, errors shown, navigation. Cheaper than a screenshot.' },
         selector: { type: 'string', description: 'CSS or text selector' },
       },
       required: ['selector'],
@@ -245,6 +249,7 @@ export const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
+        observe: { type: 'boolean', description: 'Also report what changed on the page after the action: text that appeared or disappeared, dialogs opened, errors shown, navigation. Cheaper than a screenshot.' },
         x: { type: 'number', description: 'X coordinate (CSS pixels, from left of viewport)' },
         y: { type: 'number', description: 'Y coordinate (CSS pixels, from top of viewport)' },
       },
@@ -262,6 +267,7 @@ export const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
+        observe: { type: 'boolean', description: 'Also report what changed on the page after the action: text that appeared or disappeared, dialogs opened, errors shown, navigation. Cheaper than a screenshot.' },
         selector: { type: 'string', description: 'CSS selector, text selector ("text=Click me", "button:text(Submit)"), or ref handle ("ref_12")' },
       },
       required: ['selector'],
@@ -273,6 +279,7 @@ export const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
+        observe: { type: 'boolean', description: 'Also report what changed on the page after the action: text that appeared or disappeared, dialogs opened, errors shown, navigation. Cheaper than a screenshot.' },
         selector: { type: 'string', description: 'CSS selector, text selector, or ref handle ("ref_7") for the input field' },
         value: { type: 'string', description: 'Value to fill in' },
       },
@@ -285,6 +292,7 @@ export const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
+        observe: { type: 'boolean', description: 'Also report what changed on the page after the action: text that appeared or disappeared, dialogs opened, errors shown, navigation. Cheaper than a screenshot.' },
         key: { type: 'string', description: 'Key to press: "Enter", "Tab", "Escape", "ArrowDown", "ArrowUp", "Backspace", "a", "1", etc.' },
         code: { type: 'string', description: 'Key code (optional, defaults to key name). E.g. "KeyA" for "a"' },
         ctrl: { type: 'boolean', description: 'Hold Ctrl/Cmd key' },
@@ -301,6 +309,7 @@ export const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
+        observe: { type: 'boolean', description: 'Also report what changed on the page after the action: text that appeared or disappeared, dialogs opened, errors shown, navigation. Cheaper than a screenshot.' },
         selector: { type: 'string', description: 'CSS or text selector to scroll to (element scrolled into center of viewport)' },
         x: { type: 'number', description: 'Pixels to scroll horizontally (positive = right)' },
         y: { type: 'number', description: 'Pixels to scroll vertically (positive = down, e.g. 500)' },
@@ -326,6 +335,7 @@ export const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
+        observe: { type: 'boolean', description: 'Also report what changed on the page after the action: text that appeared or disappeared, dialogs opened, errors shown, navigation. Cheaper than a screenshot.' },
         selector: { type: 'string', description: 'CSS or text selector to hover over' },
         duration: { type: 'number', description: 'How long to hold hover in ms (default: 500)' },
       },
@@ -338,6 +348,7 @@ export const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
+        observe: { type: 'boolean', description: 'Also report what changed on the page after the action: text that appeared or disappeared, dialogs opened, errors shown, navigation. Cheaper than a screenshot.' },
         selector: { type: 'string', description: 'CSS or text selector for the dropdown trigger / <select> element' },
         option: { type: 'string', description: 'Text of the option to select (partial match supported)' },
         wait: { type: 'number', description: 'Ms to wait after clicking trigger for options to appear (default: 300)' },
@@ -362,6 +373,7 @@ export const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
+        observe: { type: 'boolean', description: 'Also report what changed on the page after the action: text that appeared or disappeared, dialogs opened, errors shown, navigation. Cheaper than a screenshot.' },
         selector: { type: 'string', description: 'CSS selector for the combobox/autocomplete input' },
         value: { type: 'string', description: 'Single value to select (use this OR values)' },
         values: { type: 'array', items: { type: 'string' }, description: 'Array of values for multi-select. E.g. ["Danish", "English", "Swedish"]' },
@@ -391,6 +403,7 @@ export const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
+        observe: { type: 'boolean', description: 'Also report what changed on the page after the action: text that appeared or disappeared, dialogs opened, errors shown, navigation. Cheaper than a screenshot.' },
         selector: { type: 'string', description: 'CSS selector for the date input element' },
         date: { type: 'string', description: 'ISO date string (YYYY-MM-DD), e.g. "2026-05-15"' },
         skip_picker: { type: 'boolean', description: 'If true, only try native + masked paths and skip calendar-picker navigation (default: false)' },
