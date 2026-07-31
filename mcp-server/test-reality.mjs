@@ -14,6 +14,9 @@
  * the confusion that made depending on a third party for the gate a mistake.
  */
 import { WebSocketServer } from 'ws';
+import { requireFreeBrowser } from './browser-is-free.mjs';
+
+requireFreeBrowser('test-reality.mjs');
 
 let ws = null, cmdId = 0, hello = null;
 const pending = new Map();

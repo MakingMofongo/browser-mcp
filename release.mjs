@@ -66,6 +66,17 @@ const gate = (label, cmd, cwd) => {
 console.log('Checks:');
 gate('tool wiring', 'node test-wiring.mjs', join(ROOT, 'mcp-server'));
 
+// Releasing runs the live suite, which takes over the browser for a couple of
+// minutes. That is the same disturbance as running the suite by hand, so it needs
+// the same acknowledgement rather than being waved through because it happens to
+// be a release.
+if (!skipLive && !process.env.BMCP_BROWSER_IS_FREE) {
+  console.error('Releasing runs the live suite, which drives the real browser for about two minutes.');
+  console.error('When the browser is free:  BMCP_BROWSER_IS_FREE=1 node release.mjs');
+  console.error('To publish without those checks (and it will say so):  node release.mjs --no-live');
+  process.exit(2);
+}
+
 if (skipLive) {
   // Allowed, but never silently: the live suite is what has caught every
   // behavioural regression so far, and a release that skipped it should say so.

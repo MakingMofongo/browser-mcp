@@ -20,6 +20,9 @@
  */
 import { WebSocketServer } from 'ws';
 import { startFixtures } from './fixtures.mjs';
+import { requireFreeBrowser } from './browser-is-free.mjs';
+
+requireFreeBrowser('test-suite.mjs');
 
 let BASE = ''; // set from the local fixture server before the suite runs
 const results = [];

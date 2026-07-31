@@ -10,7 +10,10 @@
  * look; anything in seconds is a stall, not a cost.
  */
 import { WebSocketServer } from 'ws';
+import { requireFreeBrowser } from './browser-is-free.mjs';
 import { startFixtures } from './fixtures.mjs';
+
+requireFreeBrowser('bench.mjs');
 
 // Local, like the suite. Timing a tool against a public demo site measures that
 // site's day as much as anything here, and a run against one that is down reads
