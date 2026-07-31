@@ -605,13 +605,24 @@ async function suite() {
     // _blank. Asking before one has is meant to find nothing, so open one first
     // rather than asserting on whatever happened to be lying around.
     const before = await send('get_new_tab', {});
-    check('get_new_tab finds nothing when no new tab has appeared', !before.id, JSON.stringify(before));
+    check('get_new_tab claims nothing when this session has opened nothing', !before.id, JSON.stringify(before).slice(0, 80));
+
+    // A tab this session did not open is not its own, however new it is. This is
+    // the case that was taking somebody's Linear tab and pulling it into the
+    // session's tab group.
     await send('navigate', { url: `${BASE}/dropdown`, new_tab: true });
-    const nt = await send('get_new_tab', {});
-    check('get_new_tab returns the tab that just appeared',
-      nt.ok === true && /\/dropdown$/.test(nt.url || ''), JSON.stringify({ id: nt.id, url: nt.url }));
-    const sw = await send('switch_tab', { tab_id: nt.id });
-    check('switch_tab makes that tab current', sw.id === nt.id, String(sw.id));
+    const stranger = await send('get_new_tab', {});
+    check('a tab this session did not open is left where it is', !stranger.id, JSON.stringify(stranger).slice(0, 80));
+
+    // A popup one of its own pages opened carries openerTabId, and is its own.
+    await send('navigate', { url: `${BASE}/login` });
+    await setup(`window.open('/dropdown', '_blank'); 1`);
+    await new Promise(r => setTimeout(r, 1200));
+    const popup = await send('get_new_tab', {});
+    check('a popup opened by this session is returned',
+      popup.ok === true && /dropdown/.test(popup.url || ''), JSON.stringify({ url: popup.url, m: popup.matched }));
+    const sw = popup.id ? await send('switch_tab', { tab_id: popup.id }) : {};
+    check('switch_tab makes that tab current', popup.id ? sw.id === popup.id : false, String(sw.id));
 
     // A browser synthesizes dblclick from two press/release pairs, and does not
     // do so for a window that is not in front — so this fired nothing at all
