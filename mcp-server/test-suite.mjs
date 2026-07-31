@@ -797,6 +797,44 @@ async function suite() {
       empty.ok === false && /Copy a value first/.test(empty.error || ''), empty.error);
   });
 
+  // The clean run is the reference for normal, which is what removes the need to
+  // write rules about it. A postcode that fills in a city, an autosave on blur, a
+  // confirm-email mirror: observed once during recording, expected from then on.
+  // What matters is that the shape is recorded and the values are not, or every
+  // row would look like a divergence from the row before it.
+  await group('a recorded run is the reference for normal', async () => {
+    await send('record', { action: 'delete', name: '__shape' }).catch(() => {});
+    await send('navigate', { url: `${BASE}/login` });
+    await send('record', { action: 'start', name: '__shape' });
+    await send('fill', { selector: '#username', value: 'tomsmith' });
+    await send('fill', { selector: '#password', value: 'SuperSecretPassword!' });
+    await send('submit', { expect_text: 'Secure Area', timeout: 9000 });
+    await send('record', { action: 'stop' });
+    const flow = await send('record', { action: 'show', name: '__shape' });
+    const submitStep = (flow.steps || []).find(s => s.method === 'submit');
+    check('the clean run records which requests a step normally makes',
+      /POST \/authenticate/.test(JSON.stringify(submitStep?.shape?.sent || [])), JSON.stringify(submitStep?.shape));
+    check('what is recorded is the shape, not the values',
+      !JSON.stringify(flow.steps.map(s => s.shape)).includes('SuperSecretPassword'), 'checked all shapes');
+
+    // Replay unchanged: the same requests fire, so nothing is unexpected.
+    const clean = await send('replay', { name: '__shape' });
+    check('replaying the same flow reports no unexpected effect',
+      clean.ok === true && clean.diverged_at?.reason !== 'unexpected-effect', JSON.stringify(clean.diverged_at));
+
+    // Now make the submit fire something the clean run never did.
+    await send('navigate', { url: `${BASE}/login` });
+    await setup(`document.querySelector('#login').addEventListener('submit', () => {
+      fetch('/api/records/8823/delete', { method: 'DELETE' }).catch(()=>{});
+    }, true); 1`);
+    const drifted = await send('replay', { name: '__shape', start_url: false });
+    check('a request the clean run never made stops the replay',
+      drifted.ok === false && drifted.diverged_at?.reason === 'unexpected-effect' &&
+      /records\/\{id\}\/delete/.test(JSON.stringify(drifted.diverged_at?.unexpected_requests || [])),
+      JSON.stringify(drifted.diverged_at));
+    await send('record', { action: 'delete', name: '__shape' }).catch(() => {});
+  });
+
   // An auth wall part way through a run is not a broken flow. It must be told
   // apart from structural divergence, because the two need opposite responses:
   // re-record versus sign in once and carry on.
