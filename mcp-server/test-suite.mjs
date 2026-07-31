@@ -112,6 +112,25 @@ async function suite() {
   check('an ambiguous ref refuses rather than filling the wrong one',
     amb.ok === false && ambState.result.every(v => v === ''), JSON.stringify(ambState.result));
 
+  // A ref whose element the framework replaced is re-identified by its name and
+  // by the row it sits in. The row text is the part that decides between
+  // identical fields, so if it is normalised differently when minting and when
+  // resolving, the anchor silently never matches and the resolver falls back to
+  // picking among all of them — which is the wrong-row failure, arrived at
+  // through a check meant to prevent it. The anchors here contain lowercase "s"
+  // and repeated whitespace, which is what caught it.
+  await send('navigate', { url: `${BASE}/login` });
+  await setup(`document.body.insertAdjacentHTML('beforeend',
+    '<table id=inv><tr><td>Acme  Services   Ltd</td><td><input name=amount aria-label="Amount"></td></tr>' +
+    '<tr><td>Globex  Systems   Inc</td><td><input name=amount aria-label="Amount"></td></tr></table>'); 'ok'`);
+  const invPage = await send('read_page', {});
+  const secondAmount = [...(invPage.outline || '').matchAll(/textbox "Amount"[^\[]*\[(ref_\d+)\]/g)].map(m => m[1])[1];
+  await setup("const t=document.getElementById('inv'); t.innerHTML=t.innerHTML; 'replaced'");
+  await send('fill', { selector: secondAmount, value: '4242' });
+  const rowValues = await send('execute_script', { code: "[...document.querySelectorAll('#inv input')].map(i=>i.value)" });
+  check('a ref re-identifies into its own row, not the one above it',
+    rowValues.result[0] === '' && rowValues.result[1] === '4242', JSON.stringify(rowValues.result));
+
   // ── submit classifies rejection and success ─────────────────────────────
   await send('navigate', { url: `${BASE}/login` });
   await send('fill', { selector: '#username', value: 'wrong' });
