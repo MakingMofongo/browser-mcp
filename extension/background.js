@@ -3339,18 +3339,31 @@ const COMMITTING = new Set([
 ]);
 const MUTATING_VERB = /^(POST|PUT|PATCH|DELETE)$/;
 
+// Reports whether the page's request recorder is there at all, separately from
+// where it has got to. Those were one number before, and the absent case came back
+// as zero — the same value a working recorder gives when nothing has happened yet.
+// So an action on a page where the content script had not loaded reported no
+// requests, which reads as "this committed nothing" and is the one thing that must
+// never be said wrongly: it is what a caller checks before deciding a click was
+// harmless.
 async function requestMark(tabId) {
   try {
     const [r] = await chrome.scripting.executeScript({
       target: { tabId }, world: 'MAIN',
-      func: () => (window.__bmcpRequests && window.__bmcpRequests.length ? window.__bmcpRequests[window.__bmcpRequests.length - 1].n : 0),
+      func: () => ({
+        present: Array.isArray(window.__bmcpRequests),
+        n: window.__bmcpRequests && window.__bmcpRequests.length ? window.__bmcpRequests[window.__bmcpRequests.length - 1].n : 0,
+      }),
     });
-    return typeof r?.result === 'number' ? r.result : null;
-  } catch { return null; }
+    if (!r?.result) return { present: false, n: 0, reason: 'the page could not be read' };
+    return r.result;
+  } catch (e) {
+    return { present: false, n: 0, reason: 'the page could not be read' };
+  }
 }
 
 async function requestsSince(tabId, mark) {
-  if (mark == null) return null;
+  if (mark == null || typeof mark !== 'number') return null;
   try {
     const [r] = await chrome.scripting.executeScript({
       target: { tabId }, world: 'MAIN', args: [mark],
@@ -3390,15 +3403,28 @@ async function runAction(port, method, params, opts = {}) {
   // analytics fires these constantly, so treating any of them as a fault would
   // stop a run on ordinary behaviour — the same mistake the mirrored-field check
   // made. What this buys is that a delete or a submit is no longer invisible.
-  if (mark != null && result && typeof result === 'object') {
-    // Settle first: the request is usually issued from the handler, so reading
-    // immediately catches the click and misses what it caused.
-    await new Promise(r => setTimeout(r, 250));
-    const fired = await requestsSince(tabId, mark);
-    const mutating = (fired || []).filter(q => MUTATING_VERB.test(q.method));
-    if (mutating.length) {
-      result.sent = mutating.slice(0, 6).map(q => `${q.method} ${q.url}` + (q.status ? ` → ${q.status}` : ''));
-      if (mutating.length > 6) result.sent_more = mutating.length - 6;
+  if (mark && result && typeof result === 'object') {
+    if (!mark.present) {
+      // Not the same as sending nothing, and the difference is the point. Left
+      // unsaid, an action on a page the recorder never reached looks exactly like
+      // one that committed nothing — which is what a caller reads before deciding
+      // a click was harmless, and what a replay compares against to decide a row
+      // behaved normally.
+      result.sent_unknown = `what this sent could not be observed — ${mark.reason || 'the page is not recording requests, which happens before the content script has loaded or where the page forbids it'}`;
+    } else {
+      // Settle first: the request is usually issued from the handler, so reading
+      // immediately catches the click and misses what it caused.
+      await new Promise(r => setTimeout(r, 250));
+      const fired = await requestsSince(tabId, mark.n);
+      if (fired == null) {
+        result.sent_unknown = 'the page stopped answering before what it sent could be read';
+      } else {
+        const mutating = fired.filter(q => MUTATING_VERB.test(q.method));
+        if (mutating.length) {
+          result.sent = mutating.slice(0, 6).map(q => `${q.method} ${q.url}` + (q.status ? ` → ${q.status}` : ''));
+          if (mutating.length > 6) result.sent_more = mutating.length - 6;
+        }
+      }
     }
   }
 
@@ -5199,6 +5225,11 @@ async function dispatchCore(port, method, params) {
           // because an unexplained request is the one case worth stopping a whole
           // run over rather than carrying on and finding out later.
           if (d.reason === 'unexpected-effect') return 'structural';
+          // Nothing is known to be wrong, and nothing is known to be right either.
+          // Treated like a structural stop because the rest of the queue would be
+          // just as unobservable, and a run of rows nobody can account for is worth
+          // less than a run that stopped and said why.
+          if (d.reason === 'unverifiable') return 'structural';
           if (d.reason === 'target-not-found') return 'structural';
           const a = d.actual || {};
           const blob = JSON.stringify(a);
@@ -5795,6 +5826,20 @@ async function dispatchCore(port, method, params) {
         // check passes because the fields are fine, and only the comparison with
         // what normally happens shows it. Not applied to a dry run, where the
         // requests are deliberately blocked and so never match.
+        // A step whose requests could not be observed has not been shown to match
+        // the clean run — it has only failed to be shown not to. Where the
+        // recording expected requests, treating that as agreement would let a row
+        // that fired something unexpected pass because nothing was watching, which
+        // is worse than the divergence it was meant to catch.
+        if (!diverged && !dryRun && step.shape?.sent?.length && out?.sent_unknown) {
+          diverged = {
+            step: i, method: step.method, reason: 'unverifiable',
+            recorded: step.shape.sent,
+            detail: `this step normally sends ${step.shape.sent.join(', ')}, and what it sent this time could not be observed — ${out.sent_unknown}`,
+          };
+          break;
+        }
+
         if (!diverged && !dryRun && step.shape) {
           const drift = shapeDivergence(step.shape, stepShape(out || {}));
           if (drift) {
