@@ -34,6 +34,39 @@ if (!existsSync(PEM)) {
   process.exit(1);
 }
 
+// ── gates ──────────────────────────────────────────────────────────────────
+// Publishing goes straight to a channel that installed copies pull from on their
+// own, so a broken build reaches every machine without anyone choosing to take it.
+// The checks run BEFORE anything is written, so a failure leaves no half-bumped
+// version behind.
+const skipLive = process.argv.includes('--no-live');
+
+const gate = (label, cmd, cwd) => {
+  process.stdout.write(`  ${label} … `);
+  try {
+    execSync(cmd, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 600000 });
+    console.log('ok');
+  } catch (e) {
+    console.log('FAILED');
+    const out = `${e.stdout || ''}${e.stderr || ''}`.trim();
+    console.error(out.split('\n').slice(-25).join('\n'));
+    console.error(`\nRelease stopped: ${label} did not pass. Nothing was written or published.`);
+    process.exit(1);
+  }
+};
+
+console.log('Checks:');
+gate('tool wiring', 'node test-wiring.mjs', join(ROOT, 'mcp-server'));
+
+if (skipLive) {
+  // Allowed, but never silently: the live suite is what has caught every
+  // behavioural regression so far, and a release that skipped it should say so.
+  console.log('  live suite … SKIPPED (--no-live)');
+  console.log('  note: the behavioural checks did not run for this build.');
+} else {
+  gate('live suite (needs Chrome with the extension loaded)', 'node test-suite.mjs', join(ROOT, 'mcp-server'));
+}
+
 // ── version ────────────────────────────────────────────────────────────────
 const manifestPath = join(EXT, 'manifest.json');
 const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));

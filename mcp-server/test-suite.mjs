@@ -141,31 +141,31 @@ async function suite() {
     !!real && noisy?.repeats >= 30 && logs.unique < 10, `unique=${logs.unique} repeats=${noisy?.repeats}`);
 
   // ── network bodies, truncation marker and re-pull ───────────────────────
-  await send('navigate', { url: 'https://httpbin.org/' });
-  // Capture starts when the debugger attaches, so attach first and then load the
-  // JSON as a document: a navigation response is captured deterministically,
-  // whereas a fetch issued from page script races the capture being enabled.
-  await send('network_log', { limit: 1 });
-  await send('navigate', { url: 'https://httpbin.org/json' });
-  // Bodies are captured asynchronously as each response completes, so poll for one
-  // rather than assuming it has landed by the time the fetch resolves.
-  // Chrome hands the body over asynchronously after the response completes and can
-  // evict it, so poll and reload once rather than assuming a single read will see it.
-  let cut = null;
-  for (let i = 0; i < 16; i++) {
-    await new Promise(r => setTimeout(r, 500));
-    cut = await send('network_log', { url_pattern: '/json', include_body: true, max_body_chars: 60 });
-    if ((cut.requests || []).some(r => r.body)) break;
-    if (i === 7) await send('navigate', { url: 'https://httpbin.org/json' });
-  }
-  // Several requests can match; assert against the one that actually carries a body.
-  const entry = (cut.requests || []).filter(r => r.body).sort((a, b) => (b.complete_bytes || 0) - (a.complete_bytes || 0))[0];
-  check('a capped body is marked truncated with a way back',
-    entry?.truncated === true && !!entry?.id && entry.body.length <= 60, JSON.stringify({ t: entry?.truncated, id: entry?.id }));
-  const full = await send('network_log', { request_id: entry?.id });
-  let parsed = null;
-  try { parsed = JSON.parse(full.body); } catch {}
-  check('re-pulling the response returns parseable JSON', !!parsed?.slideshow, full.error || `${full.bytes} bytes`);
+  // A gate must not depend on a third-party service being healthy: httpbin
+  // rate-limits and returns HTML, which failed this check for reasons that had
+  // nothing to do with the product. Fetching the page's own URL exercises the same
+  // path — a Fetch-type request whose body is captured — with no outside dependency.
+  await group('response body capture', async () => {
+    await send('navigate', { url: `${BASE}/login` });
+    await send('network_log', { limit: 1 }); // attach before the request is made
+    let entry = null;
+    for (let attempt = 0; attempt < 3 && !entry; attempt++) {
+      await send('execute_script', { code: "const r = await fetch(location.href + '?probe=' + Date.now()); (await r.text()).length" });
+      for (let i = 0; i < 10 && !entry; i++) {
+        await new Promise(r => setTimeout(r, 400));
+        const log = await send('network_log', { url_pattern: 'probe=', include_body: true, max_body_chars: 60 });
+        entry = (log.requests || []).filter(r => r.body).sort((a, b) => (b.complete_bytes || 0) - (a.complete_bytes || 0))[0] || null;
+      }
+    }
+    check('a capped body is marked truncated with a way back',
+      entry?.truncated === true && !!entry?.id && entry.body.length <= 60,
+      JSON.stringify({ truncated: entry?.truncated, id: entry?.id, len: entry?.body?.length }));
+
+    const full = await send('network_log', { request_id: entry?.id });
+    check('re-pulling returns the whole response, not the capped copy',
+      full.ok === true && full.body?.length === entry?.complete_bytes && full.body.length > 60,
+      `${full.body?.length} of ${entry?.complete_bytes} bytes`);
+  });
 
   // ── record, branch, replay ──────────────────────────────────────────────
   await send('record', { action: 'delete', name: '__suite' }).catch(() => {});
