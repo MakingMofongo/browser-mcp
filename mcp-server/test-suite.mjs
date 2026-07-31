@@ -131,6 +131,21 @@ async function suite() {
   check('a ref re-identifies into its own row, not the one above it',
     rowValues.result[0] === '' && rowValues.result[1] === '4242', JSON.stringify(rowValues.result));
 
+  // Words that name a kind of control and also name a particular one. Taking them
+  // out of the query as soon as they are recognised as a role leaves nothing to
+  // match on, and then everything of that kind ties on the role bonus alone — the
+  // answer becomes whichever element happens to come first in the document.
+  await send('navigate', { url: `${BASE}/login` });
+  await setup(`document.body.insertAdjacentHTML('beforeend',
+    '<input type=checkbox aria-label="Main menu"><input type=search aria-label="Search the site">'); 'ok'`);
+  const searchFind = await send('find', { query: 'search input', max_results: 3 });
+  check('a query whose words are all role names still ranks by meaning',
+    /search/i.test(searchFind.matches?.[0]?.name || ''),
+    JSON.stringify((searchFind.matches || []).slice(0, 2).map(m => `${m.name}:${m.score}`)));
+  const submitFind = await send('find', { query: 'submit button' });
+  check('a plain role query still works', /login|submit/i.test(submitFind.matches?.[0]?.name || ''),
+    submitFind.matches?.[0]?.name);
+
   // ── submit classifies rejection and success ─────────────────────────────
   await send('navigate', { url: `${BASE}/login` });
   await send('fill', { selector: '#username', value: 'wrong' });

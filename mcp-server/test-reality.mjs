@@ -43,8 +43,11 @@ async function reality() {
     check('read_page produces a bounded outline of a large real page',
       (page.outline || '').length > 500 && (page.outline || '').length <= 42000, `${(page.outline || '').length} chars`);
     const found = await send('find', { query: 'search input' });
-    check('find locates the search box by description', (found.matches || []).length > 0,
-      JSON.stringify(found.matches?.[0]?.name || found.matches?.[0]));
+    // Asserting on the name, not just that something matched. The weaker version
+    // passed for a long time while this returned the main menu toggle.
+    check('find locates the search box by description',
+      /search/i.test(found.matches?.[0]?.name || ''),
+      JSON.stringify(found.matches?.[0]?.name));
     const content = await send('get_page_content', {});
     check('get_page_content returns the article text', /scraping/i.test(content.content || ''), `${content.length} chars`);
     const scrolled = await send('scroll', { y: 1200 });
