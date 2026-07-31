@@ -213,6 +213,48 @@ async function suite() {
   check('structural divergence pauses with the queue intact',
     paused.paused_at_row === 0 && paused.pending === 2, JSON.stringify({ at: paused.paused_at_row, pending: paused.pending }));
 
+  // ── mutations that used to report success without checking ──
+  await group('select_option verifies', async () => {
+    await send('navigate', { url: `${BASE}/dropdown` });
+    const missing = await send('select_option', { selector: '#dropdown', option: 'Option 99' });
+    const untouched = await send('execute_script', { code: "document.querySelector('#dropdown').selectedIndex" });
+    check('selecting an option that does not exist fails and lists what does',
+      missing.ok === false && Array.isArray(missing.available_options), JSON.stringify(missing.available_options));
+    check('a failed select leaves the field alone',
+      untouched.result === 0, String(untouched.result));
+    const good = await send('select_option', { selector: '#dropdown', option: 'Option 2' });
+    const now = await send('execute_script', { code: "document.querySelector('#dropdown').selectedIndex" });
+    check('a real select reports the value the page ended up with',
+      good.ok === true && good.selected === 'Option 2' && now.result === 2, JSON.stringify({ sel: good.selected, idx: now.result }));
+
+    // Substring matching must not quietly pick a longer neighbour.
+    await setup(`const s=document.querySelector('#dropdown');s.insertAdjacentHTML('beforeend','<option>Option 2 Extended</option>')`);
+    const amb = await send('select_option', { selector: '#dropdown', option: 'Option 2' });
+    check('an exact match wins over a longer option containing it',
+      amb.ok === true && amb.selected === 'Option 2', amb.selected || amb.error);
+  });
+
+  await group('storage and cookies verify', async () => {
+    await send('navigate', { url: `${BASE}/login` });
+    const ls = await send('set_local_storage', { key: 'bmcp_probe', value: 'kept' });
+    check('local storage reports the value it read back', ls.ok === true && ls.verified === true, JSON.stringify(ls));
+    // A secure cookie on a mismatched domain is refused by Chrome without throwing.
+    const bad = await send('set_cookies', { cookies: [{ name: 'x', value: '1', domain: 'not-this-site.invalid', url: 'https://the-internet.herokuapp.com/' }] });
+    check('a cookie Chrome refuses is reported as failed, not set',
+      bad.ok === false && bad.failed === 1, JSON.stringify(bad.results));
+  });
+
+  await group('scroll verifies', async () => {
+    await send('navigate', { url: `${BASE}/large` });
+    const down = await send('scroll', { y: 600 });
+    check('a scroll that moves reports how far it actually went',
+      down.ok === true && down.moved > 0, JSON.stringify({ moved: down.moved, at: down.position }));
+    await send('execute_script', { code: 'window.scrollTo(0, document.documentElement.scrollHeight); 1' });
+    const stuck = await send('scroll', { y: 800 });
+    check('scrolling past the end is reported, not counted as done',
+      stuck.ok === false && /bottom/i.test(stuck.error || ''), stuck.error);
+  });
+
   // ── a covered element must not report a successful click ──
   await group('overlay interception', async () => {
     await send('navigate', { url: `${BASE}/login` });
