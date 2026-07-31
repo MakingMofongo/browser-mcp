@@ -86,13 +86,16 @@ async function updateExtensionFromChannel() {
 // Fire-and-forget: never delay server startup on a network call.
 updateExtensionFromChannel();
 
-const BASE_PORT = 9876;
+// Overridable so a test can stand up a server on a port of its own instead of
+// racing the sessions already using the range.
+const BASE_PORT = Number(process.env.BMCP_BASE_PORT) || 9876;
 const MAX_PORT = 9895; // 20 ports instead of 10 — zombies die within 5s via parent check
 // v2.0 multi-browser: EVERY connected extension instance (per Chrome profile/machine)
 // is tracked; commands route to the ACTIVE one. Previously the last connection
 // silently overwrote the socket — two browsers meant nondeterministic routing.
 const extConnections = new Map(); // ws → { id, label, platform, chrome_version, connectedAt }
 let activeExt = null;             // ws currently receiving commands
+
 let activePort = null;
 let wss = null; // Track WSS for graceful shutdown
 let cmdId = 0;
@@ -106,6 +109,41 @@ function pickFailover() {
     const meta = extConnections.get(activeExt);
     process.stderr.write(`[MCP] Failed over to browser: ${meta?.label || 'unknown'}\n`);
   }
+}
+
+// Liveness is proven, not assumed, and either end can force the repair.
+//
+// readyState OPEN means a socket object exists, not that anything is on the other
+// end of it. When a peer goes away without a clean close — machine sleeps, network
+// stack drops the connection, a process is killed without sending FIN — no close
+// event is ever delivered and the socket stays OPEN for ever. The server then
+// posted every command into a dead pipe and waited out the full timeout, with no
+// way to notice and nothing it could do about it. That is what "bridge down" was:
+// not a crash, a socket both ends still believed in.
+//
+// So both ends ping, both answer, and both hang up on silence. A wedge now needs
+// both ends to be wrong about the same socket at the same time, and whichever end
+// notices first closes it — which fires the other end's close handler and brings
+// the extension's two-second rescan straight back round. terminate() rather than
+// close(), because a graceful close waits for a handshake a dead peer will never
+// send, which is the state being escaped.
+// Overridable so the recovery behaviour can be tested in seconds rather than
+// by waiting out a real minute of silence.
+const HEARTBEAT_MS = Number(process.env.BMCP_HEARTBEAT_MS) || 15000;
+const SILENT_LIMIT_MS = Number(process.env.BMCP_SILENT_MS) || 50000;
+
+function connHealth(ws) {
+  let h = extConnections.get(ws);
+  if (!h) { h = {}; extConnections.set(ws, h); }
+  return h;
+}
+
+function proven(ws) {
+  const h = extConnections.get(ws);
+  // Not yet judged either way — a connection that has never answered a ping is
+  // given the benefit of the doubt, so an older extension keeps working.
+  if (!h?.everPonged) return true;
+  return !h.lastSeen || (Date.now() - h.lastSeen) < SILENT_LIMIT_MS;
 }
 
 // Timers hoisted to module scope so gracefulShutdown can clear them deterministically.
@@ -148,6 +186,21 @@ function createWSS(port = BASE_PORT) {
     ws.on('message', (data) => {
       let msg;
       try { msg = JSON.parse(data.toString()); } catch { return; }
+
+      // Anything arriving is proof this socket carries data, which is the only
+      // evidence that counts for keeping it.
+      connHealth(ws).lastSeen = Date.now();
+
+      if (msg.type === 'ping') {
+        try { ws.send(JSON.stringify({ type: 'pong' })); } catch {}
+        return;
+      }
+      // A pong additionally proves the far end speaks the heartbeat, which is what
+      // makes it fair to hang up on this connection later for going silent.
+      if (msg.type === 'pong') {
+        connHealth(ws).everPonged = true;
+        return;
+      }
 
       if (msg.type === 'hello' && msg.instance) {
         const prev = extConnections.get(ws) || {};
@@ -194,15 +247,31 @@ function createWSS(port = BASE_PORT) {
     process.stderr.write(`[MCP] WebSocket server listening on ws://127.0.0.1:${port}\n`);
   });
 
-  // Heartbeat + idle timeout (4 hours) — hoisted to module scope so gracefulShutdown can clear it
+  // Heartbeat + idle timeout (4 hours) — hoisted to module scope so gracefulShutdown can clear it.
+  //
+  // This used to call ws.ping() and stop there. A protocol ping frame is answered
+  // by the browser itself and the reply was never looked at, so it had the shape of
+  // a liveness check while proving nothing — which is most of why a socket could go
+  // dead in both directions with neither end noticing. It asks now, and acts on the
+  // silence. The question is deliberately answered by the offscreen document's own
+  // script rather than by the browser's socket layer, because a document whose
+  // script has stopped will still have its frames answered for it.
   heartbeat = setInterval(() => {
-    for (const ws of extConnections.keys()) {
-      if (ws.readyState === 1) ws.ping();
+    for (const ws of [...extConnections.keys()]) {
+      if (ws.readyState !== 1) continue;
+      if (!proven(ws)) {
+        process.stderr.write('[MCP] connection stopped answering; dropping it so the extension reconnects\n');
+        try { ws.terminate(); } catch {}
+        extConnections.delete(ws);
+        if (activeExt === ws) { activeExt = null; pickFailover(); }
+        continue;
+      }
+      try { ws.send(JSON.stringify({ type: 'ping' })); } catch {}
     }
     if (Date.now() - lastActivity > 4 * 60 * 60 * 1000) {
       gracefulShutdown('Idle timeout (4h)');
     }
-  }, 20000);
+  }, HEARTBEAT_MS);
 }
 
 createWSS();
@@ -210,6 +279,15 @@ createWSS();
 // ── Send command to extension ───────────────────────────────────────────────
 
 async function sendToExtension(method, params = {}, timeoutMs = 30000, _retries = 8) {
+  // A connection that has gone quiet is not used, whatever its readyState says.
+  // Sending into it is how a run spends thirty seconds per command discovering
+  // what a heartbeat already knows.
+  if (activeExt && !proven(activeExt)) {
+    try { activeExt.terminate(); } catch {}
+    extConnections.delete(activeExt);
+    activeExt = null;
+    pickFailover();
+  }
   // Auto-reconnect: extension offscreen doc rescans ports every 2s, so transient
   // disconnects (extension reload, service-worker restart, Chrome relaunch) heal
   // themselves — we just wait for a socket. If the active one died but another

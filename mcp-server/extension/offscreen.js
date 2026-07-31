@@ -35,6 +35,47 @@ async function getInstanceInfo() {
   return instanceCache;
 }
 
+// A socket in readyState OPEN is not a socket that works. When the far end goes
+// away without a clean close — the machine sleeps, the network stack drops the
+// connection, a process is killed in a way that sends no FIN — the browser never
+// sees a close event and the socket stays OPEN indefinitely. scanPorts then skips
+// it every two seconds for ever, the extension believes it is connected, the
+// server sees nothing, and every command times out with nothing recovering. That
+// is what four and a half hours of silence looks like from the inside.
+//
+// So each connection is asked to prove it. A ping goes out on a timer and the
+// server answers; a connection that has stopped answering is closed, which lets
+// the scan below replace it.
+//
+// The safety property that matters: a connection is only ever killed for silence
+// once it has answered at least one ping. A server too old to know the message
+// never answers, is never judged, and behaves exactly as it does today. This can
+// close a connection it has proven dead, and no other kind.
+const HEARTBEAT_MS = 15000;
+const SILENT_LIMIT_MS = 50000;
+const health = new Map(); // port → { lastSeen, everPonged }
+
+function noteAlive(port) {
+  const h = health.get(port) || {};
+  h.lastSeen = Date.now();
+  health.set(port, h);
+}
+
+function heartbeat() {
+  for (const [port, ws] of connections) {
+    if (!ws || ws.readyState !== WebSocket.OPEN) continue;
+    const h = health.get(port);
+    if (h?.everPonged && h.lastSeen && Date.now() - h.lastSeen > SILENT_LIMIT_MS) {
+      console.warn(`[Offscreen] port ${port} stopped answering; closing so it can be replaced`);
+      try { ws.close(); } catch {}
+      connections.delete(port);
+      health.delete(port);
+      continue;
+    }
+    try { ws.send(JSON.stringify({ type: 'ping' })); } catch {}
+  }
+}
+
 function scanPorts() {
   for (let port = BASE_PORT; port <= MAX_PORT; port++) {
     const existing = connections.get(port);
@@ -60,6 +101,7 @@ function tryConnect(port) {
   ws.onopen = () => {
     clearTimeout(connectTimeout);
     connections.set(port, ws);
+    noteAlive(port);
     console.log(`[Offscreen] Connected to MCP server on port ${port} (${connections.size} total)`);
     // v2.0 hello handshake, two-phase so it can NEVER be skipped:
     // 1) immediate hello with synchronously available data (the server merges
@@ -79,6 +121,23 @@ function tryConnect(port) {
   ws.onmessage = async (event) => {
     let cmd;
     try { cmd = JSON.parse(event.data); } catch { return; }
+    // Anything arriving proves the connection carries data, which is the only
+    // evidence that counts. A pong additionally proves the server understands the
+    // heartbeat, which is what makes it fair to judge this connection on silence.
+    noteAlive(port);
+    if (cmd.type === 'pong') {
+      const h = health.get(port) || {};
+      h.everPonged = true;
+      h.lastSeen = Date.now();
+      health.set(port, h);
+      return;
+    }
+    // The server checks this end the same way this end checks the server. Not
+    // answering would have it hang up on a connection that was working perfectly.
+    if (cmd.type === 'ping') {
+      try { ws.send(JSON.stringify({ type: 'pong' })); } catch {}
+      return;
+    }
     const { id, method, params } = cmd;
 
     try {
@@ -104,6 +163,7 @@ function tryConnect(port) {
     clearTimeout(connectTimeout);
     if (connections.get(port) === ws) {
       connections.delete(port);
+      health.delete(port);
       console.log(`[Offscreen] Disconnected from port ${port} (${connections.size} remaining)`);
       updateStatus();
       // Notify background to release tabs for this session
@@ -153,3 +213,4 @@ chrome.runtime.onMessage.addListener((msg) => {
 // Initial scan + frequent rescan for new servers
 scanPorts();
 setInterval(scanPorts, 2000);
+setInterval(heartbeat, HEARTBEAT_MS);
