@@ -782,8 +782,8 @@ async function suite() {
     const withHistory = await send('health', {});
     const byTool = withHistory.recent?.by_tool || [];
     check('health reports how long the recent calls took',
-      withHistory.recent?.calls > 0 && byTool.some(t => t.method === 'click' && typeof t.mean_ms === 'number'),
-      JSON.stringify(byTool.find(t => t.method === 'click')));
+      withHistory.recent?.calls > 0 && byTool.length > 0 && byTool.every(t => typeof t.mean_ms === 'number' && t.calls > 0),
+      JSON.stringify(byTool.slice(0, 2)));
     check('health says when a tool completed on a fallback rather than the real path',
       byTool.some(t => t.used_fallback > 0) && /fallback/.test(withHistory.recent?.note || ''),
       withHistory.recent?.note);
@@ -852,6 +852,41 @@ async function suite() {
       /records\/\{id\}\/delete/.test(JSON.stringify(drifted.diverged_at?.unexpected_requests || [])),
       JSON.stringify(drifted.diverged_at));
     await send('record', { action: 'delete', name: '__shape' }).catch(() => {});
+  });
+
+  // Someone using the tab a run is working in. The flow is fine; the page is
+  // simply no longer in the state the run believes it is, and everything after
+  // that acts on the assumption that it is.
+  await group('a run notices someone else using the tab', async () => {
+    await send('record', { action: 'delete', name: '__interf' }).catch(() => {});
+    await send('navigate', { url: `${BASE}/login` });
+    await send('record', { action: 'start', name: '__interf' });
+    await send('fill', { selector: '#username', value: 'tomsmith' });
+    await send('fill', { selector: '#password', value: 'SuperSecretPassword!' });
+    await send('submit', { expect_text: 'Secure Area', timeout: 9000 });
+    await send('record', { action: 'stop' });
+
+    // A run nobody touches must not report interference, or the check is noise.
+    const quiet = await send('replay', { name: '__interf', rows: [{ Username: 'tomsmith', Password: 'SuperSecretPassword!' }] });
+    check('a run nobody touches reports no interference',
+      quiet.paused_for !== 'someone using the browser', JSON.stringify({ paused: quiet.paused_for, done: quiet.done }));
+
+    // Now put input into the page from outside the run's own actions. The
+    // recorder only keeps trusted events, so this stands in for a real one.
+    await send('navigate', { url: `${BASE}/login` });
+    // Timestamped clearly before the run begins. Setting it at "now" would land
+    // inside the first step's window, which is padded backwards on purpose so a
+    // step's own effects are counted as the step's.
+    await setup(`window.__bmcpUserInput.push({ t: Date.now() - 5000, type: 'keydown' }); 'ok'`);
+    const touched = await send('replay', { name: '__interf', start_url: false, rows: [{ Username: 'tomsmith', Password: 'SuperSecretPassword!' }] });
+    check('input from outside the run pauses it and names why',
+      touched.paused_for === 'someone using the browser' && /keydown/.test(touched.detected || ''),
+      JSON.stringify({ paused: touched.paused_for, detected: touched.detected }));
+    const touchedLed = await send('runs', { id: touched.run_id });
+    check('the interrupted row is not counted as a failure',
+      touchedLed.rows?.[0]?.status !== 'failed' && touchedLed.rows?.[0]?.status !== 'skipped',
+      touchedLed.rows?.[0]?.status);
+    await send('record', { action: 'delete', name: '__interf' }).catch(() => {});
   });
 
   // Every check here has to work on the replay path, not just when a caller drives
