@@ -854,6 +854,39 @@ async function suite() {
     await send('record', { action: 'delete', name: '__shape' }).catch(() => {});
   });
 
+  // A run that trips a limit at 2am and keeps going at full speed spends the next
+  // five hours making a struggling site worse and filling the ledger with failures
+  // that say nothing about the data.
+  await group('a run slows down and stops when the site is struggling', async () => {
+    await send('record', { action: 'delete', name: '__pace' }).catch(() => {});
+    await send('navigate', { url: `${BASE}/apply` });
+    await send('record', { action: 'start', name: '__pace' });
+    await send('fill', { selector: '#name', value: 'First Person' });
+    // Short on purpose: four failing rows each retry once, so a long submit
+    // timeout here turns a behavioural test into a five minute wait.
+    await send('submit', { expect_text: 'submitted', timeout: 2500 });
+    await send('record', { action: 'stop' });
+
+    // Healthy: no waiting, nothing to report.
+    const ok = await send('replay', { name: '__pace', rows: [{ 'Full name': 'A' }, { 'Full name': 'B' }] });
+    check('a healthy run is not slowed down or interrupted',
+      !ok.paced && !ok.paused_for && ok.done === 2, JSON.stringify({ paced: ok.paced, done: ok.done }));
+
+    // Now every submission comes back 503, driven by the row itself so the
+    // navigation at the start of each row cannot reset it.
+    const rows = ['FAIL1', 'FAIL2', 'FAIL3', 'FAIL4', 'FAIL5'].map(n => ({ 'Full name': n }));
+    const bad = await send('replay', { name: '__pace', rows }, 150000);
+    check('the run waits longer each time the site answers badly',
+      (bad.paced || []).length >= 2 && bad.paced.some(p => p.waiting_ms >= 4000),
+      JSON.stringify(bad.paced?.slice(0, 3)));
+    check('it stops rather than working through the whole queue against a bad site',
+      bad.paused_for === 'the site' && /429 or a server error/.test(bad.reason || ''), bad.reason);
+    check('the rows it never reached are still waiting',
+      bad.remaining >= 1 && bad.rows_total === 5, JSON.stringify({ remaining: bad.remaining, total: bad.rows_total }));
+
+    await send('record', { action: 'delete', name: '__pace' }).catch(() => {});
+  });
+
   // Someone using the tab a run is working in. The flow is fine; the page is
   // simply no longer in the state the run believes it is, and everything after
   // that acts on the assumption that it is.

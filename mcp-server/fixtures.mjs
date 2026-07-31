@@ -148,11 +148,22 @@ export function startFixtures() {
           res.end();
         });
       }
+      // Answers every submission with 503 once armed, so the pacing and the
+      // give-up-after-four behaviour can be exercised without waiting on a real
+      // site to have a bad day.
+
       if (url === '/apply' && req.method === 'POST') {
         let body = '';
         req.on('data', (c) => { body += c; });
         return req.on('end', () => {
           const name = new URLSearchParams(body).get('name') || '';
+          // Driven by the row rather than by a page visit. A replay navigates to
+          // the flow's start URL before every row, so anything armed by loading a
+          // page is disarmed again before the first submission.
+          if (name.startsWith('FAIL')) {
+            res.writeHead(503, { 'content-type': 'text/html' });
+            return res.end(page('503 Service Temporarily Unavailable', '<h1>503 Service Temporarily Unavailable</h1>'));
+          }
           // One row that completes without giving a reference — the case worth
           // catching, since the flow gives one for every other row and so this
           // one's silence means something.
