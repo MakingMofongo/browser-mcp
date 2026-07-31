@@ -142,11 +142,14 @@ async function suite() {
   await send('navigate', { url: 'https://httpbin.org/json' });
   // Bodies are captured asynchronously as each response completes, so poll for one
   // rather than assuming it has landed by the time the fetch resolves.
+  // Chrome hands the body over asynchronously after the response completes and can
+  // evict it, so poll and reload once rather than assuming a single read will see it.
   let cut = null;
-  for (let i = 0; i < 12; i++) {
+  for (let i = 0; i < 16; i++) {
     await new Promise(r => setTimeout(r, 500));
     cut = await send('network_log', { url_pattern: '/json', include_body: true, max_body_chars: 60 });
     if ((cut.requests || []).some(r => r.body)) break;
+    if (i === 7) await send('navigate', { url: 'https://httpbin.org/json' });
   }
   // Several requests can match; assert against the one that actually carries a body.
   const entry = (cut.requests || []).filter(r => r.body).sort((a, b) => (b.complete_bytes || 0) - (a.complete_bytes || 0))[0];

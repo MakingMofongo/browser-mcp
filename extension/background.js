@@ -4333,6 +4333,9 @@ async function dispatchCore(port, method, params) {
       }
 
       const SUBMITISH = /^(submit|save|continue|next|apply|pay|confirm|send|finish|create|book|place order|sign in|log in)\b/i;
+      // What this run put into the page, so it can be checked against what the
+      // page is showing before anything is committed.
+      const expectations = {};
       const dryRun = params.dry_run === true;
 
       // Holding back steps whose label reads like a commit is a guess, and it is
@@ -4434,7 +4437,33 @@ async function dispatchCore(port, method, params) {
         // Per-run values: a row key matching the field's name wins over the recorded one.
         if (step.method === 'fill' && row && step.target?.name) {
           const key = Object.keys(row).find(k => k.toLowerCase() === String(step.target.name).toLowerCase());
-          if (key) p.value = String(row[key]);
+          if (key) { p.value = String(row[key]); expectations[step.target.name] = p.value; }
+        }
+
+        // A structurally perfect run can still submit the previous row's values if a
+        // control never re-rendered. Check the page against the row before committing.
+        if (step.method === 'submit' && params.verify !== false && Object.keys(expectations).length) {
+          let v = null, verifyError = null;
+          try { v = await dispatchCore(port, 'verify_data', { expect: expectations }); }
+          catch (e) { verifyError = e?.message || String(e); }
+          // A check that quietly does nothing when it fails is worse than no check,
+          // because the run then reports success it never established.
+          if (verifyError || (v && v.ok !== true && !v.mismatched)) {
+            diverged = {
+              step: i, method: step.method, reason: 'verification-unavailable',
+              detail: verifyError || v?.error,
+              note: 'Stopped before committing: the page could not be checked against this row, so there is no basis for saying the data is right.',
+            };
+            break;
+          }
+          if (v && v.ok === false && v.mismatched?.length) {
+            diverged = {
+              step: i, method: step.method, reason: 'data-mismatch',
+              mismatched: v.mismatched,
+              note: 'Stopped before committing: the page is not showing the values this row supplied.',
+            };
+            break;
+          }
         }
 
         let out;
@@ -4489,11 +4518,103 @@ async function dispatchCore(port, method, params) {
         ...(validation ? { validation } : {}),
         steps_run: results.length,
         steps_total: flow.steps.length,
+        ...(Object.keys(expectations).length ? { verified_fields: Object.keys(expectations) } : {}),
         results: params.verbose ? results : undefined,
         url: tab?.url,
         ...(diverged ? {
           diverged_at: diverged,
           hint: 'The page no longer matches the recording at this step. Inspect with browser_form_state or browser_read_page, handle this case, then continue or re-record.',
+        } : {}),
+      };
+    }
+
+    case 'verify_data': {
+      // Structural checks catch a missing field. They do not catch a row completing
+      // with the previous row's values because a control never re-rendered — that
+      // run looks perfect. This compares what the page is actually showing against
+      // what it is supposed to show, in form fields and in rendered summary text.
+      const tab = await getSessionTab(port);
+      if (tab.url.startsWith('chrome://')) throw new Error('Cannot read chrome:// pages');
+      const expect = params.expect;
+      if (!expect || typeof expect !== 'object' || !Object.keys(expect).length) {
+        return { ok: false, error: 'expect required: an object of label to value, for example {"Email":"a@b.com"}' };
+      }
+      const [res] = await chrome.scripting.executeScript({
+        target: { tabId: tab.id }, world: 'MAIN',
+        args: [expect, params.selector || null, params.exact === true],
+        func: (expect, rootSel, exact) => {
+          const root = rootSel ? document.querySelector(rootSel) : document.body;
+          if (!root) return { error: 'scope not found: ' + rootSel };
+          const norm = (v) => String(v == null ? '' : v).replace(/\s+/g, ' ').trim();
+          const loose = (v) => norm(v).toLowerCase().replace(/[^a-z0-9]/g, '');
+          const same = (a, b) => exact ? norm(a) === norm(b) : (loose(a) === loose(b) || (loose(b) && loose(a).includes(loose(b))));
+
+          const labelOf = (el) => {
+            const a = el.getAttribute && el.getAttribute('aria-label');
+            if (a) return a;
+            if (el.labels && el.labels[0]) return el.labels[0].textContent;
+            if (el.placeholder) return el.placeholder;
+            const w = el.closest && el.closest('label');
+            if (w) return w.textContent;
+            return el.name || el.id || '';
+          };
+          const controls = [...root.querySelectorAll('input, select, textarea')]
+            .filter(el => el.type !== 'hidden');
+
+          // Label/value pairs as a review page renders them.
+          const pairs = [];
+          for (const dl of root.querySelectorAll('dl')) {
+            const dts = [...dl.querySelectorAll('dt')], dds = [...dl.querySelectorAll('dd')];
+            dts.forEach((dt, i) => dds[i] && pairs.push([norm(dt.textContent), norm(dds[i].textContent)]));
+          }
+          for (const tr of root.querySelectorAll('tr')) {
+            const cells = [...tr.children];
+            if (cells.length === 2) pairs.push([norm(cells[0].textContent), norm(cells[1].textContent)]);
+          }
+          for (const el of root.querySelectorAll('*')) {
+            if (el.children.length !== 0) continue;
+            const t = norm(el.textContent);
+            const m = /^(.{2,60}?)\s*[:：]\s*(.+)$/.exec(t);
+            if (m) pairs.push([m[1], m[2]]);
+          }
+
+          const out = [];
+          for (const [key, want] of Object.entries(expect)) {
+            const ctl = controls.find(c => same(labelOf(c), key) || loose(labelOf(c)).includes(loose(key)));
+            if (ctl) {
+              const got = ctl.tagName === 'SELECT'
+                ? (ctl.selectedOptions[0]?.text || '')
+                : (ctl.type === 'checkbox' || ctl.type === 'radio' ? (ctl.checked ? 'true' : 'false') : ctl.value);
+              out.push({ field: key, expected: norm(want), found: norm(got), source: 'form field', match: same(got, want) });
+              continue;
+            }
+            const pair = pairs.find(([k]) => same(k, key) || loose(k).includes(loose(key)));
+            if (pair) {
+              out.push({ field: key, expected: norm(want), found: pair[1], source: 'summary text', match: same(pair[1], want) });
+              continue;
+            }
+            // Last resort: is the value present anywhere at all?
+            const anywhere = loose(root.innerText || '').includes(loose(want));
+            out.push({
+              field: key, expected: norm(want), found: null,
+              source: anywhere ? 'value appears on the page but not against this label' : 'not found',
+              match: false,
+            });
+          }
+          return { checks: out };
+        },
+      });
+      const r = res?.result;
+      if (!r || r.error) return { ok: false, error: r?.error || 'Could not read the page' };
+      const mismatched = r.checks.filter(c => !c.match);
+      return {
+        ok: mismatched.length === 0,
+        checked: r.checks.length,
+        matched: r.checks.length - mismatched.length,
+        mismatched: mismatched.length ? mismatched : undefined,
+        checks: params.verbose ? r.checks : undefined,
+        ...(mismatched.length ? {
+          hint: 'The page is not showing what it was given. A control that did not re-render keeps the previous value, which a structural check cannot see.',
         } : {}),
       };
     }

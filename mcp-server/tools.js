@@ -119,8 +119,23 @@ export const TOOLS = [
         retry_committed: { type: 'boolean', description: 'On resume, also retry rows that failed after a request had already been sent. Those are held back by default because re-running them can create a duplicate.' },
         start_url: { type: 'boolean', description: 'Navigate to the recorded starting URL first (default: true)' },
         verbose: { type: 'boolean', description: 'Include per-step results' },
+        verify: { type: 'boolean', description: 'Before each commit, check the page is showing the values this row supplied, and stop if it is not (default: true when a row is given)' },
       },
       required: ['name'],
+    },
+  },
+  {
+    name: 'browser_verify_data',
+    description: "Check that the page is showing the values it was given. Each expected label is matched against a form field or against a label and value rendered as text, as a review or summary step displays them, and the result says which matched, which hold something different, and which could not be found. Catches a record that carries the previous record's values because a control never re-rendered, which a structural check cannot see.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        expect: { type: 'object', description: 'Labels and their expected values, for example {"Email":"a@b.com","Programme":"MS CS"}' },
+        selector: { type: 'string', description: 'Limit the check to one container, such as a review panel' },
+        exact: { type: 'boolean', description: 'Require an exact match rather than ignoring case, spacing and punctuation' },
+        verbose: { type: 'boolean', description: 'Return every check, not only the ones that failed' },
+      },
+      required: ['expect'],
     },
   },
   {
