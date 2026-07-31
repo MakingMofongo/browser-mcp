@@ -390,6 +390,7 @@ mcpServer.setRequestHandler(CallToolRequestSchema, async (request) => {
       browser_save: 'save',
       browser_record: 'record',
       browser_replay: 'replay',
+      browser_runs: 'runs',
       browser_extract: 'extract',
       browser_wait_idle: 'wait_idle',
       browser_network_log: 'network_log',

@@ -112,12 +112,24 @@ export const TOOLS = [
       properties: {
         name: { type: 'string', description: 'Flow name from browser_record' },
         row: { type: 'object', description: 'Values for this run, keyed by field name, for example {"Email":"a@b.com"}' },
-        rows: { type: 'array', items: { type: 'object' }, description: 'Run the flow once per row in a single call, up to 500. Returns which rows completed and which diverged.' },
-        on_error: { type: 'string', enum: ['stop', 'continue'], description: 'With rows: stop leaves the remaining rows untouched (default); continue works through them and collects the failures.' },
+        rows: { type: 'array', items: { type: 'object' }, description: 'Run the flow once per row in a single call, up to 500. A divergence is classified: a transient one is retried once, a row the page rejects is skipped, and a structural mismatch pauses the run with the remaining rows kept for resume.' },
+        resume: { type: 'string', description: 'Run id from a paused run; continues with the rows still pending.' },
         start_url: { type: 'boolean', description: 'Navigate to the recorded starting URL first (default: true)' },
         verbose: { type: 'boolean', description: 'Include per-step results' },
       },
       required: ['name'],
+    },
+  },
+  {
+    name: 'browser_runs',
+    description: 'Inspect multi-row replay runs. Without arguments it lists runs with their counts by status. Pass id for the per-row ledger, including which rows completed, which were skipped and why, any confirmation reference scraped from the success page, and whether a failed row may have submitted something. The ledger is written to storage as the run proceeds, so it survives a browser restart.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: { type: 'string', description: 'Run id to inspect' },
+        status: { type: 'string', enum: ['pending', 'done', 'skipped', 'failed'], description: 'Only rows with this status' },
+        delete: { type: 'string', description: 'Run id to remove' },
+      },
     },
   },
   {
