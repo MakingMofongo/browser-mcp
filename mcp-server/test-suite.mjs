@@ -312,6 +312,35 @@ async function suite() {
     await new Promise(r => setTimeout(r, 1500));
   });
 
+  // What the server was told. A click that deletes the wrong row, or submits when
+  // it meant to save a draft, looks identical on the page to one that did the
+  // right thing — the request is the only account of it the page cannot
+  // contradict. Reported rather than judged, because pages autosave and search as
+  // you type constantly, and treating that as a fault would halt a run on
+  // ordinary behaviour.
+  await group('actions report what they sent', async () => {
+    await send('navigate', { url: `${BASE}/login` });
+    await setup(`document.body.insertAdjacentHTML('beforeend','<button id=del>Delete</button><button id=inert>Nothing</button>');
+      document.getElementById('del').addEventListener('click',()=>{fetch('/api/records/8823/delete',{method:'DELETE'}).catch(()=>{})}); 1`);
+    const deleted = await send('click', { selector: '#del' });
+    check('a click that commits something says what it sent',
+      /DELETE \/api\/records\/8823\/delete/.test(JSON.stringify(deleted.sent || [])), JSON.stringify(deleted.sent));
+    const inert = await send('click', { selector: '#inert' });
+    check('a click that sends nothing reports nothing sent', !inert.sent, JSON.stringify(inert.sent));
+
+    // A form posting normally never goes through fetch or XHR, and is the most
+    // consequential request a page makes.
+    await send('navigate', { url: `${BASE}/login` });
+    await send('fill', { selector: '#username', value: 'tomsmith' });
+    await send('fill', { selector: '#password', value: 'SuperSecretPassword!' });
+    const posted = await send('submit', { expect_text: 'Secure Area', timeout: 9000 });
+    check('a submit reports the request the form made',
+      /POST/.test(JSON.stringify(posted.sent || [])) && /authenticate/.test(JSON.stringify(posted.sent || [])),
+      JSON.stringify(posted.sent));
+    check('what was sent carries no request body or credential',
+      !JSON.stringify(posted.sent || []).includes('SuperSecretPassword'), JSON.stringify(posted.sent));
+  });
+
   // The failure half of the contract. Every tool caught reporting success while
   // doing nothing was caught by looking at what came back; these check the shape
   // that answer has to have when the work genuinely cannot be done — ok:false and
@@ -388,8 +417,14 @@ async function suite() {
     const frames = await send('list_frames', {});
     check('list_frames lists the main frame', Array.isArray(frames.frames) && frames.frames.length >= 1, String(frames.frames?.length));
 
+    // get_new_tab exists to catch a tab that appeared — an OAuth popup, a target
+    // _blank. Asking before one has is meant to find nothing, so open one first
+    // rather than asserting on whatever happened to be lying around.
+    const before = await send('get_new_tab', {});
+    check('get_new_tab finds nothing when no new tab has appeared', !before.id, JSON.stringify(before));
+    await send('navigate', { url: `${BASE}/dropdown`, new_tab: true });
     const nt = await send('get_new_tab', {});
-    check('get_new_tab returns a tab in this session', nt.ok === true && !!nt.id, JSON.stringify({ id: nt.id, m: nt.matched }));
+    check('get_new_tab returns the tab that just appeared', nt.ok === true && !!nt.id, JSON.stringify({ id: nt.id, m: nt.matched }));
     const sw = await send('switch_tab', { tab_id: nt.id });
     check('switch_tab makes that tab current', sw.id === nt.id, String(sw.id));
 
