@@ -387,6 +387,7 @@ mcpServer.setRequestHandler(CallToolRequestSchema, async (request) => {
       browser_health: 'health',
       browser_form_state: 'form_state',
       browser_submit: 'submit',
+      browser_save: 'save',
       browser_record: 'record',
       browser_replay: 'replay',
       browser_extract: 'extract',
@@ -431,8 +432,47 @@ mcpServer.setRequestHandler(CallToolRequestSchema, async (request) => {
                     method === 'batch' ? 180000 :
                     method === 'extract' ? 120000 :
                     method === 'replay' ? 300000 :
+                    method === 'save' ? 90000 :
                     method === 'submit' ? (args?.timeout || 15000) + 20000 : 30000;
     const result = await sendToExtension(method, args || {}, timeout);
+
+    // browser_save returns raw bytes; write them to disk and hand back the path.
+    // Base64 in the transcript would be unreadable and enormous.
+    if (method === 'save' && result?.data) {
+      const targetPath = resolve(process.cwd(), args?.path || `download-${Date.now()}.${result.content_type?.includes('pdf') ? 'pdf' : 'bin'}`);
+      mkdirSync(dirname(targetPath), { recursive: true });
+      writeFileSync(targetPath, Buffer.from(result.data, 'base64'));
+      const { data, ...rest } = result;
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({ ...rest, saved_to: targetPath, bytes: Buffer.from(result.data, 'base64').length }, null, 2),
+        }],
+      };
+    }
+
+    // A save nested inside a batch returns bytes too. Write them out the same way,
+    // otherwise the base64 lands in the transcript — which is exactly what the
+    // top-level handling above exists to prevent.
+    if (method === 'batch' && Array.isArray(result?.results)) {
+      result.results.forEach((r, i) => {
+        const payload = r?.result;
+        if (!payload?.data) return;
+        const declared = args?.actions?.[i]?.params?.path || args?.actions?.[i]?.input?.path;
+        try {
+          const targetPath = resolve(process.cwd(), declared || `download-${Date.now()}-${i}.${payload.content_type?.includes('pdf') ? 'pdf' : 'bin'}`);
+          mkdirSync(dirname(targetPath), { recursive: true });
+          const buf = Buffer.from(payload.data, 'base64');
+          writeFileSync(targetPath, buf);
+          delete payload.data;
+          payload.saved_to = targetPath;
+          payload.bytes = buf.length;
+        } catch (e) {
+          delete payload.data;
+          payload.save_error = String(e.message || e);
+        }
+      });
+    }
 
     // Batch: hoist any screenshots taken inside the batch into proper image blocks
     // (base64 in JSON text would blow up the context and render as garbage).

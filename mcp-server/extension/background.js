@@ -3688,6 +3688,61 @@ async function dispatchCore(port, method, params) {
       };
     }
 
+    case 'save': {
+      // Two ways a page holds something worth keeping: it IS the artefact (a
+      // submitted application, a confirmation receipt), or it links to one behind
+      // the session's cookies (an export endpoint, an in-tab PDF). Printing and
+      // credentialed fetching cover both, and the bytes come back for the caller
+      // to write somewhere it can actually read them.
+      const mode = params.mode || (params.url ? 'url' : 'pdf');
+      const tab = await getSessionTab(port, true);
+
+      if (mode === 'url') {
+        if (!params.url) return { ok: false, error: 'url required for mode:"url"' };
+        try {
+          // Runs in the extension background, so the request carries the user's
+          // cookies and is not subject to the page's CORS rules.
+          const res = await fetch(params.url, { credentials: 'include' });
+          const buf = await res.arrayBuffer();
+          const bytes = new Uint8Array(buf);
+          let bin = '';
+          for (let i = 0; i < bytes.length; i += 0x8000) {
+            bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+          }
+          return {
+            ok: res.ok, status: res.status,
+            content_type: res.headers.get('content-type') || null,
+            bytes: bytes.length,
+            data: btoa(bin),
+            source_url: params.url,
+          };
+        } catch (e) {
+          return { ok: false, error: `Fetch failed: ${e?.message || e}` };
+        }
+      }
+
+      if (tab.url.startsWith('chrome://')) throw new Error('Cannot print chrome:// pages');
+      try {
+        await debuggerAttach(tab.id);
+        await cdpSend(tab.id, 'Page.enable', {});
+        const r = await cdpSend(tab.id, 'Page.printToPDF', {
+          printBackground: params.background !== false,
+          landscape: !!params.landscape,
+          scale: Math.min(2, Math.max(0.1, params.scale || 1)),
+          preferCSSPageSize: true,
+          ...(params.paper === 'a4' ? { paperWidth: 8.27, paperHeight: 11.69 } : {}),
+        });
+        if (!r?.data) return { ok: false, error: 'Chrome returned no PDF data for this page.' };
+        return { ok: true, data: r.data, content_type: 'application/pdf', bytes: Math.round(r.data.length * 0.75), source_url: tab.url, title: tab.title };
+      } catch (e) {
+        return {
+          ok: false,
+          error: `Print failed: ${e?.message || e}`,
+          hint: 'If the tab is displaying a PDF rather than a web page, pass its URL with mode:"url" to download the original file instead.',
+        };
+      }
+    }
+
     case 'record': {
       const action = params.action || 'start';
       const store = await chrome.storage.local.get({ bmcpFlows: {} });

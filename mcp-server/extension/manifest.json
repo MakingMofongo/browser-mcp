@@ -42,7 +42,7 @@
     "128": "icons/icon-128.png"
   },
   "content_security_policy": {
-    "extension_pages": "script-src 'self'; object-src 'self'; connect-src 'self' ws://127.0.0.1:* http://127.0.0.1:*"
+    "extension_pages": "script-src 'self'; object-src 'self'; connect-src 'self' https: http: ws://127.0.0.1:* http://127.0.0.1:*"
   },
   "background": {
     "service_worker": "background.js"

@@ -76,6 +76,23 @@ export const TOOLS = [
     },
   },
   {
+    name: 'browser_save',
+    description: 'Save something the browser can see to a file on disk. With mode "pdf" it prints the current page, which is how to keep a confirmation or receipt that only exists as a rendered page. With mode "url" it downloads a URL using the session cookies, which reaches export endpoints and in-tab PDFs that a plain request would be denied. Returns the path written, so the file can then be read normally.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Where to write the file' },
+        mode: { type: 'string', enum: ['pdf', 'url'], description: 'pdf prints the current page; url downloads the given address (default: pdf, or url when one is given)' },
+        url: { type: 'string', description: 'Address to download for mode "url"' },
+        landscape: { type: 'boolean', description: 'Print in landscape' },
+        background: { type: 'boolean', description: 'Include background graphics when printing (default: true)' },
+        scale: { type: 'number', description: 'Print scale between 0.1 and 2 (default: 1)' },
+        paper: { type: 'string', enum: ['a4'], description: "Force A4 instead of the page own size" },
+      },
+      required: ['path'],
+    },
+  },
+  {
     name: 'browser_record',
     description: 'Record a flow so it can be replayed later. Start recording, run the flow once, then stop to save it. Only page-changing actions are recorded, and each target is stored by a durable identity rather than a reference ID so it survives a fresh page load. Also lists, shows and deletes saved flows.',
     inputSchema: {
