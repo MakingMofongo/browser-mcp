@@ -234,6 +234,22 @@ async function suite() {
       amb.ok === true && amb.selected === 'Option 2', amb.selected || amb.error);
   });
 
+  await group('navigate tells the truth about landing', async () => {
+    const dead = await send('navigate', { url: 'https://this-host-does-not-exist-bmcp-test.invalid/page' });
+    check('a page that did not load is reported as not loaded',
+      dead.ok === false && /ERR_NAME_NOT_RESOLVED/.test(dead.chrome_error || ''), dead.chrome_error || dead.url);
+    const good = await send('navigate', { url: `${BASE}/login` });
+    check('an ordinary navigation still reports where it landed',
+      good.ok === true && /\/login$/.test(good.url || ''), good.url);
+    // Following a redirect must report where the tab ended up, not the address
+    // that was asked for — that difference is how a sign-in wall shows itself.
+    const moved = await send('navigate', { url: `${BASE}/redirect` });
+    const reallyAt = await send('execute_script', { code: 'location.pathname' });
+    check('a redirect reports the address landed on, not the one requested',
+      moved.ok === true && moved.url.includes(reallyAt.result) && !moved.url.endsWith('/redirector'),
+      JSON.stringify({ reported: moved.url, actual: reallyAt.result }));
+  });
+
   await group('press_key actually presses', async () => {
     await send('navigate', { url: `${BASE}/login` });
     await send('execute_script', { code: "document.querySelector('#username').focus(); 1" });
