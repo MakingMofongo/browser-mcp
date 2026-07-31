@@ -26,5 +26,25 @@
     return (health.unanswered || 0) >= UNANSWERED_LIMIT;
   }
 
-  root.bmcpHeartbeatPolicy = { shouldDrop, UNANSWERED_LIMIT };
+  // The other destructive decision, kept beside this one for the same reason.
+  // Replacing the offscreen document closes every session's connection at once, so
+  // a watchdog that misjudges takes the bridge down far more reliably than the
+  // wedge it is watching for. Its first version condemned on a single unanswered
+  // ping, using a counter held in a variable — which a service worker loses on
+  // eviction, so the count reset almost every tick and the caution was decorative.
+  const MISS_LIMIT = 2;
+
+  /**
+   * @param {{answered: boolean, misses: number}} state  misses = consecutive
+   *        unanswered checks BEFORE this one.
+   * @returns {{replace: boolean, misses: number}} misses to persist.
+   */
+  function offscreenVerdict(state) {
+    if (state.answered) return { replace: false, misses: 0 };
+    const misses = (state.misses || 0) + 1;
+    if (misses < MISS_LIMIT) return { replace: false, misses };
+    return { replace: true, misses: 0 };
+  }
+
+  root.bmcpHeartbeatPolicy = { shouldDrop, UNANSWERED_LIMIT, offscreenVerdict, MISS_LIMIT };
 })(typeof self !== 'undefined' ? self : globalThis);

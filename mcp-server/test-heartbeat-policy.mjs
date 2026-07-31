@@ -14,7 +14,7 @@ import { runInNewContext } from 'vm';
 const src = readFileSync(new URL('../extension/heartbeat-policy.js', import.meta.url), 'utf8');
 const sandbox = { self: {} };
 runInNewContext(src, sandbox);
-const { shouldDrop, UNANSWERED_LIMIT } = sandbox.self.bmcpHeartbeatPolicy;
+const { shouldDrop, UNANSWERED_LIMIT, offscreenVerdict, MISS_LIMIT } = sandbox.self.bmcpHeartbeatPolicy;
 
 const results = [];
 const check = (name, pass, detail = '') => {
@@ -61,6 +61,44 @@ check('a healthy connection survives however far the timer is throttled',
 health = { everPonged: true, unanswered: UNANSWERED_LIMIT };
 check('a connection that stops answering is dropped whatever the timing',
   shouldDrop(health) === true);
+
+// ── replacing the offscreen document ────────────────────────────────────────
+// Same shape of decision, same asymmetry: a false positive drops every session at
+// once, so it wants more than one missed reply. The count is passed in and handed
+// back rather than held here, because the service worker that owns it is evicted
+// between checks — a count kept in a variable resets almost every tick, which is
+// how the first version of this managed to look careful and never fire.
+check('an answer clears the count and changes nothing',
+  JSON.stringify(offscreenVerdict({ answered: true, misses: 1 })) === JSON.stringify({ replace: false, misses: 0 }));
+
+check('one missed reply is remembered, not acted on',
+  JSON.stringify(offscreenVerdict({ answered: false, misses: 0 })) === JSON.stringify({ replace: false, misses: 1 }));
+
+check('the second consecutive miss replaces the document',
+  offscreenVerdict({ answered: false, misses: MISS_LIMIT - 1 }).replace === true);
+
+check('replacing resets the count so it starts clean',
+  offscreenVerdict({ answered: false, misses: MISS_LIMIT - 1 }).misses === 0);
+
+// The eviction case, replayed: a miss, then the worker is evicted and the count
+// comes back from storage rather than from memory. Losing it here is what made
+// the original never reach its own threshold.
+let carried = 0;
+carried = offscreenVerdict({ answered: false, misses: carried }).misses;   // miss, worker dies
+const afterEviction = offscreenVerdict({ answered: false, misses: carried }); // reloaded, misses again
+check('a count that survives eviction reaches the threshold',
+  afterEviction.replace === true, 'miss, evicted, miss');
+
+// And a document that answers between misses is never condemned on a total.
+let n = 0;
+let everReplaced = false;
+for (const answered of [false, true, false, true, false, true]) {
+  const v = offscreenVerdict({ answered, misses: n });
+  if (v.replace) everReplaced = true;
+  n = v.misses;
+}
+check('misses that are not consecutive never add up to a replacement',
+  everReplaced === false, 'alternating miss/answer');
 
 const passed = results.filter(Boolean).length;
 console.log(`\n${passed}/${results.length} passed`);

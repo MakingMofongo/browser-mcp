@@ -1,3 +1,9 @@
+// The two decisions that destroy something when they are wrong — abandoning a
+// connection, and replacing the offscreen document — live in one file with no
+// chrome APIs in them, so they can be tested without a browser. Both have already
+// shipped a fault that would have been worse than what they were fixing.
+importScripts('heartbeat-policy.js');
+
 /**
  * Agent360 Browser MCP — Background Service Worker
  *
@@ -1723,19 +1729,17 @@ async function ensureOffscreen() {
     new Promise((r) => setTimeout(() => r(false), 2000)),
   ]);
 
-  // Two strikes, because the costs are not symmetric. Replacing the document
-  // drops every session's connection at once, so being wrong once a minute would
-  // be worse than the wedge this is here to clear — and a single missed reply
-  // proves very little, since it only takes the worker being busy at the wrong
-  // moment. A document that is genuinely gone misses every one of them.
-  if (alive) { await setMisses(0); return; }
-  const misses = (await getMisses()) + 1;
-  if (misses < 2) {
-    await setMisses(misses);
-    console.warn('[bmcp] offscreen document did not answer; checking again before replacing it');
+  // Two strikes, because the costs are not symmetric: replacing the document drops
+  // every session's connection at once, and a single missed reply proves very
+  // little — it only takes the worker being busy at the wrong moment. The rule
+  // itself is in heartbeat-policy.js so it can be tested; this part only carries
+  // the count, which has to survive the worker being evicted between checks.
+  const verdict = self.bmcpHeartbeatPolicy.offscreenVerdict({ answered: alive, misses: await getMisses() });
+  await setMisses(verdict.misses);
+  if (!verdict.replace) {
+    if (!alive) console.warn('[bmcp] offscreen document did not answer; checking again before replacing it');
     return;
   }
-  await setMisses(0);
   {
     try { await chrome.offscreen.closeDocument(); } catch {}
     try {
