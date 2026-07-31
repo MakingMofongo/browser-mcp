@@ -118,8 +118,23 @@ try {
     closedByServer, closedByServer ? '' : 'still connected well past the silence limit');
 
   // And the extension can come straight back, which is what makes it self-healing.
-  const again = await connect().then(() => true).catch(() => false);
-  check('the port accepts a fresh connection immediately afterwards', again);
+  const again = await connect();
+  check('the port accepts a fresh connection immediately afterwards', !!again);
+
+  // A terminated socket keeps delivering whatever was already queued. If that
+  // counted as a sign of life the server would put it back in its list and could
+  // route commands into the connection it had just given up on — the repair
+  // undoing itself. The fresh connection above must stay the one in use.
+  try { ws.send(JSON.stringify({ type: 'pong' })); } catch {}
+  try { ws.send(JSON.stringify({ type: 'hello', instance: { id: 'zombie', label: 'Zombie' } })); } catch {}
+  await new Promise((r) => setTimeout(r, 800));
+  const answered = await new Promise((resolve) => {
+    again.on('message', (d) => { if (JSON.parse(d.toString()).type === 'pong') resolve(true); });
+    again.send(JSON.stringify({ type: 'ping' }));
+    setTimeout(() => resolve(false), 3000);
+  });
+  check('a dead socket talking afterwards does not come back into use', answered,
+    answered ? '' : 'the live connection stopped being served');
 } catch (e) {
   check('bridge test', false, e.message);
 } finally {

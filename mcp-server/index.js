@@ -133,10 +133,14 @@ const HEARTBEAT_MS = Number(process.env.BMCP_HEARTBEAT_MS) || 15000;
 // How many pings may go unanswered before a connection is treated as gone.
 const UNANSWERED_LIMIT = Number(process.env.BMCP_UNANSWERED_LIMIT) || 3;
 
+// Never adds a connection back. It used to insert an entry for whatever socket it
+// was handed, which meant a message arriving on one that had just been terminated
+// put it straight back into the map — where pickFailover could choose it and start
+// sending commands into the connection that had only just been given up on. A
+// socket keeps delivering what was already queued after terminate(), so this was
+// not a rare ordering: it was the normal one.
 function connHealth(ws) {
-  let h = extConnections.get(ws);
-  if (!h) { h = {}; extConnections.set(ws, h); }
-  return h;
+  return extConnections.get(ws) || null;
 }
 
 // Counts unanswered pings rather than measuring elapsed time, matching the
@@ -193,9 +197,16 @@ function createWSS(port = BASE_PORT) {
       let msg;
       try { msg = JSON.parse(data.toString()); } catch { return; }
 
+      // A socket that has already been given up on is finished, whatever it
+      // delivers afterwards. terminate() does not stop what was queued from
+      // arriving, and treating that as a sign of life is how a connection comes
+      // back from the dead.
+      const health = connHealth(ws);
+      if (!health) return;
+
       // Anything arriving is proof this socket carries data, which is the only
       // evidence that counts for keeping it.
-      connHealth(ws).unanswered = 0;
+      health.unanswered = 0;
 
       if (msg.type === 'ping') {
         try { ws.send(JSON.stringify({ type: 'pong' })); } catch {}
@@ -204,9 +215,7 @@ function createWSS(port = BASE_PORT) {
       // A pong additionally proves the far end speaks the heartbeat, which is what
       // makes it fair to hang up on this connection later for going silent.
       if (msg.type === 'pong') {
-        const h = connHealth(ws);
-        h.everPonged = true;
-        h.unanswered = 0;
+        health.everPonged = true;
         return;
       }
 
@@ -277,7 +286,7 @@ function createWSS(port = BASE_PORT) {
       try {
         ws.send(JSON.stringify({ type: 'ping' }));
         const h = connHealth(ws);
-        h.unanswered = (h.unanswered || 0) + 1;
+        if (h) h.unanswered = (h.unanswered || 0) + 1;
       } catch {}
     }
     if (Date.now() - lastActivity > 4 * 60 * 60 * 1000) {
