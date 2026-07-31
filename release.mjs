@@ -109,9 +109,16 @@ if (!skipLive && !dryRun && !process.env.BMCP_BROWSER_IS_FREE) {
 if (skipLive || dryRun) {
   // Allowed, but never silently: the live suite is what has caught every
   // behavioural regression so far, and a release that skipped it should say so.
-  console.log(`  live suite … SKIPPED (${dryRun ? "--dry-run" : "--no-live"})`);
-  console.log('  note: the behavioural checks did not run for this build.');
+  // Names both, because two checks are being skipped and saying one of them
+  // understates what has not been verified.
+  console.log(`  no stalls, live suite … SKIPPED (${dryRun ? "--dry-run" : "--no-live"})`);
+  console.log('  note: neither the timing nor the behavioural checks ran for this build.');
 } else {
+  // Timing before behaviour, because it is quicker and because a stall makes the
+  // suite slow rather than red — clicks that each took 5.4 seconds shipped for
+  // weeks with every behavioural test passing, since waiting is not failing. This
+  // is the only check that would have caught that, and it was not gating anything.
+  gate('no stalls', 'node bench.mjs', join(ROOT, 'mcp-server'));
   gate('live suite (needs Chrome with the extension loaded)', 'node test-suite.mjs', join(ROOT, 'mcp-server'));
 }
 
