@@ -1693,6 +1693,14 @@ async function resolveElement(tabId, selectorStr) {
 
 // ── Offscreen Document Setup ───────────────────────────────────────────────
 
+// Consecutive unanswered pings, kept in session storage rather than a variable.
+// The service worker is evicted between alarms, so an in-memory count would reset
+// to zero almost every tick and never reach the threshold — the check would look
+// careful and never actually fire.
+const MISS_KEY = 'bmcp_offscreen_misses';
+const getMisses = async () => (await chrome.storage.session.get(MISS_KEY))[MISS_KEY] || 0;
+const setMisses = (n) => chrome.storage.session.set({ [MISS_KEY]: n });
+
 async function ensureOffscreen() {
   const existing = await chrome.offscreen.hasDocument();
   if (!existing) {
@@ -1714,7 +1722,21 @@ async function ensureOffscreen() {
     chrome.runtime.sendMessage({ type: 'bmcp_offscreen_ping' }).then((r) => r?.alive === true).catch(() => false),
     new Promise((r) => setTimeout(() => r(false), 2000)),
   ]);
-  if (!alive) {
+
+  // Two strikes, because the costs are not symmetric. Replacing the document
+  // drops every session's connection at once, so being wrong once a minute would
+  // be worse than the wedge this is here to clear — and a single missed reply
+  // proves very little, since it only takes the worker being busy at the wrong
+  // moment. A document that is genuinely gone misses every one of them.
+  if (alive) { await setMisses(0); return; }
+  const misses = (await getMisses()) + 1;
+  if (misses < 2) {
+    await setMisses(misses);
+    console.warn('[bmcp] offscreen document did not answer; checking again before replacing it');
+    return;
+  }
+  await setMisses(0);
+  {
     try { await chrome.offscreen.closeDocument(); } catch {}
     try {
       await chrome.offscreen.createDocument({
