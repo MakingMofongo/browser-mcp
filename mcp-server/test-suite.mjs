@@ -235,6 +235,43 @@ async function suite() {
       amb.ok === true && amb.selected === 'Option 2', amb.selected || amb.error);
   });
 
+  // The failure half of the contract. Every tool caught reporting success while
+  // doing nothing was caught by looking at what came back; these check the shape
+  // that answer has to have when the work genuinely cannot be done — ok:false and
+  // a sentence worth acting on, rather than a code, a bare false, or a throw.
+  await group('failures say what went wrong', async () => {
+    await send('navigate', { url: `${BASE}/login` });
+    const gone = '#bmcp-definitely-not-on-this-page';
+    const cases = [
+      ['click', { selector: gone }],
+      ['fill', { selector: gone, value: 'x' }],
+      ['double_click', { selector: gone }],
+      ['select_option', { selector: '#username', option: 'nope' }],
+      ['set_date', { selector: '#username', date: 'not-a-date' }],
+      ['upload_file', { selector: gone, files: ['C:/Projects/browser-mcp/package.json'] }],
+      ['scroll', { selector: gone }],
+      ['wait', { selector: gone, timeout: 1200 }],
+      ['extract', { selector: gone }],
+      ['clipboard', { action: 'copy', selector: gone }],
+      ['select_frame', { frame_index: 99, code: '1' }],
+      ['replay', { name: '__does_not_exist__' }],
+    ];
+    const bad = [];
+    for (const [method, params] of cases) {
+      try {
+        const r = await send(method, params);
+        const failed = r?.ok === false || r?.found === false || !!r?.error;
+        const msg = String(r?.error || r?.hint || '');
+        if (!failed) bad.push(`${method} claimed success`);
+        else if (msg.length < 15) bad.push(`${method} failed with nothing useful: ${JSON.stringify(r).slice(0, 60)}`);
+      } catch (e) {
+        if (/Cannot read|not a function|undefined/.test(String(e.message))) bad.push(`${method} threw a raw internal error: ${e.message}`);
+      }
+    }
+    check('every tool given impossible input fails with something to act on',
+      bad.length === 0, bad.join(' | '));
+  });
+
   // Tools nothing else exercises. Both of the worst bugs found so far — scroll
   // hanging on every page, upload_file throwing before it attached anything —
   // survived because no assertion ever ran them. Thin coverage that calls a tool

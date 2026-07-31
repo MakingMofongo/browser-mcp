@@ -434,8 +434,18 @@ mcpServer.setRequestHandler(CallToolRequestSchema, async (request) => {
     // Base64 in the transcript would be unreadable and enormous.
     if (method === 'save' && result?.data) {
       const targetPath = resolve(process.cwd(), args?.path || `download-${Date.now()}.${result.content_type?.includes('pdf') ? 'pdf' : 'bin'}`);
-      mkdirSync(dirname(targetPath), { recursive: true });
-      writeFileSync(targetPath, Buffer.from(result.data, 'base64'));
+      try {
+        mkdirSync(dirname(targetPath), { recursive: true });
+        writeFileSync(targetPath, Buffer.from(result.data, 'base64'));
+      } catch (e) {
+        // Worth separating from a capture failure: the page was rendered and the
+        // bytes exist, so the fix is a different path rather than another attempt
+        // at the same page.
+        return {
+          content: [{ type: 'text', text: `The page was captured but could not be written to ${targetPath}: ${e.message}. Try a path that exists and is writable — the capture itself worked, so nothing needs re-rendering.` }],
+          isError: true,
+        };
+      }
       const { data, ...rest } = result;
       return {
         content: [{
