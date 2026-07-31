@@ -5,6 +5,9 @@
  * Run: node test-wiring.mjs
  */
 import { readFileSync } from 'fs';
+import { join } from 'path';
+import { homedir } from 'os';
+import { pathToFileURL } from 'url';
 import { TOOLS } from './tools.js';
 
 const indexSrc = readFileSync(new URL('./index.js', import.meta.url), 'utf8');
@@ -67,6 +70,39 @@ if (bgCopy !== bgSrc) fail('mcp-server/extension/background.js out of sync with 
 // Anything genuinely unreachable from a headless run belongs below WITH a reason.
 // An entry here is a claim that the tool cannot be tested, not that testing it was
 // inconvenient, and it is the first place to look when one of these breaks.
+// 6a. Every file the extension loads at startup must exist, in every copy of it.
+//
+// background.js calls importScripts, and offscreen.html loads scripts by name. A
+// missing one there is not a degraded feature — the service worker fails to start
+// and the extension is dead, which is the worst outcome available and would be
+// found by a person whose browser had stopped working rather than by a test.
+// There are three copies of the extension and they are kept in step by hand, so
+// this checks all of them.
+{
+  const extDirs = [
+    ['extension/', new URL('../extension/', import.meta.url)],
+    ['mcp-server/extension/', new URL('./extension/', import.meta.url)],
+    [join(homedir(), '.browser-mcp/extension/'), pathToFileURL(join(homedir(), '.browser-mcp', 'extension') + '/')],
+  ];
+  const needed = new Set();
+  for (const m of bgSrc.matchAll(/importScripts\(\s*['"]([^'"]+)['"]/g)) needed.add(m[1]);
+  for (const page of ['offscreen.html', 'popup.html']) {
+    try {
+      const html = readFileSync(new URL('../extension/' + page, import.meta.url), 'utf8');
+      for (const m of html.matchAll(/<script[^>]+src=["']([^"']+)["']/g)) {
+        if (!/^https?:/.test(m[1])) needed.add(m[1]);
+      }
+    } catch { /* page is optional */ }
+  }
+  if (!needed.size) fail('no startup scripts found to check — the wiring check has stopped looking at anything');
+  for (const [label, dir] of extDirs) {
+    for (const rel of needed) {
+      try { readFileSync(new URL(rel, dir)); }
+      catch { fail(`${label}${rel} is loaded at startup but missing — the extension would not start`); }
+    }
+  }
+}
+
 // 6b. Replayed steps must go through the same path a caller's action does.
 //
 // Three separate checks were built on top of dispatch and were dead during replay
