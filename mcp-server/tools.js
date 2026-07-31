@@ -634,16 +634,11 @@ export const TOOLS = [
 
   {
     name: 'browser_solve_captcha',
-    description: 'Detect and attempt to solve CAPTCHAs on the page. Recognises reCAPTCHA v2 and v3, hCaptcha, Cloudflare Turnstile and FunCaptcha. Can click the reCAPTCHA checkbox, click specific grid cells for image challenges, or hand the challenge to the user.',
+    description: 'Detect CAPTCHAs on the page and report the type and whether a challenge is currently visible. Recognises reCAPTCHA v2 and v3, hCaptcha, Cloudflare Turnstile and FunCaptcha. Solving is not supported: when one is blocking the flow, tell the user and let them complete it in the browser.',
     inputSchema: {
       type: 'object',
       properties: {
-        action: { type: 'string', enum: ['detect', 'click_checkbox', 'click_grid', 'ask_human'], description: 'Action to take. "detect" scans for CAPTCHAs. "click_checkbox" clicks the reCAPTCHA checkbox. "click_grid" clicks specific grid cells (pass cells param). "ask_human" shows overlay to user. Default: "detect"' },
-        cells: {
-          type: 'array',
-          items: { type: 'number' },
-          description: 'Grid cell indices to click (0-indexed, left-to-right, top-to-bottom) for image challenges. E.g. [2, 5, 7] to click cells 3, 6, 8.',
-        },
+        action: { type: 'string', enum: ['detect'], description: 'Only detect is supported (default)' },
       },
     },
   },

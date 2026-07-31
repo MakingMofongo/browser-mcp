@@ -818,7 +818,31 @@ function bmcpFillOp(op, selOrExpected, TAG, extra) {
   const resolve = (sel) => {
     if (!sel) return null;
     const rm = /^ref[_=](\d+)$/.exec(sel);
-    if (rm) { const e = window.__bmcpRefEls && window.__bmcpRefEls['ref_' + rm[1]]; return (e && e.isConnected) ? e : null; }
+    if (rm) {
+      const key = 'ref_' + rm[1];
+      let e = window.__bmcpRefEls && window.__bmcpRefEls[key];
+      if (e && e.isConnected) return e;
+      // Re-identify a node the framework replaced, rather than failing the fill.
+      const meta = (window.__bmcpRefMeta || {})[key];
+      if (!meta) return null;
+      const nm = (x) => {
+        const a = x.getAttribute && x.getAttribute('aria-label');
+        if (a) return a.trim();
+        if (x.labels && x.labels[0]) return x.labels[0].textContent.trim().replace(/\s+/g, ' ');
+        if (x.placeholder) return x.placeholder.trim();
+        const t = (x.textContent || '').trim().replace(/\s+/g, ' ');
+        return t ? t.slice(0, 80) : (x.name || x.id || '');
+      };
+      const cands = walkAll(document, []).filter(x =>
+        x.tagName === meta.tag &&
+        (meta.type ? (x.type || '').toLowerCase() === meta.type : true) &&
+        nm(x) === meta.name);
+      if (!cands.length) return null;
+      e = cands[Math.min(meta.idx || 0, cands.length - 1)];
+      window.__bmcpRefEls[key] = e;
+      window.__bmcpRefHealed = key;
+      return e;
+    }
     const tm = /^(\w+):text\((.+)\)$/.exec(sel);
     if (tm || sel.startsWith('text=')) {
       const needle = (tm ? tm[2] : sel.slice(5)).trim();
@@ -1238,27 +1262,63 @@ function parseSelector(selector) {
 
 // Locate a ref-handle element (assigned by read_page/find) and return its center.
 // Runs as a serialized function in MAIN world — page CSP cannot block it.
+//
+// Reactive frameworks (LWC, Angular Material, React) replace subtrees on every
+// input event, so a ref captured moments earlier can point at a detached node.
+// Failing there forces a re-read between every single action. Instead each ref
+// carries a fingerprint — role, accessible name, tag and its index among
+// same-looking elements — and a stale ref is re-resolved from that. The element is
+// identified by what it IS, not by the object it happened to be.
+function bmcpResolveRef(key) {
+  const refs = window.__bmcpRefEls || {};
+  const meta = (window.__bmcpRefMeta || {})[key];
+  let el = refs[key];
+  let healed = false;
+
+  if ((!el || !el.isConnected) && meta) {
+    const nameOf = (e) => {
+      const a = e.getAttribute && e.getAttribute('aria-label');
+      if (a) return a.trim();
+      if (e.labels && e.labels[0]) return e.labels[0].textContent.trim().replace(/\s+/g, ' ');
+      if (e.placeholder) return e.placeholder.trim();
+      const t = (e.textContent || '').trim().replace(/\s+/g, ' ');
+      if (t) return t.slice(0, 80);
+      return e.name || e.id || '';
+    };
+    const all = [];
+    const walk = (root) => {
+      for (const e of root.querySelectorAll('*')) { all.push(e); if (e.shadowRoot) walk(e.shadowRoot); }
+    };
+    walk(document);
+    const sameKind = all.filter(e =>
+      e.tagName === meta.tag &&
+      (meta.type ? (e.type || '').toLowerCase() === meta.type : true) &&
+      nameOf(e) === meta.name);
+    if (sameKind.length) {
+      el = sameKind[Math.min(meta.idx || 0, sameKind.length - 1)];
+      healed = true;
+      refs[key] = el;
+    }
+  }
+
+  if (!el) return { error: meta ? 'stale-ref' : 'unknown-ref' };
+  if (!el.isConnected) return { error: 'stale-ref' };
+  el.scrollIntoView({ block: 'center', behavior: 'instant' });
+  const rect = el.getBoundingClientRect();
+  return {
+    x: rect.x + rect.width / 2, y: rect.y + rect.height / 2,
+    tag: el.tagName, text: (el.textContent || '').trim().slice(0, 80), found: true, healed,
+  };
+}
+
 async function resolveRefElement(tabId, refKey) {
   const r = await chrome.scripting.executeScript({
-    target: { tabId },
-    world: 'MAIN',
-    func: (key) => {
-      const el = window.__bmcpRefEls && window.__bmcpRefEls[key];
-      if (!el) return { error: 'unknown-ref' };
-      if (!el.isConnected) return { error: 'stale-ref' };
-      el.scrollIntoView({ block: 'center', behavior: 'instant' });
-      const rect = el.getBoundingClientRect();
-      return {
-        x: rect.x + rect.width / 2, y: rect.y + rect.height / 2,
-        tag: el.tagName, text: (el.textContent || '').trim().slice(0, 80), found: true,
-      };
-    },
-    args: [refKey],
+    target: { tabId }, world: 'MAIN', func: bmcpResolveRef, args: [refKey],
   });
   const res = r?.[0]?.result;
   if (!res || res.error) {
     throw new Error(res?.error === 'stale-ref'
-      ? `Ref ${refKey} is stale — the element left the DOM (page navigated or re-rendered). Re-run browser_read_page or browser_find to get fresh refs.`
+      ? `Ref ${refKey} no longer matches anything on the page — it was replaced and could not be re-identified by role, name or position. Re-run browser_read_page or browser_find.`
       : `Unknown ref ${refKey} on this page. Run browser_read_page or browser_find first (refs are per-page and reset on navigation).`);
   }
   return res;
@@ -4299,25 +4359,17 @@ async function dispatchCore(port, method, params) {
         return detection;
       }
 
-      // ── Auto-click reCAPTCHA checkbox ──
-      if (action === 'click_checkbox') {
-        const result = await clickRecaptchaCheckbox(tab.id);
-        // Wait for challenge or pass
-        await new Promise(r => setTimeout(r, 2500));
-        // Re-detect to see if it passed or image challenge appeared
-        const after = await detectCaptcha(tab.id);
-        return { ...result, after };
+      // Solving is deliberately not implemented: clicking through a CAPTCHA is a
+      // terms-of-service problem for the site owner and an unreliable capability.
+      // Detection is the honest part — it tells the caller to hand over to a human.
+      if (action === 'click_checkbox' || action === 'click_grid') {
+        return {
+          ok: false,
+          error: 'Solving CAPTCHAs is not supported. Tell the user a CAPTCHA is blocking the page and let them complete it in the browser, then continue.',
+          detected: await detectCaptcha(tab.id),
+        };
       }
 
-      // ── Click specific grid cells (AI vision guided) ──
-      if (action === 'click_grid') {
-        const cells = params.cells || [];
-        if (!cells.length) return { error: 'No cells specified' };
-        const result = await clickCaptchaGridCells(tab.id, cells);
-        return result;
-      }
-
-      // ── Human fallback ──
       if (action === 'ask_human') {
         return { method: 'human', instructions: 'Call browser_ask_user with message: "A CAPTCHA needs to be solved. Please solve it in the browser and click Done when finished."' };
       }
@@ -4391,6 +4443,21 @@ async function dispatchCore(port, method, params) {
             const key = 'ref_' + (++window.__bmcpRefSeq);
             try { Object.defineProperty(el, '__bmcpRef', { value: key, configurable: true }); } catch {}
             refs[key] = el;
+            // Fingerprint so the ref can be re-identified if the framework swaps the node.
+            try {
+              if (!window.__bmcpRefMeta) window.__bmcpRefMeta = {};
+              const nm = (e) => {
+                const a = e.getAttribute && e.getAttribute('aria-label');
+                if (a) return a.trim();
+                if (e.labels && e.labels[0]) return e.labels[0].textContent.trim().replace(/\s+/g, ' ');
+                if (e.placeholder) return e.placeholder.trim();
+                const t = (e.textContent || '').trim().replace(/\s+/g, ' ');
+                return t ? t.slice(0, 80) : (e.name || e.id || '');
+              };
+              const myName = nm(el);
+              const peers = [...document.querySelectorAll(el.tagName)].filter(p => nm(p) === myName);
+              window.__bmcpRefMeta[key] = { tag: el.tagName, type: (el.type || '').toLowerCase(), name: myName, idx: Math.max(0, peers.indexOf(el)) };
+            } catch {}
             return key;
           };
           const visible = (el) => {
@@ -4510,7 +4577,22 @@ async function dispatchCore(port, method, params) {
             if (el.__bmcpRef && refs[el.__bmcpRef] === el) return el.__bmcpRef;
             const k = 'ref_' + (++window.__bmcpRefSeq);
             try { Object.defineProperty(el, '__bmcpRef', { value: k, configurable: true }); } catch {}
-            refs[k] = el; return k;
+            refs[k] = el;
+            try {
+              if (!window.__bmcpRefMeta) window.__bmcpRefMeta = {};
+              const nm = (e) => {
+                const a = e.getAttribute && e.getAttribute('aria-label');
+                if (a) return a.trim();
+                if (e.labels && e.labels[0]) return e.labels[0].textContent.trim().replace(/\s+/g, ' ');
+                if (e.placeholder) return e.placeholder.trim();
+                const t = (e.textContent || '').trim().replace(/\s+/g, ' ');
+                return t ? t.slice(0, 80) : (e.name || e.id || '');
+              };
+              const myName = nm(el);
+              const peers = [...document.querySelectorAll(el.tagName)].filter(p => nm(p) === myName);
+              window.__bmcpRefMeta[k] = { tag: el.tagName, type: (el.type || '').toLowerCase(), name: myName, idx: Math.max(0, peers.indexOf(el)) };
+            } catch {}
+            return k;
           };
           const vis = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
           const label = (el) => {
@@ -4608,6 +4690,21 @@ async function dispatchCore(port, method, params) {
             const key = 'ref_' + (++window.__bmcpRefSeq);
             try { Object.defineProperty(el, '__bmcpRef', { value: key, configurable: true }); } catch {}
             refs[key] = el;
+            // Fingerprint so the ref can be re-identified if the framework swaps the node.
+            try {
+              if (!window.__bmcpRefMeta) window.__bmcpRefMeta = {};
+              const nm = (e) => {
+                const a = e.getAttribute && e.getAttribute('aria-label');
+                if (a) return a.trim();
+                if (e.labels && e.labels[0]) return e.labels[0].textContent.trim().replace(/\s+/g, ' ');
+                if (e.placeholder) return e.placeholder.trim();
+                const t = (e.textContent || '').trim().replace(/\s+/g, ' ');
+                return t ? t.slice(0, 80) : (e.name || e.id || '');
+              };
+              const myName = nm(el);
+              const peers = [...document.querySelectorAll(el.tagName)].filter(p => nm(p) === myName);
+              window.__bmcpRefMeta[key] = { tag: el.tagName, type: (el.type || '').toLowerCase(), name: myName, idx: Math.max(0, peers.indexOf(el)) };
+            } catch {}
             return key;
           };
           const accName = (el) => {
@@ -4920,117 +5017,7 @@ async function detectCaptcha(tabId) {
   }
 }
 
-async function clickRecaptchaCheckbox(tabId) {
-  try {
-    await debuggerAttach(tabId);
-    // Find the reCAPTCHA anchor iframe position
-    const { result } = await cdpSend(tabId, 'Runtime.evaluate', {
-      expression: `(() => {
-        const iframe = document.querySelector('iframe[src*="recaptcha/api2/anchor"], iframe[src*="recaptcha/enterprise/anchor"]');
-        if (!iframe) return JSON.stringify({ found: false });
-        const rect = iframe.getBoundingClientRect();
-        // Checkbox is roughly at 27,30 inside the iframe (standard reCAPTCHA layout)
-        return JSON.stringify({ found: true, x: rect.x + 27, y: rect.y + 30 });
-      })()`,
-      returnByValue: true,
-    });
-    const pos = JSON.parse(result.value);
-    if (!pos.found) {
-      await debuggerDetach(tabId);
-      return { clicked: false, reason: 'reCAPTCHA checkbox iframe not found' };
-    }
 
-    // Click the checkbox using real mouse events
-    await cdpSend(tabId, 'Input.dispatchMouseEvent', {
-      type: 'mouseMoved', x: pos.x, y: pos.y,
-    });
-    await new Promise(r => setTimeout(r, 100 + Math.random() * 200));
-    await cdpSend(tabId, 'Input.dispatchMouseEvent', {
-      type: 'mousePressed', x: pos.x, y: pos.y, button: 'left', clickCount: 1,
-    });
-    await cdpSend(tabId, 'Input.dispatchMouseEvent', {
-      type: 'mouseReleased', x: pos.x, y: pos.y, button: 'left', clickCount: 1,
-    });
-    await debuggerDetach(tabId);
-    return { clicked: true, position: pos, note: 'Checkbox clicked. Wait 2-3 seconds then re-detect to check if passed or image challenge appeared.' };
-  } catch (e) {
-    try { await debuggerDetach(tabId); } catch {}
-    return { clicked: false, error: e.message };
-  }
-}
-
-async function clickCaptchaGridCells(tabId, cells) {
-  try {
-    await debuggerAttach(tabId);
-    // Find the challenge iframe position and dimensions
-    const { result } = await cdpSend(tabId, 'Runtime.evaluate', {
-      expression: `(() => {
-        const iframe = document.querySelector('iframe[src*="recaptcha/api2/bframe"], iframe[src*="recaptcha/enterprise/bframe"]');
-        if (!iframe) return JSON.stringify({ found: false });
-        const rect = iframe.getBoundingClientRect();
-        return JSON.stringify({ found: true, x: rect.x, y: rect.y, width: rect.width, height: rect.height });
-      })()`,
-      returnByValue: true,
-    });
-    const frame = JSON.parse(result.value);
-    if (!frame.found) {
-      await debuggerDetach(tabId);
-      return { clicked: false, reason: 'Challenge iframe not found. Take a screenshot to verify CAPTCHA state.' };
-    }
-
-    // Determine grid size — reCAPTCHA uses 3x3 or 4x4 grids
-    // The image grid starts ~100px from top of iframe, and is roughly square
-    const gridTop = frame.y + 100;
-    const gridLeft = frame.x + 14;
-    const gridSize = frame.width - 28; // padding on each side
-    const cols = cells.some(c => c >= 9) ? 4 : 3;
-    const rows = cols;
-    const cellSize = gridSize / cols;
-
-    const maxCell = cols * rows - 1;
-    const validCells = cells.filter(c => c >= 0 && c <= maxCell);
-    if (!validCells.length) {
-      await debuggerDetach(tabId);
-      return { clicked: false, error: `All cell indices out of bounds. Grid is ${cols}x${rows}, valid range: 0-${maxCell}` };
-    }
-
-    const clicked = [];
-    for (const cell of validCells) {
-      const row = Math.floor(cell / cols);
-      const col = cell % cols;
-      const x = Math.round(gridLeft + col * cellSize + cellSize / 2);
-      const y = Math.round(gridTop + row * cellSize + cellSize / 2);
-
-      // Human-like click with small random offset
-      const ox = x + Math.round((Math.random() - 0.5) * cellSize * 0.3);
-      const oy = y + Math.round((Math.random() - 0.5) * cellSize * 0.3);
-
-      await cdpSend(tabId, 'Input.dispatchMouseEvent', {
-        type: 'mouseMoved', x: ox, y: oy,
-      });
-      await new Promise(r => setTimeout(r, 150 + Math.random() * 300));
-      await cdpSend(tabId, 'Input.dispatchMouseEvent', {
-        type: 'mousePressed', x: ox, y: oy, button: 'left', clickCount: 1,
-      });
-      await cdpSend(tabId, 'Input.dispatchMouseEvent', {
-        type: 'mouseReleased', x: ox, y: oy, button: 'left', clickCount: 1,
-      });
-      await new Promise(r => setTimeout(r, 200 + Math.random() * 400));
-      clicked.push({ cell, row, col, x: ox, y: oy });
-    }
-
-    await debuggerDetach(tabId);
-    return {
-      clicked: true,
-      cells: clicked,
-      grid: `${cols}x${rows}`,
-      note: 'Cells clicked. Take a screenshot to verify, then click the "Verify" / "Skip" button if needed.',
-    };
-  } catch (e) {
-    try { await debuggerDetach(tabId); } catch {}
-    return { clicked: false, error: e.message };
-  }
-}
 
 // ── Start ───────────────────────────────────────────────────────────────────
 ensureOffscreen().catch(console.error);
