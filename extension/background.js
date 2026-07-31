@@ -291,6 +291,14 @@ async function debuggerAttach(tabId) {
       }
       // "Cannot attach"/"canceled" can also be transient during navigation — retry too.
       lastMsg = e.message || String(e);
+      // A debugger session left behind by ANOTHER extension (or by our own
+      // pre-reload instance) makes Chrome answer with "Cannot access a
+      // chrome-extension:// URL of different extension" — observed right after
+      // disabling a competing automation extension. A forced detach clears the
+      // orphaned session so the next attempt can attach cleanly.
+      if (/Cannot access|different extension|Another debugger|already attached to a different/i.test(lastMsg)) {
+        try { await chrome.debugger.detach({ tabId }); } catch {}
+      }
     }
     if (attempt < 2) await new Promise(r => setTimeout(r, 250 + attempt * 250));
   }
@@ -533,30 +541,40 @@ async function debuggerClick(tabId, x, y) {
         const actionable = (el.closest && el.closest('a,button,input,select,textarea,label,summary,[role="button"],[role="link"],[role="menuitem"],[role="tab"],[role="option"],[role="checkbox"],[role="radio"],[onclick]'));
         if (actionable) el = actionable;
         const opts = { bubbles: true, cancelable: true, composed: true, view: window, clientX: ${x}, clientY: ${y} };
+        // Watch for the click actually reaching the page, so the verdict is earned
+        // rather than assumed.
+        let observed = false;
+        const spy = () => { observed = true; };
+        el.addEventListener('click', spy, true);
         try { el.dispatchEvent(new PointerEvent('pointerdown', opts)); } catch (e) {}
         el.dispatchEvent(new MouseEvent('mousedown', opts));
         try { el.dispatchEvent(new PointerEvent('pointerup', opts)); } catch (e) {}
         el.dispatchEvent(new MouseEvent('mouseup', opts));
-        el.dispatchEvent(new MouseEvent('click', opts));
+        // EXACTLY ONE activating click. Firing dispatchEvent('click') AND el.click()
+        // sends two activations: on a checkbox that toggles twice and lands back on
+        // the original value while still looking like a successful click.
         if (typeof el.click === 'function') el.click();
+        else el.dispatchEvent(new MouseEvent('click', opts));
 
-        // React fiber fallback — find and call onClick handler directly
-        const fiberKey = Object.keys(el).find(k => k.startsWith('__reactFiber') || k.startsWith('__reactInternalInstance'));
-        if (fiberKey) {
-          let fiber = el[fiberKey];
-          for (let i = 0; i < 10 && fiber; i++) {
-            if (fiber.memoizedProps?.onClick) { fiber.memoizedProps.onClick(new MouseEvent('click', {bubbles:true})); break; }
-            fiber = fiber.return;
+        // Framework fallbacks ONLY when no click event was observed — otherwise they
+        // re-fire a handler that already ran (double-submits, double-toggles).
+        if (!observed) {
+          const fiberKey = Object.keys(el).find(k => k.startsWith('__reactFiber') || k.startsWith('__reactInternalInstance'));
+          if (fiberKey) {
+            let fiber = el[fiberKey];
+            for (let i = 0; i < 10 && fiber; i++) {
+              if (fiber.memoizedProps?.onClick) { fiber.memoizedProps.onClick(new MouseEvent('click', {bubbles:true})); observed = true; break; }
+              fiber = fiber.return;
+            }
+          }
+          const ngKey = Object.keys(el).find(k => k.startsWith('__ng'));
+          if (!observed && (ngKey || el.getAttribute('ng-click') || el.getAttribute('(click)'))) {
+            const matRipple = el.closest && el.closest('[mat-button], [mat-raised-button], [mat-icon-button], [mat-fab], mat-checkbox, mat-slide-toggle, mat-radio-button');
+            if (matRipple) { matRipple.dispatchEvent(new MouseEvent('click', opts)); observed = true; }
           }
         }
-
-        // Angular Material fallback — ripple + internal handlers
-        const ngKey = Object.keys(el).find(k => k.startsWith('__ng'));
-        if (ngKey || el.getAttribute('ng-click') || el.getAttribute('(click)')) {
-          const matRipple = el.closest && el.closest('[mat-button], [mat-raised-button], [mat-icon-button], [mat-fab], mat-checkbox, mat-slide-toggle, mat-radio-button');
-          if (matRipple) matRipple.dispatchEvent(new MouseEvent('click', opts));
-        }
-        return { landed: true, path: 'synthetic-fallback' };
+        el.removeEventListener('click', spy, true);
+        return { landed: observed, path: observed ? 'synthetic-fallback' : 'no-effect' };
       })()`,
     });
     // Honest reporting: never claim success when zero events reached the page.
@@ -2228,6 +2246,13 @@ async function dispatch(port, method, params) {
 
         // Primary path: debugger mouse events (isTrusted=true, works on React/Angular SPAs)
         const verdict = await debuggerClick(tab.id, el.x, el.y);
+        if (!verdict.landed) {
+          // Neither trusted nor synthetic dispatch reached a handler — say so
+          // plainly instead of returning a success the caller would act on.
+          const r = await scriptingClick(tab.id, params.selector);
+          if (r.ok) return { ok: true, method: 'scripting-fallback', click_path: 'synthetic-fallback', verified: true, tag: r.tag };
+          return { ok: false, verified: false, click_path: verdict.path, error: 'Click dispatched but NO event reached the page. The element may be covered by an overlay, inside a cross-origin iframe, or disabled. Try browser_dismiss_overlays, a different selector, or browser_click_xy with coordinates from a screenshot.' };
+        }
         return { ok: true, method: el.method || 'debugger', tag: el.tag, text: el.text, click_path: verdict.path, verified: verdict.landed };
       } catch (e) {
         // Fallback: synthetic click via chrome.scripting for anti-automation sites
@@ -2247,9 +2272,30 @@ async function dispatch(port, method, params) {
         //
         // Prisen ved fallbacken er at klikket mister isTrusted=true. Det tjekker de færreste
         // sider, og et klik der virker på 95% af nettet slår et klik der aldrig virker.
-        if (/Debugger detached|Debugger attach failed|not attached/i.test(e?.message || '')) {
-          const r = await scriptingClick(tab.id, params.selector);
-          if (r.ok) return { ok: true, method: 'scripting-fallback', tag: r.tag };
+        // ANY debugger-channel failure now falls back — the old regex listed
+        // specific phrasings and missed real ones ("Cannot access a
+        // chrome-extension:// URL of different extension" from an orphaned
+        // session), so the fallback never fired in exactly the cases it was
+        // written for. Before re-clicking we ask the page whether the trusted
+        // click already landed, so a mid-flight failure can't double-fire.
+        let alreadyLanded = false;
+        try {
+          const [chk] = await chrome.scripting.executeScript({
+            target: { tabId: tab.id }, world: 'MAIN',
+            func: () => {
+              const v = window.__bmcpClicked === true;
+              try { delete window.__bmcpClicked; } catch {}
+              return v;
+            },
+          });
+          alreadyLanded = chk?.result === true;
+        } catch {}
+        if (alreadyLanded) {
+          return { ok: true, method: 'debugger', click_path: 'trusted', verified: true, note: 'debugger errored after the click landed' };
+        }
+        const r = await scriptingClick(tab.id, params.selector);
+        if (r.ok) {
+          return { ok: true, method: 'scripting-fallback', click_path: 'synthetic-fallback', verified: true, tag: r.tag, note: 'debugger channel unavailable: ' + (e?.message || e) };
         }
         throw e;
       }
