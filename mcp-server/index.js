@@ -353,6 +353,9 @@ mcpServer.setRequestHandler(CallToolRequestSchema, async (request) => {
       browser_read_page: 'read_page',
       browser_find: 'find',
       browser_health: 'health',
+      browser_form_state: 'form_state',
+      browser_attach_tab: 'attach_tab',
+      browser_detach_tab: 'detach_tab',
     };
 
     if (name === 'browser_about') {

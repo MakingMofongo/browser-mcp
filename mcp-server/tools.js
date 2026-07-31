@@ -39,6 +39,17 @@ export const TOOLS = [
     },
   },
   {
+    name: 'browser_form_state',
+    description: 'ONE call that returns everything you need to fill a form: every visible field with its label, type, current value, required/disabled/readonly flags, validation errors — AND, for every <select>, its actual list of options (no more scraping to find out what you can pick). Plus all buttons with enabled/disabled state, page-level error messages, and the current step/section. Fields still empty but required are flagged MISSING_REQUIRED. Every entry carries a ref usable directly with fill/click/select_option. Use this INSTEAD of hand-writing execute_script DOM scrapes on any form or application portal.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        selector: { type: 'string', description: 'Optional CSS selector to scope to one form/section (default: whole page)' },
+        max_options: { type: 'number', description: 'Max options listed per select (default: 25, cap 60)' },
+      },
+    },
+  },
+  {
     name: 'browser_find',
     description: 'Find elements by plain-language description — "login button", "search input", "link containing pricing". Scores accessible names, placeholders, roles and text; returns the top matches with ref handles usable directly as selectors ("ref_7"). Use when you know WHAT you want but not its selector. For a full page inventory use browser_read_page instead.',
     inputSchema: {
@@ -364,8 +375,37 @@ export const TOOLS = [
   },
   {
     name: 'browser_list_tabs',
-    description: 'List all open browser tabs with their URLs and titles.',
-    inputSchema: { type: 'object', properties: {} },
+    description: 'List this session\'s tabs. Pass all:true to see EVERY tab open in the browser (across all windows) with its owner ("this-session" or "user"), window_id, and whether it can be automated — use that to find a tab the user already has open (logged-in dashboards, a half-filled form) and then browser_attach_tab to take it over.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        all: { type: 'boolean', description: 'true = every tab in the browser, including the user\'s own. false/omitted = only this session\'s tabs.' },
+      },
+    },
+  },
+  {
+    name: 'browser_attach_tab',
+    description: 'Adopt an EXISTING browser tab into this session so every tool (click, fill, read_page, screenshot…) acts on it — including tabs the user opened and logged into. Get the id from browser_list_tabs({all:true}). Adopted tabs are protected: never auto-evicted, and never closed when the session ends. Pass group:false to leave the tab where it is instead of moving it into the session tab group.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tab_id: { type: 'number', description: 'Tab id from browser_list_tabs({all:true})' },
+        group: { type: 'boolean', description: 'Move the tab into this session\'s colored tab group (default: true). false keeps the user\'s tab strip untouched.' },
+      },
+      required: ['tab_id'],
+    },
+  },
+  {
+    name: 'browser_detach_tab',
+    description: 'Release a tab from this session WITHOUT closing it — hands an adopted tab back to the user. Also detaches the debugger and removes it from the session tab group.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tab_id: { type: 'number', description: 'Tab id to release' },
+        ungroup: { type: 'boolean', description: 'Remove it from the session tab group (default: true)' },
+      },
+      required: ['tab_id'],
+    },
   },
   {
     name: 'browser_get_cookies',

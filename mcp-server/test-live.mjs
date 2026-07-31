@@ -119,15 +119,21 @@ function listen(i = 0) {
     sock.on('message', async (data) => {
       let m; try { m = JSON.parse(data.toString()); } catch { return; }
       if (m.type === 'hello') {
-        // First hello may come from a stale v2 build — push one reload so the
-        // freshly synced code is what we test, then run on the reconnect hello.
-        if (!globalThis.__reloadPushed) {
+        // First hello may come from a stale build — push one reload so the freshly
+        // synced code is what we test, then run on the reconnect hello.
+        // NO_RELOAD=1 skips this (fresh installs need no reload, and reloading
+        // mid-handshake races the service worker's startup).
+        if (!globalThis.__reloadPushed && !process.env.NO_RELOAD) {
           globalThis.__reloadPushed = true;
           console.log('hello received — pushing one reload to load the freshly synced build…');
           try { sock.send(JSON.stringify({ id: ++cmdId, method: 'reload_extension', params: {} })); } catch {}
           return;
         }
+        if (hello) return; // ignore the second (upgraded) hello of the two-phase handshake
         hello = m.instance;
+        // Let the service worker finish waking before the first command; otherwise
+        // it answers "message channel closed before a response was received".
+        await new Promise(r => setTimeout(r, 2500));
         try { await suite(); } catch (e) { check('suite aborted', false, e.message); }
         const passed = results.filter(r => r.pass).length;
         console.log(`\n${passed}/${results.length} passed`);

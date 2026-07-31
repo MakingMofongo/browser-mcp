@@ -39,6 +39,10 @@ function restoreSessions() {
         sessions.set(Number(port), {
           tabIds: validTabIds,
           activeTabId,
+          // Tabs adopted from the user's own browsing (browser_attach_tab). They are
+          // never auto-evicted and never closed on session teardown — we did not
+          // open them, so we must not take them away.
+          adopted: new Set((data.adopted || []).filter(id => validTabIds.has(id))),
           groupId: data.groupId || null,
           color: data.color || SESSION_COLORS[sessions.size % SESSION_COLORS.length],
           label: data.label || `Claude ${sessions.size + 1}`,
@@ -55,6 +59,7 @@ function getSession(port) {
     sessions.set(port, {
       tabIds: new Set(),
       activeTabId: null,
+      adopted: new Set(),
       groupId: null,
       color: SESSION_COLORS[idx],
       label: `Claude ${sessions.size + 1}`,
@@ -86,6 +91,7 @@ async function evictOldestTabs(session, justAddedTabId) {
     if (session.tabIds.size <= MAX_TABS_PER_SESSION) break;
     if (oldId === session.activeTabId) continue;
     if (oldId === justAddedTabId) continue;
+    if (session.adopted?.has(oldId)) continue; // never auto-close the user's own tabs
     try {
       await chrome.tabs.remove(oldId);
     } catch {} // tab may already be closed
@@ -132,10 +138,13 @@ async function releaseSession(port) {
   const session = sessions.get(port);
   if (!session) return;
 
-  // Detach debugger + close all session tabs
+  // Detach debugger + close the tabs WE opened. Adopted tabs (the user's own,
+  // brought in via browser_attach_tab) are released, never closed.
   const tabIds = [...session.tabIds];
   for (const tabId of tabIds) {
     debuggerForceDetach(tabId);
+    stickyTabs.delete(tabId);
+    if (session.adopted?.has(tabId)) continue;
     try {
       await chrome.tabs.remove(tabId);
     } catch {} // tab may already be closed
@@ -151,6 +160,7 @@ function persistSessions() {
     data[port] = {
       tabIds: [...session.tabIds],
       activeTabId: session.activeTabId,
+      adopted: [...(session.adopted || [])],
       groupId: session.groupId,
       color: session.color,
       label: session.label,
@@ -244,6 +254,20 @@ async function getSessionTab(port, activate = false) {
 // Track which tabs have debugger attached to avoid repeated attach/detach
 const debuggerAttached = new Set();
 
+// Chrome does not route CDP Input.* events (mouse, keys, insertText) to a tab that
+// is not the ACTIVE tab of its window — the command succeeds, the page sees nothing,
+// and everything silently degrades to the synthetic/native fallbacks. Measured on
+// Chrome 150: identical click on the same element is 'synthetic-fallback' while the
+// tab is backgrounded and 'trusted' once it is active. So every tool that dispatches
+// real input activates its tab first. This activates the TAB within its window only —
+// it never calls windows.update({focused:true}), so it does not pull Chrome in front
+// of whatever the user is doing.
+const INPUT_METHODS = new Set([
+  'click', 'fill', 'double_click', 'right_click', 'click_xy', 'press_key',
+  'select_option', 'set_date', 'set_combobox', 'hover', 'paste_from_clipboard',
+  'solve_captcha', 'upload_file', 'drop_file',
+]);
+
 // Verify Chrome's actual debugger-truth before trusting local cache.
 // Fixes "ghost-attached" state where Set says attached but Chrome side is gone
 // (happens on SW lifecycle events, user-canceled banners, anti-automation evictions).
@@ -273,11 +297,17 @@ async function debuggerAttach(tabId) {
   // is a real user-canceled banner. (Previously we threw on the first ghost, which made
   // dev-server URLs unusable during their initial bundle.)
   let lastMsg = '';
-  for (let attempt = 0; attempt < 3; attempt++) {
+  // FORCE-GRAB: 6 attempts with escalating backoff, and before every retry we
+  // force-detach whatever session is lingering on the tab (ours or an orphan left
+  // by another extension / a closed DevTools window). Chrome allows exactly one
+  // debugger client per tab, so the only way to win a contested tab is to clear
+  // the stale claim and re-attach immediately.
+  for (let attempt = 0; attempt < 6; attempt++) {
     try {
       await chrome.debugger.attach({ tabId }, '1.3');
       if (await verifyAttachedWithChrome(tabId)) {
         debuggerAttached.add(tabId);
+        stickyTabs.add(tabId); // hold this tab across future navigations
         return;
       }
       // Ghost — detach cleanly so the next attempt starts fresh, then retry.
@@ -287,6 +317,7 @@ async function debuggerAttach(tabId) {
       if (e.message?.includes('Already attached')) {
         // Chrome side has session — sync local cache
         debuggerAttached.add(tabId);
+        stickyTabs.add(tabId);
         return;
       }
       // "Cannot attach"/"canceled" can also be transient during navigation — retry too.
@@ -300,14 +331,31 @@ async function debuggerAttach(tabId) {
         try { await chrome.debugger.detach({ tabId }); } catch {}
       }
     }
-    if (attempt < 2) await new Promise(r => setTimeout(r, 250 + attempt * 250));
+    // Force-detach before EVERY retry, not only on contention messages: a ghost
+    // attach (attach resolves, Chrome says not attached) also clears this way.
+    if (attempt >= 1) { try { await chrome.debugger.detach({ tabId }); } catch {} }
+    if (attempt < 5) await new Promise(r => setTimeout(r, 200 + attempt * 300));
   }
   throw new Error(
-    `Debugger attach failed after 3 attempts (tab ${tabId}). Last: ${lastMsg}. ` +
-    `If persistent: the page may be continuously reloading (dev-server mid-build — wait, then retry), ` +
-    `or the user canceled Chrome's debugger banner — reload Browser MCP (chrome://extensions/ → ↻) or restart Chrome.`
+    `Debugger attach failed after 6 force-grab attempts (tab ${tabId}). Last: ${lastMsg}. ` +
+    `Chrome allows ONE debugger client per tab — check for another automation extension ` +
+    `(e.g. Claude in Chrome) or an open DevTools window on this tab, then call browser_reattach_debugger. ` +
+    `Note: interactive tools still work via the synthetic fallback; only isTrusted=true is lost.`
   );
 }
+
+// STICKY ATTACH: Chrome auto-detaches the debugger on cross-document navigation, and
+// whoever re-attaches first owns the tab. Re-claiming immediately on load means a
+// competing extension can't take it during the gap — and the next click gets trusted
+// events instead of quietly falling back. Only session tabs we already held are
+// re-claimed, so this never attaches to tabs the user is browsing manually.
+const stickyTabs = new Set();
+chrome.tabs.onUpdated.addListener((tabId, info) => {
+  if (info.status !== 'complete' || !stickyTabs.has(tabId)) return;
+  if (debuggerAttached.has(tabId)) return;
+  debuggerAttach(tabId).catch(() => {}); // best-effort re-claim
+});
+chrome.tabs.onRemoved.addListener((tabId) => stickyTabs.delete(tabId));
 
 async function debuggerDetach(tabId) {
   // Don't detach immediately — keep attached for subsequent commands.
@@ -1928,6 +1976,11 @@ async function dropFileOnTarget(tabId, selector, files) {
 // ── Command Dispatcher ──────────────────────────────────────────────────────
 
 async function dispatch(port, method, params) {
+  // Real input only reaches ACTIVE tabs (see INPUT_METHODS above). Activating here,
+  // once, means every input tool gets trusted events instead of silently degrading.
+  if (INPUT_METHODS.has(method)) {
+    try { await getSessionTab(port, true); } catch {}
+  }
   switch (method) {
     case 'navigate': {
       const session = getSession(port);
@@ -2758,12 +2811,58 @@ async function dispatch(port, method, params) {
     }
 
     case 'reattach_debugger': {
-      // Ghost-attach recovery without full extension reload: force detach + fresh attach.
-      const tab = await getSessionTab(port);
-      try { await chrome.debugger.detach({ tabId: tab.id }); } catch {}
-      await new Promise(r => setTimeout(r, 150));
-      await debuggerAttach(tab.id);
-      return { ok: true, reattached: true, tab_id: tab.id };
+      // FORCE-GRAB recovery: activate the tab (input only reaches active tabs),
+      // clear every stale claim, re-attach, then PROVE it by dispatching a real
+      // mouse event and checking whether the page actually received it.
+      const tab = await getSessionTab(port, true);
+      const before = await chrome.debugger.getTargets().then(
+        ts => ts.find(t => t.tabId === tab.id)?.attached || false).catch(() => null);
+      debuggerAttached.delete(tab.id);
+      for (let i = 0; i < 3; i++) {
+        try { await chrome.debugger.detach({ tabId: tab.id }); } catch {}
+        await new Promise(r => setTimeout(r, 120));
+      }
+      let attachErr = null;
+      try { await debuggerAttach(tab.id); } catch (e) { attachErr = e.message; }
+      const after = await chrome.debugger.getTargets().then(
+        ts => ts.find(t => t.tabId === tab.id)?.attached || false).catch(() => null);
+
+      // Live proof: fire a trusted mouse move + click on a harmless spot and see
+      // whether the page observed a trusted event. Reporting "reattached: true"
+      // without this would be exactly the unverified claim this fork avoids.
+      let trustedWorks = false;
+      if (after && !tab.url.startsWith('chrome://') && !tab.url.startsWith('about:')) {
+        try {
+          await chrome.scripting.executeScript({
+            target: { tabId: tab.id }, world: 'MAIN',
+            func: () => {
+              window.__bmcpProbe = false;
+              const h = (e) => { if (e.isTrusted) window.__bmcpProbe = true; };
+              window.addEventListener('mousemove', h, { capture: true, once: true });
+            },
+          });
+          await cdpSend(tab.id, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x: 5, y: 5 });
+          await new Promise(r => setTimeout(r, 120));
+          const [chk] = await chrome.scripting.executeScript({
+            target: { tabId: tab.id }, world: 'MAIN',
+            func: () => { const v = window.__bmcpProbe === true; try { delete window.__bmcpProbe; } catch {} return v; },
+          });
+          trustedWorks = chk?.result === true;
+        } catch {}
+      }
+      return {
+        ok: after === true,
+        tab_id: tab.id,
+        was_attached: before,
+        now_attached: after,
+        trusted_input_verified: trustedWorks,
+        ...(attachErr ? { attach_error: attachErr } : {}),
+        hint: trustedWorks
+          ? 'Debugger held and trusted input confirmed reaching the page.'
+          : after
+          ? 'Attached, but a trusted event did not reach the page. The tab must be the ACTIVE tab of its window for Chrome to route CDP input; clicks still work via the synthetic fallback.'
+          : 'Could not attach — another debugger client (rival automation extension, or an open DevTools window) holds this tab. Close it, or keep using the synthetic fallback.',
+      };
     }
 
     case 'hover': {
@@ -2954,13 +3053,43 @@ async function dispatch(port, method, params) {
     }
 
     case 'list_tabs': {
-      // Return only this session's tabs
       const session = getSession(port);
+
+      // all:true → every tab open in the browser, not just this session's, so the
+      // model can see what the user already has open and adopt one deliberately.
+      if (params.all) {
+        const everything = await chrome.tabs.query({});
+        const mine = session.tabIds;
+        const grouped = {};
+        for (const t of everything) {
+          const entry = {
+            id: t.id,
+            url: t.url || t.pendingUrl || '',
+            title: t.title || '',
+            active: t.active,
+            window_id: t.windowId,
+            owner: mine.has(t.id) ? (session.adopted?.has(t.id) ? 'this-session (adopted)' : 'this-session') : 'user',
+            attachable: !(t.url || '').startsWith('chrome://') && !(t.url || '').startsWith('chrome-extension://') && !(t.url || '').startsWith('edge://'),
+          };
+          (grouped[t.windowId] ||= []).push(entry);
+        }
+        const flat = Object.values(grouped).flat();
+        return {
+          tabs: flat,
+          total: flat.length,
+          windows: Object.keys(grouped).length,
+          session: session.label,
+          session_tabs: mine.size,
+          hint: 'browser_attach_tab({tab_id}) adopts one of the "user" tabs into this session so every tool acts on it. Adopted tabs are never auto-closed. Tabs with attachable:false (chrome://, extension pages) cannot be automated.',
+        };
+      }
+
+      // Default: only this session's tabs
       const tabs = [];
       for (const tabId of session.tabIds) {
         try {
           const tab = await chrome.tabs.get(tabId);
-          tabs.push({ id: tab.id, url: tab.url, title: tab.title, active: tab.active });
+          tabs.push({ id: tab.id, url: tab.url, title: tab.title, active: tab.active, adopted: session.adopted?.has(tabId) || false });
         } catch {
           session.tabIds.delete(tabId);
         }
@@ -3233,6 +3362,60 @@ async function dispatch(port, method, params) {
       }
     }
 
+    case 'attach_tab': {
+      // Adopt one of the user's existing tabs into this session. Everything that
+      // follows (click/fill/read_page/screenshot) then acts on it. The tab keeps
+      // its cookies and login state — that is the point.
+      const tabId = params.tab_id;
+      if (typeof tabId !== 'number') {
+        return { ok: false, error: 'tab_id (number) required — list candidates with browser_list_tabs({all:true})' };
+      }
+      let tab;
+      try { tab = await chrome.tabs.get(tabId); } catch {
+        return { ok: false, error: `No tab with id ${tabId}. Run browser_list_tabs({all:true}) for current ids (they change when tabs are reopened).` };
+      }
+      const url = tab.url || tab.pendingUrl || '';
+      if (url.startsWith('chrome://') || url.startsWith('chrome-extension://') || url.startsWith('edge://')) {
+        return { ok: false, error: `Cannot automate ${url.split('/')[0]}// pages — Chrome blocks extension access to them.` };
+      }
+      const session = getSession(port);
+      const already = session.tabIds.has(tabId);
+      if (!already) {
+        if (params.group === false) {
+          session.tabIds.add(tabId); // leave the user's tab strip untouched
+        } else {
+          await addTabToSession(port, tabId);
+        }
+        session.adopted = session.adopted || new Set();
+        session.adopted.add(tabId);
+      }
+      session.activeTabId = tabId;
+      persistSessions();
+      return {
+        ok: true,
+        attached: { id: tab.id, url, title: tab.title, window_id: tab.windowId },
+        already_in_session: already,
+        grouped: params.group !== false && !already,
+        note: 'This is now the session\'s active tab. It will NOT be auto-closed or evicted; browser_detach_tab releases it without closing. Pass group:false to avoid moving it into the session tab group.',
+      };
+    }
+
+    case 'detach_tab': {
+      // Release a tab from the session WITHOUT closing it.
+      const session = getSession(port);
+      const tabId = params.tab_id;
+      if (typeof tabId !== 'number') return { ok: false, error: 'tab_id (number) required' };
+      if (!session.tabIds.has(tabId)) return { ok: false, error: `Tab ${tabId} is not in this session` };
+      session.tabIds.delete(tabId);
+      session.adopted?.delete(tabId);
+      if (session.activeTabId === tabId) session.activeTabId = null;
+      debuggerForceDetach(tabId);
+      stickyTabs.delete(tabId);
+      if (params.ungroup !== false) { try { await chrome.tabs.ungroup(tabId); } catch {} }
+      persistSessions();
+      return { ok: true, released: tabId, still_open: true, remaining: session.tabIds.size };
+    }
+
     case 'switch_tab': {
       const session = getSession(port);
       if (!session.tabIds.has(params.tab_id)) {
@@ -3466,6 +3649,106 @@ async function dispatch(port, method, params) {
       const r = res?.result;
       if (!r) throw new Error('read_page injection returned nothing (page may still be loading)');
       return { ...r, url: tab.url, title: tab.title, hint: 'Use refs directly as selectors: browser_click({selector:"ref_12"}), browser_fill({selector:"ref_7", value:"..."}). Refs reset on navigation.' };
+    }
+
+    case 'form_state': {
+      // Born from a real 10-hour college-portal session: of 628 execute_script
+      // calls, ~200 were hand-written DOM scrapes for things no tool exposed —
+      // 82 just to list a <select>'s options, 42 for submit-button enabled state,
+      // 21 for filled-vs-empty, 20 for validation errors. This returns all of it
+      // in ONE call, with refs that click/fill accept directly.
+      const tab = await getSessionTab(port);
+      if (tab.url.startsWith('chrome://')) throw new Error('Cannot read chrome:// pages');
+      const [res] = await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        world: 'MAIN',
+        args: [params.selector || null, Math.min(60, params.max_options || 25)],
+        func: (rootSel, maxOpts) => {
+          if (!window.__bmcpRefEls) { window.__bmcpRefEls = {}; window.__bmcpRefSeq = 0; }
+          const refs = window.__bmcpRefEls;
+          const ref = (el) => {
+            if (el.__bmcpRef && refs[el.__bmcpRef] === el) return el.__bmcpRef;
+            const k = 'ref_' + (++window.__bmcpRefSeq);
+            try { Object.defineProperty(el, '__bmcpRef', { value: k, configurable: true }); } catch {}
+            refs[k] = el; return k;
+          };
+          const vis = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+          const label = (el) => {
+            const a = el.getAttribute('aria-label'); if (a) return a.trim();
+            const lb = el.getAttribute('aria-labelledby');
+            if (lb) { const t = lb.split(/\s+/).map(i => document.getElementById(i)?.textContent || '').join(' ').trim(); if (t) return t; }
+            if (el.labels && el.labels[0]) return el.labels[0].textContent.trim().replace(/\s+/g, ' ');
+            if (el.placeholder) return el.placeholder.trim();
+            const wrap = el.closest('label'); if (wrap) return wrap.textContent.trim().replace(/\s+/g, ' ').slice(0, 60);
+            return el.name || el.id || '';
+          };
+          const root = rootSel ? document.querySelector(rootSel) : document;
+          if (!root) return { error: 'root selector not found: ' + rootSel };
+          const controls = [...root.querySelectorAll('input, select, textarea, [contenteditable="true"]')]
+            .filter(el => el.type !== 'hidden' && vis(el));
+          const fields = [];
+          let filled = 0, empty = 0, missingRequired = 0;
+          for (const el of controls) {
+            const type = (el.tagName === 'SELECT' ? 'select' : el.tagName === 'TEXTAREA' ? 'textarea' : (el.type || 'text')).toLowerCase();
+            if (type === 'submit' || type === 'button' || type === 'reset') continue;
+            const f = { ref: ref(el), label: label(el).slice(0, 70), type };
+            if (el.name) f.name = el.name;
+            const req = el.required || el.getAttribute('aria-required') === 'true';
+            if (req) f.required = true;
+            if (el.disabled) f.disabled = true;
+            if (el.readOnly) f.readonly = true;
+            let hasValue;
+            if (type === 'checkbox' || type === 'radio') { f.checked = el.checked; hasValue = el.checked; }
+            else if (type === 'select') {
+              const sel = el.selectedOptions[0];
+              f.selected = sel ? sel.text.trim().slice(0, 50) : '';
+              hasValue = !!(el.value && el.value !== '' && !/^(please select|select|choose|--)/i.test(f.selected));
+              // THE big one: the actual options, so no scrape is needed to pick one
+              f.options = [...el.options].slice(0, maxOpts).map(o => o.text.trim().slice(0, 45)).filter(Boolean);
+              if (el.options.length > maxOpts) f.options_truncated = el.options.length;
+            } else if (type === 'password') { f.value = el.value ? `[${el.value.length} chars]` : ''; hasValue = !!el.value; }
+            else if (type === 'file') { f.files = [...(el.files || [])].map(x => x.name); hasValue = f.files.length > 0; }
+            else { const v = ('value' in el ? el.value : el.textContent) || ''; f.value = String(v).slice(0, 80); hasValue = !!String(v).trim(); }
+            if (hasValue) filled++; else { empty++; if (req) { missingRequired++; f.MISSING_REQUIRED = true; } }
+            const invalid = el.getAttribute('aria-invalid') === 'true' ||
+              (el.willValidate && !el.checkValidity && false) ||
+              (typeof el.checkValidity === 'function' && !el.checkValidity());
+            if (invalid) {
+              f.invalid = true;
+              if (el.validationMessage) f.validation_message = el.validationMessage.slice(0, 90);
+              const d = el.getAttribute('aria-describedby');
+              if (d) { const t = d.split(/\s+/).map(i => document.getElementById(i)?.textContent || '').join(' ').trim(); if (t) f.error_text = t.slice(0, 90); }
+            }
+            fields.push(f);
+          }
+          // Submit / action buttons with their enabled state
+          const buttons = [...root.querySelectorAll('button, input[type="submit"], input[type="button"], [role="button"]')]
+            .filter(vis).slice(0, 25).map(el => ({
+              ref: ref(el),
+              text: (el.textContent || el.value || label(el)).trim().replace(/\s+/g, ' ').slice(0, 45),
+              disabled: !!el.disabled || el.getAttribute('aria-disabled') === 'true',
+              type: (el.type || 'button').toLowerCase(),
+            })).filter(b => b.text);
+          // Page-level errors and step/progress indicators
+          const errors = [...document.querySelectorAll('[role="alert"], .error, .invalid-feedback, [class*="error" i]:not(input):not(select):not(textarea)')]
+            .filter(vis).map(e => (e.textContent || '').trim().replace(/\s+/g, ' ')).filter(t => t && t.length < 200);
+          const steps = [...document.querySelectorAll('[aria-current], .active[class*="step" i], [class*="step" i][class*="current" i], nav [aria-selected="true"]')]
+            .filter(vis).map(e => (e.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 60)).filter(Boolean);
+          return {
+            fields, buttons,
+            page_errors: [...new Set(errors)].slice(0, 10),
+            current_step: [...new Set(steps)].slice(0, 5),
+            summary: { total: fields.length, filled, empty, missing_required: missingRequired },
+          };
+        },
+      });
+      const r = res?.result;
+      if (!r) throw new Error('form_state injection returned nothing (page may still be loading)');
+      if (r.error) return { ok: false, error: r.error };
+      return {
+        ok: true, ...r, url: tab.url, title: tab.title,
+        hint: 'Every field/button carries a ref usable directly: browser_fill({selector:"ref_7", value:"..."}), browser_select_option on a select ref. MISSING_REQUIRED marks required fields still empty.',
+      };
     }
 
     case 'find': {
