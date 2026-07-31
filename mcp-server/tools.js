@@ -128,7 +128,7 @@ export const TOOLS = [
   },
   {
     name: 'browser_network_log',
-    description: 'Read the HTTP requests made by the current page, including XHR, fetch, documents and images, with method, URL, status, MIME type and duration. Recording begins when the debugger attaches to the tab, so requests made before this call are included. Filter with url_pattern or only_failed. Requests from other installed extensions are excluded unless include_extension_requests is set.',
+    description: 'Read the HTTP requests made by the current page, including XHR, fetch, documents and images, with method, URL, status, MIME type and duration. Response bodies for data requests are captured as they complete and can be returned with include_body, which is often faster than scraping the rendered result. Recording begins when the debugger attaches to the tab, so earlier requests are included. Filter with url_pattern or only_failed. Requests from other installed extensions are excluded unless include_extension_requests is set.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -137,6 +137,8 @@ export const TOOLS = [
         limit: { type: 'number', description: 'Max entries returned (default: 50)' },
         clear: { type: 'boolean', description: 'Clear the buffer after reading' },
         include_extension_requests: { type: 'boolean', description: 'Include chrome-extension:// asset requests from other installed extensions (excluded by default as noise)' },
+        include_body: { type: 'boolean', description: 'Return captured response bodies. Entries listing has_body have one available.' },
+        max_body_chars: { type: 'number', description: 'Truncate each returned body at this length (default: 4000)' },
       },
     },
   },

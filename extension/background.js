@@ -411,8 +411,17 @@ function debuggerForceDetach(tabId) {
 // tab from the moment the debugger attaches, so "what did this page call?" is
 // answerable retroactively — the same reasoning as capturing console at
 // document_start instead of at first read.
-const networkLogs = new Map(); // tabId → [{id, method, url, status, type, ms, failed}]
+const networkLogs = new Map(); // tabId → [{id, method, url, status, type, ms, failed, body}]
 const NET_MAX = 300;
+const NET_BODY_MAX = 200_000;      // per response
+const NET_BODY_BUDGET = 4_000_000; // per tab, so a chatty page cannot grow without bound
+
+function netBodyBytes(tabId) {
+  const buf = networkLogs.get(tabId) || [];
+  let n = 0;
+  for (const e of buf) n += e.body ? e.body.length : 0;
+  return n;
+}
 
 function netBuf(tabId) {
   let b = networkLogs.get(tabId);
@@ -442,6 +451,24 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
       if (e.started != null && params.timestamp != null) e.ms = Math.round((params.timestamp - e.started) * 1000);
       if (method === 'Network.loadingFailed') { e.failed = true; e.error = params.errorText; }
       delete e.started;
+      // Capture data responses while the body is still retrievable. Knowing that a
+      // request fired without being able to see what came back is the difference
+      // between scraping a virtualised table row by row and just reading the JSON
+      // the page already fetched. Bodies are held but only returned on request.
+      const isData = e.type === 'XHR' || e.type === 'Fetch' ||
+        (e.mime && /json|javascript|text\/plain|xml/i.test(e.mime));
+      if (method === 'Network.loadingFinished' && isData && netBodyBytes(tabId) < NET_BODY_BUDGET) {
+        chrome.debugger.sendCommand({ tabId }, 'Network.getResponseBody', { requestId: params.requestId })
+          .then((r) => {
+            if (!r || r.body == null) return;
+            if (r.base64Encoded) { e.body_note = 'binary response, not captured'; return; }
+            const s = String(r.body);
+            e.body_bytes = s.length;
+            e.body = s.length > NET_BODY_MAX ? s.slice(0, NET_BODY_MAX) : s;
+            if (s.length > NET_BODY_MAX) e.body_truncated = s.length;
+          })
+          .catch(() => { /* body already evicted from Chrome's cache */ });
+      }
     }
   }
 });
@@ -3979,10 +4006,23 @@ async function dispatchCore(port, method, params) {
         (!pat || (e.url || '').includes(pat)) &&
         (!params.only_failed || e.failed || (e.status >= 400)));
       const total = out.length;
-      out = out.slice(-(params.limit || 50)).map(({ id, started, ...rest }) => rest);
+      const bodyChars = Math.min(200000, params.max_body_chars || 4000);
+      out = out.slice(-(params.limit || 50)).map(({ id, started, body, ...rest }) => {
+        // Bodies are captured always but returned only when asked for, so the
+        // default listing stays small.
+        if (!params.include_body) {
+          return body ? { ...rest, has_body: true, body_bytes: body.length } : rest;
+        }
+        if (!body) return rest;
+        return {
+          ...rest,
+          body: body.length > bodyChars ? body.slice(0, bodyChars) + `\n[truncated, ${body.length} chars total]` : body,
+        };
+      });
       if (params.clear) networkLogs.set(tab.id, []);
       return {
         requests: out, total_matched: total, buffered: buf.length,
+        ...(params.include_body ? {} : { hint: 'Entries marked has_body carry a captured response; pass include_body:true to read them.' }),
         ...(buf.length === 0 ? { note: 'Empty — recording starts when the debugger attaches to a tab. Reload the page to capture its full load sequence.' } : {}),
       };
     }
@@ -5084,16 +5124,41 @@ async function dispatchCore(port, method, params) {
             if (top.some(t => s.el.contains(t.el))) continue;
             top.push(s);
           }
+          // Enterprise wizards repeat the same label across steps and hidden panels.
+          // A single confident answer there is a coin flip, so each match carries
+          // the context needed to tell them apart, and near-ties are flagged.
+          const context = (el) => {
+            const bits = [];
+            const sec = el.closest('section, form, [role="dialog"], [role="tabpanel"], fieldset, article, nav, header, footer, main, aside');
+            if (sec) {
+              const lbl = sec.getAttribute('aria-label') ||
+                (sec.querySelector('legend, h1, h2, h3, [role="heading"]') || {}).textContent || '';
+              const tag = sec.tagName.toLowerCase() + (sec.getAttribute('role') ? `[${sec.getAttribute('role')}]` : '');
+              bits.push(lbl.trim() ? `in ${tag} "${lbl.trim().replace(/\s+/g, ' ').slice(0, 40)}"` : `in ${tag}`);
+            }
+            const r = el.getBoundingClientRect();
+            const inView = r.top >= 0 && r.top < innerHeight;
+            bits.push(inView ? `at y=${Math.round(r.top)}` : (r.top < 0 ? 'above viewport' : 'below viewport'));
+            if (el.disabled || el.getAttribute('aria-disabled') === 'true') bits.push('disabled');
+            return bits.join(', ');
+          };
+          const matches = top.map(s => ({
+            ref: assignRef(s.el),
+            role: s.el.getAttribute('role') || s.el.tagName.toLowerCase(),
+            name: s.name.slice(0, 100),
+            score: s.score,
+            match: s.reasons.join(','),
+            visible: s.isVisible,
+            where: context(s.el),
+          }));
+          const ambiguous = matches.length > 1 && (matches[0].score - matches[1].score) <= 10;
           return {
             total_candidates: scored.length,
-            matches: top.map(s => ({
-              ref: assignRef(s.el),
-              role: s.el.getAttribute('role') || s.el.tagName.toLowerCase(),
-              name: s.name.slice(0, 100),
-              score: s.score,
-              match: s.reasons.join(','),
-              visible: s.isVisible,
-            })),
+            matches,
+            ...(ambiguous ? {
+              ambiguous: true,
+              note: `Top ${matches.filter(m => m.score >= matches[0].score - 10).length} matches score within 10 points of each other. Use the where field to pick, or scope the search with browser_read_page on the right container.`,
+            } : {}),
           };
         },
       });
