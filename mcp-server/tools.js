@@ -134,6 +134,7 @@ export const TOOLS = [
       properties: {
         expect: { type: 'object', description: 'Labels and their expected values, for example {"Email":"a@b.com","Programme":"MS CS"}' },
         selector: { type: 'string', description: 'Limit the check to one container, such as a review panel' },
+        reload: { type: 'boolean', description: 'Reload the page first, then check. Turns "is the page showing this" into "did the server keep it", which is the question that matters after a save — a form still displaying what was typed proves nothing about what was stored.' },
         exact: { type: 'boolean', description: 'Require an exact match rather than ignoring case, spacing and punctuation' },
         verbose: { type: 'boolean', description: 'Return every check, not only the ones that failed' },
       },

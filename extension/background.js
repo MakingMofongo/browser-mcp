@@ -5932,6 +5932,32 @@ async function dispatchCore(port, method, params) {
       if (!expect || typeof expect !== 'object' || !Object.keys(expect).length) {
         return { ok: false, error: 'expect required: an object of label to value, for example {"Email":"a@b.com"}' };
       }
+
+      // Reload first, and the question changes from "is the page showing this" to
+      // "did the server keep it". Those are different questions and only the second
+      // one matters after a save: a form that still displays what was typed proves
+      // nothing, because the value it is showing may only ever have existed in the
+      // browser. Portals drop individual fields server-side while accepting the rest
+      // — a degree that reverts every time while everything around it persists — and
+      // the only way anybody has found to tell is to reload and look again. That was
+      // being done by hand after every save.
+      let reloaded = false;
+      if (params.reload) {
+        const before = tab.url;
+        await chrome.tabs.reload(tab.id, { bypassCache: true });
+        // Wait for the document to come back, rather than reading the outgoing one.
+        for (let i = 0; i < 60; i++) {
+          await new Promise(r => setTimeout(r, 250));
+          const t = await chrome.tabs.get(tab.id).catch(() => null);
+          if (t && t.status === 'complete') { reloaded = true; break; }
+        }
+        if (!reloaded) {
+          return { ok: false, error: `The page did not finish reloading, so whether these values survived cannot be told from here. It was on ${before}.` };
+        }
+        // Settle for anything that populates fields after load, which is most
+        // portals — reading too early sees an empty form and calls it data loss.
+        await new Promise(r => setTimeout(r, 600));
+      }
       const [res] = await chrome.scripting.executeScript({
         target: { tabId: tab.id }, world: 'MAIN',
         args: [expect, params.selector || null, params.exact === true],
@@ -6006,8 +6032,14 @@ async function dispatchCore(port, method, params) {
         matched: r.checks.length - mismatched.length,
         mismatched: mismatched.length ? mismatched : undefined,
         checks: params.verbose ? r.checks : undefined,
-        ...(mismatched.length ? {
-          hint: 'The page is not showing what it was given. A control that did not re-render keeps the previous value, which a structural check cannot see.',
+        // What was actually established matters as much as the verdict. Read from
+        // the page as it stood is a weaker claim than read after a reload, and only
+        // the second says anything about the server.
+        ...(reloaded ? { after_reload: true } : {}),
+        ...(mismatched.length && reloaded ? {
+          hint: 'These did not survive a reload, so the server did not keep them however the page looked before. Portals do this to individual fields while accepting everything around them — re-enter just these and save again.',
+        } : mismatched.length ? {
+          hint: 'The page is not showing what it was given. A control that did not re-render keeps the previous value, which a structural check cannot see. Pass reload:true to find out whether the server kept it, which is a different question.',
         } : {}),
       };
     }

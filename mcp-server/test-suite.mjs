@@ -158,6 +158,31 @@ async function suite() {
   check('a plain role query still works', /login|submit/i.test(submitFind.matches?.[0]?.name || ''),
     submitFind.matches?.[0]?.name);
 
+  // "Is the page showing this" and "did the server keep it" are different
+  // questions, and after a save only the second one matters. A form still
+  // displaying what was typed proves nothing — the value may only ever have
+  // existed in the browser. Real portals drop individual fields server-side while
+  // accepting everything around them, and reloading was being done by hand after
+  // every save to find out.
+  await send('navigate', { url: `${BASE}/login` });
+  await send('fill', { selector: '#username', value: 'never-saved' });
+  const shown = await send('verify_data', { expect: { Username: 'never-saved' } });
+  const survived = await send('verify_data', { expect: { Username: 'never-saved' }, reload: true });
+  check('a value the page merely shows passes without a reload',
+    shown.ok === true, JSON.stringify({ ok: shown.ok }));
+  check('and fails once reloaded, because the server never had it',
+    survived.ok === false && survived.after_reload === true && /did not survive/.test(survived.hint || ''),
+    JSON.stringify({ ok: survived.ok, found: survived.mismatched?.[0]?.found }));
+
+  // The other direction matters as much: a check that always failed after a
+  // reload would be worthless. This one is server-rendered, so it survives.
+  await send('navigate', { url: `${BASE}/apply` });
+  await send('fill', { selector: '#name', value: 'Persisted Person' });
+  await send('submit', { expect_text: 'submitted', timeout: 6000 });
+  const kept = await send('verify_data', { expect: { 'Confirmation number': 'APP' }, reload: true });
+  check('a value the server kept survives the reload check',
+    kept.ok === true && kept.after_reload === true, JSON.stringify({ ok: kept.ok }));
+
   // ── submit classifies rejection and success ─────────────────────────────
   await send('navigate', { url: `${BASE}/login` });
   await send('fill', { selector: '#username', value: 'wrong' });
