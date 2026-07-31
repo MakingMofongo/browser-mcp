@@ -7,7 +7,7 @@
 export const TOOLS = [
   {
     name: 'browser_batch',
-    description: 'Execute a sequence of browser tool calls in ONE round trip. Actions run SEQUENTIALLY and stop on the first error. Use this whenever you can predict 2+ steps ahead (e.g. navigate → read_page → fill → click → get_page_content) — it is dramatically faster than separate calls. Each item is {name, params} where name is the tool name (with or without the browser_ prefix) and params is exactly what you would pass to that tool. Screenshots inside a batch are returned as proper images. Cannot be nested; ask_user/solve_captcha not allowed inside.',
+    description: 'Execute a sequence of browser tool calls in one round trip. Actions run sequentially and stop at the first error. Each item is {name, params}, where name is a tool name with or without the browser_ prefix and params matches that tool\'s normal input. Screenshots taken inside a batch are returned as images. Batches cannot be nested, and ask_user and solve_captcha are not available inside them.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -29,7 +29,7 @@ export const TOOLS = [
   },
   {
     name: 'browser_read_page',
-    description: 'Get a structured outline of the page: every visible interactive element (links, buttons, inputs, selects, tabs, checkboxes…) with role, accessible name, state (value/checked/disabled/href) and a stable ref handle [ref_N]. Refs are usable DIRECTLY as selectors in click/fill/select_option/hover ("ref_12"). THE tool for unfamiliar pages — read once, then act on refs instead of guessing CSS selectors. filter:"all" adds headings and images. Refs reset on navigation.',
+    description: 'Get a structured outline of the page\'s visible interactive elements — links, buttons, inputs, selects, checkboxes and similar — each with its role, accessible name, current state and a reference ID. References can be used directly as selectors in click, fill, select_option and hover. Use filter:"all" to also include headings and images. References reset when the page navigates.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -40,7 +40,7 @@ export const TOOLS = [
   },
   {
     name: 'browser_form_state',
-    description: 'ONE call that returns everything you need to fill a form: every visible field with its label, type, current value, required/disabled/readonly flags, validation errors — AND, for every <select>, its actual list of options (no more scraping to find out what you can pick). Plus all buttons with enabled/disabled state, page-level error messages, and the current step/section. Fields still empty but required are flagged MISSING_REQUIRED. Every entry carries a ref usable directly with fill/click/select_option. Use this INSTEAD of hand-writing execute_script DOM scrapes on any form or application portal.',
+    description: 'Read the state of a form: each visible field with its label, type, current value, required, disabled and readonly flags and validation errors, plus the available options for every select. Also returns buttons with their enabled state, page-level error messages and the current step. Required fields that are still empty are flagged. Each entry includes a reference ID usable with fill, click and select_option.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -51,7 +51,7 @@ export const TOOLS = [
   },
   {
     name: 'browser_find',
-    description: 'Find elements by plain-language description — "login button", "search input", "link containing pricing". Scores accessible names, placeholders, roles and text; returns the top matches with ref handles usable directly as selectors ("ref_7"). Use when you know WHAT you want but not its selector. For a full page inventory use browser_read_page instead.',
+    description: 'Find elements on the page using natural language, such as "login button" or "email field". Matches against accessible names, placeholders, roles and text content, with synonym and typo tolerance, and returns the best matches with reference IDs usable as selectors. For a complete inventory of the page use browser_read_page instead.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -63,7 +63,7 @@ export const TOOLS = [
   },
   {
     name: 'browser_submit',
-    description: 'Submit a form and report WHAT ACTUALLY HAPPENED — the single most valuable tool for logins and applications. Clicks the submit control (auto-detected if you do not name one), then watches the page and returns a definite outcome: "navigated" (went somewhere new), "validation_error" (submitted and REJECTED, with the exact error messages), "expected_text" (your success text appeared), "page_changed", or "no_change" with a diagnosis of why. Use this INSTEAD of click-then-wait: a plain click cannot tell success from silent no-op, which is how one real login burned 11 minutes across three clicks that all reported ok.',
+    description: 'Submit a form and report the outcome. Clicks the submit control, auto-detecting it when no selector is given, then observes the page and returns one of: navigated, validation_error with the messages shown, expected_text, page_changed, or no_change with a diagnosis. Distinguishes a successful submit from a rejected one and from a click that had no effect.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -76,7 +76,7 @@ export const TOOLS = [
   },
   {
     name: 'browser_network_log',
-    description: 'Read the HTTP requests this page made (XHR, fetch, documents, images) with method, URL, status, MIME type and duration. Recording starts the moment the debugger attaches, so the log is already there when you ask — unlike browser_wait_for_network, which only waits for a single future request. Filter with url_pattern, or only_failed:true to see just 4xx/5xx/network errors.',
+    description: 'Read the HTTP requests made by the current page, including XHR, fetch, documents and images, with method, URL, status, MIME type and duration. Recording begins when the debugger attaches to the tab, so requests made before this call are included. Filter with url_pattern or only_failed. Requests from other installed extensions are excluded unless include_extension_requests is set.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -90,7 +90,7 @@ export const TOOLS = [
   },
   {
     name: 'browser_drag',
-    description: 'Drag from one point/element to another with real trusted mouse events moved in steps (sliders, reorderable lists, canvas, kanban cards), with an automatic HTML5 drag-and-drop fallback for dropzones that listen for dragstart/dragover/drop. Give from_selector/to_selector (CSS, text, or ref) or raw from_x/from_y/to_x/to_y coordinates.',
+    description: 'Drag from one element or point to another using trusted mouse events, with an HTML5 drag-and-drop fallback for drop zones that listen for dragstart, dragover and drop. Use for sliders, reorderable lists, kanban boards and canvas interactions. Accepts from_selector and to_selector (CSS, text or reference ID) or raw coordinates.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -104,7 +104,7 @@ export const TOOLS = [
   },
   {
     name: 'browser_triple_click',
-    description: 'Triple-click to select an entire line/paragraph — the reliable way to replace existing text in rich editors (contenteditable, Quill, ProseMirror) before typing. Returns the text that got selected so you can confirm you grabbed the right thing.',
+    description: 'Triple-click an element to select its entire line or paragraph, typically before replacing text in a rich text editor. Returns the text that was selected.',
     inputSchema: {
       type: 'object',
       properties: { selector: { type: 'string', description: 'CSS, text, or ref selector' } },
@@ -113,7 +113,7 @@ export const TOOLS = [
   },
   {
     name: 'browser_resize_window',
-    description: 'Resize the browser window (responsive testing, or making more of a long form visible at once). Returns both the window size and the resulting inner viewport size.',
+    description: 'Resize the browser window. Returns the resulting window dimensions and the inner viewport size. Useful for testing responsive layouts or fitting more of a long page on screen.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -125,17 +125,17 @@ export const TOOLS = [
   },
   {
     name: 'browser_health',
-    description: 'Pre-flight check of the automation channels on the active tab: is script injection working, is the debugger attachable, which tab is active, how many session tabs exist. Call when interactive tools start failing (attach errors, timeouts) to diagnose instead of retrying blind — the hint field says what to do.',
+    description: 'Check the automation channels for the active tab: whether script injection works, whether the debugger is attached, which tab is active and how many tabs the session holds. Use to diagnose failures in click, fill or key presses.',
     inputSchema: { type: 'object', properties: {} },
   },
   {
     name: 'browser_list_browsers',
-    description: 'List every Chrome instance (profile/machine) whose Browser MCP extension is connected to this session, with id, label, platform and which one is active. Use before browser_select_browser when the user has multiple Chromes.',
+    description: 'List the Chrome instances currently connected to this session, with their ID, label, platform and which one is receiving commands.',
     inputSchema: { type: 'object', properties: {} },
   },
   {
     name: 'browser_select_browser',
-    description: 'Route all subsequent browser commands to a specific connected Chrome instance (by id or label from browser_list_browsers). If the active browser disconnects, the server auto-fails-over to another connected one.',
+    description: 'Route subsequent commands to a specific connected Chrome instance, identified by the ID or label from browser_list_browsers. If the active browser disconnects, another connected instance takes over automatically.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -146,7 +146,7 @@ export const TOOLS = [
   },
   {
     name: 'browser_navigate',
-    description: 'Navigate the active browser tab to a URL. Reuses the current tab by default (no tab spam). Pass new_tab=true only when you need to keep the current page open.',
+    description: 'Navigate the active tab to a URL. Reuses the current tab by default; pass new_tab:true to keep the current page open. Pass "back" or "forward" as the url to move through the tab\'s history.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -158,7 +158,7 @@ export const TOOLS = [
   },
   {
     name: 'browser_get_page_content',
-    description: 'Get the content of the current page. format:"article" extracts the main content only (nav/header/footer/sidebar/cookie noise stripped) — strongly preferred for reading articles, docs, and dashboards. "text" is the full body innerText; "html" the raw DOM. Long output is truncated at max_chars with an explicit marker.',
+    description: 'Get the content of the current page. Use format:"article" for the main content with navigation, headers, footers and sidebars removed, "text" for the full body text, or "html" for the raw DOM. Output longer than max_chars is truncated with a marker giving the full length.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -169,7 +169,7 @@ export const TOOLS = [
   },
   {
     name: 'browser_screenshot',
-    description: 'Take a screenshot of the visible area of the current tab. Returns base64 PNG, or saves to disk if path is provided.',
+    description: 'Take a screenshot of the visible area of the current tab. Returns a PNG image, or saves it to disk when a path is given.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -179,7 +179,7 @@ export const TOOLS = [
   },
   {
     name: 'browser_execute_script',
-    description: 'Execute JavaScript in the page with full REPL semantics (like the DevTools console): multi-statement code works, top-level await works, and the LAST EXPRESSION is the return value. E.g. `const r = await fetch("/api"); const j = await r.json(); j.items.length`. Parameter is `code` (alias `script` accepted).',
+    description: 'Execute JavaScript in the page with the semantics of the DevTools console: multiple statements are allowed, top-level await works, and the value of the last expression is returned.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -190,7 +190,7 @@ export const TOOLS = [
   },
   {
     name: 'browser_copy_to_clipboard',
-    description: 'SECRET-SAFE: Copy an element\'s value/text (or an attribute) to the system clipboard WITHOUT returning the content — only the character count comes back. Use for credentials/tokens that must move from a page (e.g. Azure "new client secret" value) to a field or CLI (`pbpaste`) without ever entering the conversation. CSS selectors only.',
+    description: 'Copy an element\'s value, text or a named attribute to the system clipboard without returning the content — only the character count comes back. Use to move a credential from a page into a field or a CLI without it entering the conversation.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -202,7 +202,7 @@ export const TOOLS = [
   },
   {
     name: 'browser_paste_from_clipboard',
-    description: 'SECRET-SAFE: Paste the system clipboard into a form field WITHOUT the content ever being returned — only the character count comes back. Pairs with browser_copy_to_clipboard for credential moves between pages/apps. Trims whitespace by default (trim:false to keep).',
+    description: 'Paste the system clipboard into a form field without returning the content — only the character count comes back. Pairs with browser_copy_to_clipboard for moving credentials between pages.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -214,12 +214,12 @@ export const TOOLS = [
   },
   {
     name: 'browser_clipboard_stats',
-    description: 'SECRET-SAFE: Inspect the system clipboard\'s SHAPE without exposing content: length, trimmed length, has_whitespace, looks_like_uuid, looks_like_url. Use to verify a copy landed (e.g. "is this a ~40-char secret or a UUID from the wrong button?") before pasting.',
+    description: 'Inspect the shape of the system clipboard without exposing its content: length, trimmed length, whether it contains whitespace, and whether it looks like a UUID or a URL. Use to confirm a copy landed before pasting.',
     inputSchema: { type: 'object', properties: {} },
   },
   {
     name: 'browser_double_click',
-    description: 'True double-click on an element (two trusted press/release pairs with escalating clickCount). Use for open-item actions (calendar events, file lists) where two single clicks would trigger inline-rename instead (e.g. OWA month view).',
+    description: 'Double-click an element using two trusted press and release pairs with escalating click counts. Use for open-item actions such as calendar events or file lists, where two single clicks would trigger inline rename instead.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -230,7 +230,7 @@ export const TOOLS = [
   },
   {
     name: 'browser_right_click',
-    description: 'Right-click an element (trusted CDP mouse events) to open page-level context menus (web apps like OWA/Google Docs render their own). Note: Chrome\'s NATIVE context menu does not open via CDP — only in-page menus.',
+    description: 'Right-click an element to open a page-level context menu. Chrome\'s own native context menu cannot be opened this way; only menus rendered by the page itself will appear.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -241,7 +241,7 @@ export const TOOLS = [
   },
   {
     name: 'browser_click_xy',
-    description: 'ESCAPE HATCH: Click at raw viewport coordinates (CSS pixels) with fully trusted mouse events. Use when a visible button resists every selector strategy (Azure portal dialogs, Knockout-bound divs, canvas UIs): take a screenshot, read the button\'s position, click its center. Combine with browser_screenshot for coordinates.',
+    description: 'Click at raw viewport coordinates in CSS pixels using trusted mouse events. Use when a visible control resists every selector strategy, taking the coordinates from a screenshot.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -253,12 +253,12 @@ export const TOOLS = [
   },
   {
     name: 'browser_reattach_debugger',
-    description: 'RECOVERY: Force-detach and re-attach the Chrome debugger on the current tab. Use when interactive tools (click/fill/press_key) start timing out or reporting ghost-attach ("Debugger attach failed ... ghost") while list_tabs still works — faster than reloading the extension.',
+    description: 'Force the Chrome debugger to detach and reattach on the current tab, then verify recovery by dispatching a real input event and checking that the page received it. Use when click, fill or key presses begin failing with attach errors.',
     inputSchema: { type: 'object', properties: {} },
   },
   {
     name: 'browser_click',
-    description: 'Click an element. Selectors: CSS ("#btn"), text ("text=Submit", "button:text(Get started)"), or a ref handle from read_page/find ("ref_12"). Auto-scrolls into view; real trusted mouse events with automatic synthetic fallback. The result reports verified + click_path — verified:false means NO event reached the page (never a silent no-op): re-read the page or try another selector.',
+    description: 'Click an element. Accepts a CSS selector, a text selector such as "text=Submit" or "button:text(Get started)", or a reference ID from read_page or find. Scrolls the element into view and uses trusted mouse events, falling back to synthetic events when the debugger is unavailable. The result reports whether the click reached the page and which path was used.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -269,7 +269,7 @@ export const TOOLS = [
   },
   {
     name: 'browser_fill',
-    description: 'Fill a form input with a value. Selectors: CSS, text ("text=Email"), or ref handle from read_page/find ("ref_7"). Returns value_before and value_after so you can verify the fill landed on the RIGHT element (passwords redacted). For date inputs use browser_set_date, for autocomplete/combobox use browser_set_combobox.',
+    description: 'Fill a form input. Accepts a CSS selector, a text selector or a reference ID, and searches inside shadow roots. Returns the value before and after, whether focus stayed on the target element, and whether the value survived the page\'s own framework. Password values are redacted. Use browser_set_date for date inputs and browser_set_combobox for autocompletes.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -281,7 +281,7 @@ export const TOOLS = [
   },
   {
     name: 'browser_press_key',
-    description: 'Press a keyboard key (Enter, Tab, Escape, ArrowDown, etc.). Useful for submitting forms, navigating dropdowns, closing dialogs. Supports modifier keys (ctrl, alt, shift, meta).',
+    description: 'Press a keyboard key such as Enter, Tab, Escape or an arrow key, with optional modifier keys. Use for submitting forms, moving between fields and closing dialogs.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -297,7 +297,7 @@ export const TOOLS = [
   },
   {
     name: 'browser_scroll',
-    description: 'Scroll the page to an element or by pixel amount. Useful for reaching elements below the fold.',
+    description: 'Scroll the page to an element or by a pixel amount. Scrolling by pixels is split into several wheel events so that lazy-loading and IntersectionObserver callbacks fire.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -309,7 +309,7 @@ export const TOOLS = [
   },
   {
     name: 'browser_wait',
-    description: 'Wait for an element to become VISIBLE (not merely present — pages often pre-render success text in a hidden div, which would match instantly and leave you reading a mid-transition page). Supports CSS, text, and ref selectors. Returns waited_ms; pass visible:false to match presence only.',
+    description: 'Wait for an element to become visible, accepting CSS, text and reference selectors. Returns how long it waited. Pass visible:false to match elements that are present but hidden, which is useful when a page pre-renders success text in a hidden container.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -322,7 +322,7 @@ export const TOOLS = [
   },
   {
     name: 'browser_hover',
-    description: 'Hover over an element to trigger tooltips, dropdown menus, or hover states. Supports CSS and text selectors.',
+    description: 'Hover over an element to reveal tooltips, dropdown menus or hover states, holding the position for the given duration.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -334,7 +334,7 @@ export const TOOLS = [
   },
   {
     name: 'browser_select_option',
-    description: 'Select an option from a dropdown menu. Works with native <select> elements AND custom dropdowns (Angular Material, React Select, etc.). For custom dropdowns: clicks the trigger, waits for options, then clicks the matching option by text. For autocomplete (typing filters options) use browser_set_combobox instead.',
+    description: 'Select an option from a dropdown. Works with native select elements and with custom dropdowns that render their options on click. For autocompletes where typing filters the options, use browser_set_combobox.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -347,7 +347,7 @@ export const TOOLS = [
   },
   {
     name: 'browser_dismiss_overlays',
-    description: 'Dismiss visible popups, modals, tooltips, banners, and "Are you sure?"-style overlays in one call. Heuristic-based: finds close affordance via aria-label, text content (Skip/Cancel/Ikke nu/Don\'t show/Got it/Close), or × character button. Use when a flow is interrupted by unexpected dialogs (cookie banners, onboarding tooltips, draft-confirm prompts on Meta Ads, etc.). Returns list of what was dismissed.',
+    description: 'Dismiss visible popups, modals, tooltips, banners and confirmation overlays in one call. Finds a close affordance by aria-label, by text such as Close, Skip, Not now or Got it, or by an x-shaped button. In the default non_critical scope, dialogs containing editable text fields are left alone so form data is preserved; aggressive dismisses everything. Returns what was dismissed and what was skipped.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -358,7 +358,7 @@ export const TOOLS = [
   },
   {
     name: 'browser_set_combobox',
-    description: 'Set value(s) on an autocomplete/combobox input. Handles the click → type query → wait for filtered listbox → click option flow as one MCP call. Supports multi-select (e.g., Languages on Meta Ads). Use when browser_select_option fails because options render lazily after typing.',
+    description: 'Set one or more values on an autocomplete or combobox input, handling the click, type, wait for the filtered list and select sequence in a single call. Supports multi-select fields that accumulate chips. Use when browser_select_option fails because options are rendered only after typing.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -374,7 +374,7 @@ export const TOOLS = [
   },
   {
     name: 'browser_drop_file',
-    description: 'Upload a file by finding a hidden <input type="file"> within a drag-drop zone\'s subtree (or parent up to 2 levels). Use when browser_upload_file fails because the dropzone has no visible file input. Returns clear error if no input is found anywhere — pure drop-zones without backing inputs require manual handling.',
+    description: 'Upload a file by locating the hidden file input inside a drag-and-drop zone, searching the target\'s subtree and up to two ancestor levels. Use when browser_upload_file cannot find a visible file input. Returns a clear error when no backing input exists anywhere.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -387,7 +387,7 @@ export const TOOLS = [
   },
   {
     name: 'browser_set_date',
-    description: 'Robustly set a date input — handles native <input type="date">, masked text inputs (e.g. MM/DD/YYYY), and calendar pickers (MUI, react-datepicker, AntD, Lexical/Meta). Tries native value-set, format-aware typing via Input.insertText, and ARIA-based picker navigation in sequence with read-back verification. Use instead of browser_fill when fill fails or for any input that opens a calendar widget.',
+    description: 'Set a date input. Handles native date inputs, masked text inputs such as MM/DD/YYYY, and calendar pickers including MUI, react-datepicker, AntD and Lexical. Tries a native value set, format-aware typing and picker navigation in turn, verifying the value after each. Use instead of browser_fill for any input that opens a calendar.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -400,7 +400,7 @@ export const TOOLS = [
   },
   {
     name: 'browser_handle_dialog',
-    description: 'Handle JavaScript alert(), confirm(), or prompt() dialogs. Call this BEFORE triggering the action that causes the dialog. Waits for the dialog to appear, then accepts or dismisses it.',
+    description: 'Handle a JavaScript alert, confirm or prompt dialog. Call before the action that triggers the dialog, then choose to accept or dismiss it and supply text for prompts.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -412,7 +412,7 @@ export const TOOLS = [
   },
   {
     name: 'browser_wait_for_network',
-    description: 'Wait for a network request to complete. Useful after clicking buttons that trigger API calls — ensures data is loaded before reading the page. Monitors real network traffic via Chrome DevTools Protocol.',
+    description: 'Wait for a network request matching a URL pattern to complete, and return its status and response body. Use after an action that triggers an API call. To inspect requests that have already happened, use browser_network_log.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -423,7 +423,7 @@ export const TOOLS = [
   },
   {
     name: 'browser_fetch',
-    description: 'Make an HTTP request from the extension background (NOT subject to CORS). Use this when page-context fetch would be blocked by CORS or CSP. Useful for API calls to Google, Stripe, Slack APIs while on their pages.',
+    description: 'Make an HTTP request from the extension background, which is not subject to the page\'s CORS restrictions. Use for API calls that page-context fetch would block.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -437,7 +437,7 @@ export const TOOLS = [
   },
   {
     name: 'browser_list_tabs',
-    description: 'List this session\'s tabs. Pass all:true to see EVERY tab open in the browser (across all windows) with its owner ("this-session" or "user"), window_id, and whether it can be automated — use that to find a tab the user already has open (logged-in dashboards, a half-filled form) and then browser_attach_tab to take it over.',
+    description: 'List the tabs belonging to this session. Pass all:true to list every open tab in the browser with its owner and window, which is how you find a tab to pass to browser_attach_tab.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -447,7 +447,7 @@ export const TOOLS = [
   },
   {
     name: 'browser_attach_tab',
-    description: 'Adopt an EXISTING browser tab into this session so every tool (click, fill, read_page, screenshot…) acts on it — including tabs the user opened and logged into. Get the id from browser_list_tabs({all:true}). Adopted tabs are protected: never auto-evicted, and never closed when the session ends. Pass group:false to leave the tab where it is instead of moving it into the session tab group.',
+    description: 'Attach an existing browser tab to this session so subsequent tools act on it, including tabs the user opened and signed into. Get the tab ID from browser_list_tabs with all:true. Attached tabs are not evicted and are not closed when the session ends. Pass group:false to leave the tab outside the session\'s tab group.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -459,7 +459,7 @@ export const TOOLS = [
   },
   {
     name: 'browser_detach_tab',
-    description: 'Release a tab from this session WITHOUT closing it — hands an adopted tab back to the user. Also detaches the debugger and removes it from the session tab group.',
+    description: 'Release a tab from this session without closing it, detaching the debugger and removing it from the session\'s tab group.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -471,7 +471,7 @@ export const TOOLS = [
   },
   {
     name: 'browser_get_cookies',
-    description: 'Get cookies for a specific domain.',
+    description: 'Get the cookies for a domain, returning name, value, domain and path for each.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -482,7 +482,7 @@ export const TOOLS = [
   },
   {
     name: 'browser_get_local_storage',
-    description: 'Read localStorage from the current page. Pass key for a specific value, or omit for all.',
+    description: 'Read localStorage for the current page. Pass a key for a single value, or omit it to return everything.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -511,7 +511,7 @@ export const TOOLS = [
   },
   {
     name: 'browser_set_local_storage',
-    description: 'Set a localStorage key-value pair on the current page.',
+    description: 'Set a localStorage key and value on the current page.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -523,7 +523,7 @@ export const TOOLS = [
   },
   {
     name: 'browser_console_logs',
-    description: 'Read the page\'s console history — captured from document_start, so messages logged BEFORE your first read are included, plus uncaught exceptions and unhandled promise rejections. Filter with pattern (regex) to avoid noise; only_errors:true for errors/exceptions only; clear:true to reset the buffer after reading.',
+    description: 'Read the page\'s console messages, captured from document start so entries logged before this call are included, along with uncaught exceptions and unhandled promise rejections. Filter with pattern, restrict to errors with only_errors, and reset the buffer with clear.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -536,7 +536,7 @@ export const TOOLS = [
   },
   {
     name: 'browser_ask_user',
-    description: 'Show an overlay dialog asking the user to perform an action or provide information (credentials, 2FA, CAPTCHA, OAuth consent). Can include input fields for the user to fill in. Returns user responses.',
+    description: 'Show a dialog in the page asking the user to act or to provide information such as credentials, a 2FA code or CAPTCHA help. Optional input fields are returned as values. Use whenever a secret or a human decision is needed rather than guessing.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -562,12 +562,12 @@ export const TOOLS = [
   },
   {
     name: 'browser_list_frames',
-    description: 'List all frames (iframes) in the current page with their URLs and indices.',
+    description: 'List the frames in the current page with their URLs and indices, for use with browser_select_frame.',
     inputSchema: { type: 'object', properties: {} },
   },
   {
     name: 'browser_select_frame',
-    description: 'Execute JavaScript in a specific iframe by frame index. Use browser_list_frames first to find the right index.',
+    description: 'Execute JavaScript inside a specific iframe, identified by its index from browser_list_frames.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -579,12 +579,12 @@ export const TOOLS = [
   },
   {
     name: 'browser_get_new_tab',
-    description: 'Get the most recently opened tab (useful after clicking links that open new tabs, OAuth popups, etc.).',
+    description: 'Get the most recently opened tab and add it to this session. Use after clicking a link or completing an OAuth step that opens a new window.',
     inputSchema: { type: 'object', properties: {} },
   },
   {
     name: 'browser_switch_tab',
-    description: 'Switch to a specific browser tab by ID. Get tab IDs from browser_list_tabs or browser_get_new_tab.',
+    description: 'Make one of this session\'s tabs the active tab, so subsequent actions apply to it.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -595,7 +595,7 @@ export const TOOLS = [
   },
   {
     name: 'browser_close_tab',
-    description: 'Close a browser tab by ID. Only tabs owned by the current session can be closed.',
+    description: 'Close one of this session\'s tabs. Closing the last tab does not end the session; the next navigation opens a new tab.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -606,7 +606,7 @@ export const TOOLS = [
   },
   {
     name: 'browser_upload_file',
-    description: 'Upload a file to a <input type="file"> element on the page. Uses Chrome Debugger API to set files programmatically — no dialog needed. For drag-drop zones without visible file input use browser_drop_file.',
+    description: 'Upload one or more files to a file input on the page, setting them programmatically so no native file dialog opens. For drop zones with no visible file input, use browser_drop_file.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -619,7 +619,7 @@ export const TOOLS = [
   },
   {
     name: 'browser_extract_token',
-    description: 'Navigate to a provider\'s API settings page so you can read its API token from the page.',
+    description: 'Open a provider\'s API settings page so its token can be read from the page. Returns the URL opened and where on that page the token is normally shown.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -630,7 +630,7 @@ export const TOOLS = [
   },
   {
     name: 'browser_solve_captcha',
-    description: 'Detect and solve CAPTCHAs on the current page. Auto-detects reCAPTCHA v2/v3, hCaptcha, Cloudflare Turnstile, and FunCaptcha. Tries auto-click first (often clears reCAPTCHA v2 when signed into Google), then returns a screenshot for AI vision analysis, then falls back to asking the user. Returns detection info and solving status.',
+    description: 'Detect and attempt to solve CAPTCHAs on the page. Recognises reCAPTCHA v2 and v3, hCaptcha, Cloudflare Turnstile and FunCaptcha. Can click the reCAPTCHA checkbox, click specific grid cells for image challenges, or hand the challenge to the user.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -645,7 +645,7 @@ export const TOOLS = [
   },
   {
     name: 'browser_about',
-    description: 'Returns Browser MCP info and pre-filled URLs the user can click to submit feature wishes, share use-cases, or report bugs. Call this PROACTIVELY whenever the user (a) mentions a feature they wish existed ("I wish browser-mcp could...", "it would be nice if..."), (b) says something is missing, broken, or unexpected, (c) asks how Browser MCP works or who maintains it, or (d) describes something cool they built with browser-mcp. Pass intent="wish" | "use_case" | "bug" | "info" plus an optional title and body, and offer the returned submit_url to the user. Browser MCP is community-shaped — this tool is how the user contributes back.',
+    description: 'Return information about Browser MCP along with a pre-filled URL the user can open to submit a feature request, share a use-case or report a bug. Pass intent as wish, use_case, bug or info, with an optional title and body.',
     inputSchema: {
       type: 'object',
       properties: {
