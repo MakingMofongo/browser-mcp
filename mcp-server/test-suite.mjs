@@ -213,6 +213,44 @@ async function suite() {
   check('structural divergence pauses with the queue intact',
     paused.paused_at_row === 0 && paused.pending === 2, JSON.stringify({ at: paused.paused_at_row, pending: paused.pending }));
 
+  // ── health carries the two reasons a page stops responding that aren't faults ──
+  await group('health reports what is actually blocking', async () => {
+    await send('navigate', { url: 'https://example.com' });
+    await setup(`document.body.innerHTML = '<div class="h-captcha" style="width:300px;height:80px"></div>'`);
+    const h = await send('health', {});
+    check('health names a CAPTCHA rather than reporting all clear',
+      h.captcha?.types?.includes('hCaptcha') && /CAPTCHA/.test(h.hint || ''), JSON.stringify(h.captcha));
+
+    await send('navigate', { url: 'https://example.com' });
+    const clean = await send('health', {});
+    check('health does not invent a CAPTCHA on an ordinary page',
+      !clean.captcha && !clean.auth_wall && clean.ready === true, JSON.stringify({ c: clean.captcha, a: clean.auth_wall }));
+  });
+
+  // ── clipboard: one tool, and never the content ──
+  await group('clipboard', async () => {
+    await send('navigate', { url: `${BASE}/login` });
+    await setup(`document.querySelector('#username').value = 'S3cr3t-Value-42'`);
+    const copied = await send('clipboard', { action: 'copy', selector: '#username' });
+    const stats = await send('clipboard', { action: 'inspect' });
+    check('copy reports only a length, never the value',
+      copied.copied_chars === 15 && !JSON.stringify(copied).includes('S3cr3t'), JSON.stringify(copied));
+    check('inspect describes the shape without the content',
+      stats.length === 15 && stats.looks_like_uuid === false && !JSON.stringify(stats).includes('S3cr3t'), JSON.stringify(stats));
+    const pasted = await send('clipboard', { action: 'paste', selector: '#password' });
+    const landed = await send('execute_script', { code: "document.querySelector('#password').value" });
+    check('paste puts the value in the field without returning it',
+      landed.result === 'S3cr3t-Value-42' && pasted.pasted_chars === 15 && !JSON.stringify(pasted).includes('S3cr3t'),
+      JSON.stringify(pasted));
+    const bad = await send('clipboard', { action: 'nonsense' });
+    check('an unknown clipboard action says so instead of guessing',
+      bad.ok === false && /copy, paste, inspect or clear/.test(bad.error || ''), bad.error);
+    await send('clipboard', { action: 'clear' });
+    const empty = await send('clipboard', { action: 'paste', selector: '#username' });
+    check('pasting with nothing held fails instead of writing an empty value',
+      empty.ok === false && /Copy a value first/.test(empty.error || ''), empty.error);
+  });
+
   // An auth wall part way through a run is not a broken flow. It must be told
   // apart from structural divergence, because the two need opposite responses:
   // re-record versus sign in once and carry on.

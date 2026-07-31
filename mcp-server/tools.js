@@ -7,7 +7,7 @@
 export const TOOLS = [
   {
     name: 'browser_batch',
-    description: 'Execute a sequence of browser tool calls in one round trip. Actions run sequentially and stop at the first error. Each item is {name, params}, where name is a tool name with or without the browser_ prefix and params matches that tool\'s normal input. Screenshots taken inside a batch are returned as images. Batches cannot be nested, and ask_user and solve_captcha are not available inside them.',
+    description: 'Execute a sequence of browser tool calls in one round trip. Actions run sequentially and stop at the first error. Each item is {name, params}, where name is a tool name with or without the browser_ prefix and params matches that tool\'s normal input. Screenshots taken inside a batch are returned as images. Batches cannot be nested, and ask_user is not available inside them.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -210,17 +210,6 @@ export const TOOLS = [
     },
   },
   {
-    name: 'browser_triple_click',
-    description: 'Triple-click an element to select its entire line or paragraph, typically before replacing text in a rich text editor. Returns the text that was selected.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        screenshot: { type: 'string', enum: ['anomaly', 'always'], description: 'Attach an image cropped to the target element. "anomaly" only sends one when the action did not take effect, which is when pixels tell you something the text result cannot.' },
-        observe: { type: 'boolean', description: 'Also report what changed on the page after the action: text that appeared or disappeared, dialogs opened, errors shown, navigation. Cheaper than a screenshot.' }, selector: { type: 'string', description: 'CSS, text, or ref selector' } },
-      required: ['selector'],
-    },
-  },
-  {
     name: 'browser_resize_window',
     description: 'Resize the browser window. Returns the resulting window dimensions and the inner viewport size. Useful for testing responsive layouts or fitting more of a long page on screen.',
     inputSchema: {
@@ -234,7 +223,7 @@ export const TOOLS = [
   },
   {
     name: 'browser_health',
-    description: 'Check the automation channels for the active tab: whether script injection works, whether the debugger is attached, which tab is active and how many tabs the session holds. Use to diagnose failures in click, fill or key presses.',
+    description: 'Check the automation channels for the active tab: whether script injection works, whether the debugger is attached, which tab is active and how many tabs the session holds. Also reports a CAPTCHA or a sign-in challenge when one is present, since those stop a flow without anything being broken. Use to diagnose failures in click, fill or key presses.',
     inputSchema: { type: 'object', properties: {} },
   },
   {
@@ -298,33 +287,18 @@ export const TOOLS = [
     },
   },
   {
-    name: 'browser_copy_to_clipboard',
-    description: 'Copy an element\'s value, text or a named attribute to the system clipboard without returning the content — only the character count comes back. Use to move a credential from a page into a field or a CLI without it entering the conversation.',
+    name: 'browser_clipboard',
+    description: 'Carry a value from one page to another without it entering the conversation. Copy takes an element\'s value, text or a named attribute and holds it inside the browser; paste writes it into a form field; inspect reports only the shape of what is held — length, whether it is padded with whitespace, whether it looks like a UUID or a URL; clear discards it. No action returns the content, which is what makes this the way to move a credential or a one-time code through a flow. The value is held in the browser rather than the system clipboard, so no other application can read it and it does not outlive the browser session.',
     inputSchema: {
       type: 'object',
       properties: {
-        selector: { type: 'string', description: 'CSS selector of the element whose value/text to copy' },
-        attribute: { type: 'string', description: 'Optional: copy this attribute instead of value/textContent' },
+        action: { type: 'string', enum: ['copy', 'paste', 'inspect', 'clear'], description: 'copy from an element, paste into a field, inspect what is held, or clear it' },
+        selector: { type: 'string', description: 'CSS, text, or ref selector. Required for copy and paste.' },
+        attribute: { type: 'string', description: 'When copying, take this attribute instead of the value or text' },
+        trim: { type: 'boolean', description: 'When pasting, strip surrounding whitespace first (default: true)' },
       },
-      required: ['selector'],
+      required: ['action'],
     },
-  },
-  {
-    name: 'browser_paste_from_clipboard',
-    description: 'Paste the system clipboard into a form field without returning the content — only the character count comes back. Pairs with browser_copy_to_clipboard for moving credentials between pages.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        selector: { type: 'string', description: 'CSS or text selector for the target input field' },
-        trim: { type: 'boolean', description: 'Trim surrounding whitespace before pasting (default: true)' },
-      },
-      required: ['selector'],
-    },
-  },
-  {
-    name: 'browser_clipboard_stats',
-    description: 'Inspect the shape of the system clipboard without exposing its content: length, trimmed length, whether it contains whitespace, and whether it looks like a UUID or a URL. Use to confirm a copy landed before pasting.',
-    inputSchema: { type: 'object', properties: {} },
   },
   {
     name: 'browser_double_click',
@@ -334,17 +308,6 @@ export const TOOLS = [
       properties: {
         screenshot: { type: 'string', enum: ['anomaly', 'always'], description: 'Attach an image cropped to the target element. "anomaly" only sends one when the action did not take effect, which is when pixels tell you something the text result cannot.' },
         observe: { type: 'boolean', description: 'Also report what changed on the page after the action: text that appeared or disappeared, dialogs opened, errors shown, navigation. Cheaper than a screenshot.' },
-        selector: { type: 'string', description: 'CSS or text selector' },
-      },
-      required: ['selector'],
-    },
-  },
-  {
-    name: 'browser_right_click',
-    description: 'Right-click an element to open a page-level context menu. Chrome\'s own native context menu cannot be opened this way; only menus rendered by the page itself will appear.',
-    inputSchema: {
-      type: 'object',
-      properties: {
         selector: { type: 'string', description: 'CSS or text selector' },
       },
       required: ['selector'],
@@ -722,15 +685,5 @@ export const TOOLS = [
     },
   },
 
-  {
-    name: 'browser_solve_captcha',
-    description: 'Detect CAPTCHAs on the page and report the type and whether a challenge is currently visible. Recognises reCAPTCHA v2 and v3, hCaptcha, Cloudflare Turnstile and FunCaptcha. Solving is not supported: when one is blocking the flow, tell the user and let them complete it in the browser.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        action: { type: 'string', enum: ['detect'], description: 'Only detect is supported (default)' },
-      },
-    },
-  },
 
 ];

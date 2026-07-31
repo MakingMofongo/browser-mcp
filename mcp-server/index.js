@@ -287,15 +287,12 @@ If the user runs the extension in several Chrome profiles or machines, browser_l
 - browser_press_key("ArrowDown") — navigate dropdowns
 - browser_press_key("a", ctrl=true) — select all
 
-## CAPTCHA handling
-Use browser_solve_captcha to detect and solve CAPTCHAs automatically:
-1. Call browser_solve_captcha() — detects CAPTCHA type on page
-2. If reCAPTCHA v2 checkbox found → call browser_solve_captcha(action="click_checkbox") — auto-clicks; often passes when signed into Google
-3. If image challenge appears → call browser_screenshot, analyze the grid visually, then call browser_solve_captcha(action="click_grid", cells=[2,5,7]) with the correct cell indices
-4. If all else fails → call browser_solve_captcha(action="ask_human") to show overlay to user
-5. After solving, retry the action that was blocked
-
-For image grid challenges: cells are 0-indexed, left-to-right, top-to-bottom. A 3x3 grid has cells 0-8. A 4x4 grid has cells 0-15.
+## CAPTCHAs and sign-in challenges
+browser_health reports a CAPTCHA when one is on the page, including its type and whether a
+challenge is currently showing. There is no way to solve it from here — a CAPTCHA exists to
+establish a person is present, so tell the user what is blocking the flow and let them clear it
+in the browser, then carry on. The same applies to a one-time code or an identity-provider
+redirect that appears mid-flow.
 
 ## OAuth popups
 - OAuth popups (Google, Microsoft, GitHub, Slack, HubSpot) are automatically intercepted and added to your session's tab group
@@ -369,16 +366,12 @@ mcpServer.setRequestHandler(CallToolRequestSchema, async (request) => {
       browser_set_cookies: 'set_cookies',
       browser_set_local_storage: 'set_local_storage',
       browser_console_logs: 'console_logs',
-      browser_solve_captcha: 'solve_captcha',
       browser_set_date: 'set_date',
       browser_dismiss_overlays: 'dismiss_overlays',
       browser_set_combobox: 'set_combobox',
       browser_drop_file: 'drop_file',
-      browser_copy_to_clipboard: 'copy_to_clipboard',
-      browser_paste_from_clipboard: 'paste_from_clipboard',
-      browser_clipboard_stats: 'clipboard_stats',
+      browser_clipboard: 'clipboard',
       browser_double_click: 'double_click',
-      browser_right_click: 'right_click',
       browser_click_xy: 'click_xy',
       browser_reattach_debugger: 'reattach_debugger',
       browser_batch: 'batch',
@@ -396,7 +389,6 @@ mcpServer.setRequestHandler(CallToolRequestSchema, async (request) => {
       browser_wait_idle: 'wait_idle',
       browser_network_log: 'network_log',
       browser_drag: 'drag',
-      browser_triple_click: 'triple_click',
       browser_resize_window: 'resize_window',
       browser_attach_tab: 'attach_tab',
       browser_detach_tab: 'detach_tab',
@@ -430,7 +422,7 @@ mcpServer.setRequestHandler(CallToolRequestSchema, async (request) => {
       return { content: [{ type: 'text', text: `Unknown tool: ${name}` }], isError: true };
     }
 
-    const timeout = method === 'solve_captcha' ? 60000 :
+    const timeout =
                     method === 'batch' ? 180000 :
                     method === 'extract' ? 120000 :
                     method === 'replay' ? 300000 :
