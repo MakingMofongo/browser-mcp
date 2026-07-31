@@ -85,6 +85,30 @@ async function bench() {
   }
   const total = rows.reduce((a, b) => a + b.ms, 0);
   console.log(`\n  ${rows.length} calls, ${total}ms total, ${Math.round(total / rows.length)}ms mean\n`);
+
+  // Fails rather than merely printing. Every stall this project has had looked
+  // exactly like this list and stayed invisible until somebody happened to read
+  // it: clicks sat at 5.4 seconds each for weeks, and scroll and drag hung
+  // outright. Nothing in the code looked slow — timing was the only thing that
+  // ever surfaced any of it, so timing that cannot fail is a report nobody is
+  // obliged to act on.
+  //
+  // The threshold is deliberately loose. It is not defending a few hundred
+  // milliseconds; it is catching the difference between a cost and a wait on
+  // something that is never going to answer.
+  const STALL_MS = 2000;
+  const stalls = rows.filter((r) => r.ms >= STALL_MS);
+  const threw = rows.filter((r) => /THREW|timeout/i.test(r.note));
+  if (stalls.length) {
+    console.error(`${stalls.length} tool(s) took ${STALL_MS}ms or more, which is a stall rather than a cost:`);
+    for (const r of stalls) console.error(`  ${r.label} ${r.ms}ms ${r.note}`);
+    console.error('That is usually input waiting on something that will not answer — a compositor');
+    console.error('for a window that is not in front, or a command the browser never acknowledges.');
+  }
+  if (threw.length) {
+    console.error(`${threw.length} tool(s) did not complete: ${threw.map((r) => r.label).join(', ')}`);
+  }
+  if (stalls.length || threw.length) process.exit(1);
 }
 
 const PORTS = Array.from({ length: 20 }, (_, i) => 9876 + i);
