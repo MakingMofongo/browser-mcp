@@ -220,6 +220,12 @@ async function getSessionTab(port) {
   const consider = (tab) => {
     if (!tab) return false;
     if (tab.url.startsWith('chrome://')) return false;
+    // A page belonging to an extension — ours or anyone's — cannot be driven:
+    // Chrome refuses to attach a debugger to another extension's page, and every
+    // action on it fails with an attach error that reads like debugger contention
+    // rather than what it is. Picking one is how a session ends up unable to do
+    // anything while looking like it has a perfectly good tab.
+    if (tab.url.startsWith('chrome-extension://') || tab.url.startsWith('edge://') || tab.url.startsWith('devtools://')) return false;
     if (tab.url.startsWith('about:')) { if (!blankFallback) blankFallback = tab; return false; }
     return true;
   };
@@ -1049,6 +1055,9 @@ function bmcpFillOp(op, selOrExpected, TAG, extra) {
       found: true, isCE: !!el.isContentEditable, tag: el.tagName,
       type: (el.type || '').toLowerCase(), before: String(before),
       focused: active === el,
+      // Whether the document has focus at all, which decides whether typing can be
+      // trusted to land where it is aimed.
+      docFocused: document.hasFocus(),
       focus_landed_on: active === el ? null : ((active && (active.tagName + (active.name ? '[name=' + active.name + ']' : ''))) || 'none'),
       x: r.x + r.width / 2, y: r.y + r.height / 2,
       inShadow: el.getRootNode() !== document,
@@ -1172,7 +1181,19 @@ async function fillElementDeep(tabId, selector, value, opts = {}) {
   // 2. Trusted typing ONLY when focus verifiably landed on our element. Otherwise
   //    keystrokes would go to whatever else holds focus — the Gmail failure.
   let method = null, typedTrusted = false;
-  if (info.focused && !info.isCE) {
+  // Only when the document actually has focus. In a window that does not, calling
+  // focus() on an element sets document.activeElement and fires no focus event at
+  // all — so a page that moves focus away has not done it yet, and the check made
+  // beforehand passes honestly. Delivering the keystrokes is itself what gives the
+  // document focus, which runs those pending handlers and moves focus as the text
+  // arrives, putting it in whatever the page preferred. No check made in advance
+  // can see that coming, because the act of typing is what causes it.
+  //
+  // So this is not guarded against, it is avoided: with no document focus the
+  // value goes in through the setter, which writes to the element we tagged and
+  // cannot be redirected. Nothing is lost — real keystrokes were not being
+  // delivered to an unfocused window anyway.
+  if (info.focused && info.docFocused && !info.isCE) {
     try {
       await debuggerAttach(tabId);
       // Re-confirm focus immediately before typing — the gap between the focus
