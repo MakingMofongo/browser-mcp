@@ -10,8 +10,9 @@
  * asserting on ok:true would miss precisely the bugs worth catching.
  */
 import { WebSocketServer } from 'ws';
+import { startFixtures } from './fixtures.mjs';
 
-const BASE = 'https://the-internet.herokuapp.com';
+let BASE = ''; // set from the local fixture server before the suite runs
 const results = [];
 let ws = null, cmdId = 0, hello = null;
 const pending = new Map();
@@ -303,6 +304,51 @@ async function suite() {
     check('select_frame runs code inside the frame',
       inFrame.ok === true && /content goes here/i.test(String(inFrame.result || '')), JSON.stringify(inFrame.result));
     check('list_frames sees the nested frame', frames2.frames?.length >= 2, String(frames2.frames?.length));
+
+    await send('navigate', { url: `${BASE}/login` });
+    // batch is how most real work is issued, so its failure mode matters as much
+    // as its success one: it must stop at the first error rather than run on.
+    const bat = await send('batch', { actions: [
+      { name: 'navigate', params: { url: `${BASE}/login` } },
+      { name: 'fill', params: { selector: '#username', value: 'batched' } },
+      { name: 'execute_script', params: { code: "document.querySelector('#username').value" } },
+    ] });
+    check('batch runs each action and carries the results back',
+      bat.completed === 3 && bat.results?.[2]?.result?.result === 'batched', JSON.stringify(bat.results?.[2]?.result));
+    const bad = await send('batch', { actions: [
+      { name: 'fill', params: { selector: '#nope-not-here', value: 'x' } },
+      { name: 'navigate', params: { url: 'https://example.com' } },
+    ] });
+    const stayed = await send('execute_script', { code: 'location.pathname' });
+    check('batch stops at the first failure instead of running on',
+      bat.completed === 3 && bad.completed < 2 && stayed.result === '/login',
+      JSON.stringify({ completed: bad.completed, at: stayed.result }));
+
+    const xy = await send('click_xy', { x: 200, y: 200 });
+    check('click_xy reports whether the click reached the page', xy.ok === true && xy.verified === true, xy.click_path);
+
+    const re = await send('reattach_debugger', {});
+    check('reattach_debugger reports the attachment state it achieved',
+      re.ok === true && typeof re.now_attached === 'boolean', JSON.stringify({ was: re.was_attached, now: re.now_attached }));
+
+    await send('navigate', { url: `${BASE}/dynamic_loading/2` });
+    await send('click', { selector: '#start button' });
+    const netWait = await send('wait_for_network', { timeout: 6000 });
+    check('wait_for_network returns a verdict rather than hanging',
+      typeof netWait.ok === 'boolean', JSON.stringify(netWait).slice(0, 80));
+
+    const ck = await send('get_cookies', { domain: 'the-internet.herokuapp.com' });
+    check('get_cookies returns cookies for the domain', Array.isArray(ck.cookies), String(ck.cookies?.length));
+    await send('set_local_storage', { key: 'bmcp_cov', value: 'yes' });
+    const lsv = await send('get_local_storage', { key: 'bmcp_cov' });
+    check('get_local_storage reads back what set_local_storage wrote', lsv.value === 'yes', String(lsv.value));
+
+    // attach_tab/detach_tab move a tab in and out of this session's ownership.
+    const extra = await send('get_new_tab', {});
+    const det = await send('detach_tab', { tab_id: extra.id });
+    const att = await send('attach_tab', { tab_id: extra.id });
+    check('detach_tab and attach_tab move a tab out of and back into the session',
+      det.ok === true && att.ok === true, JSON.stringify({ det: det.ok, att: att.ok }));
 
     await send('navigate', { url: `${BASE}/login` });
     const dd = await send('drop_file', { selector: '#username', files: ['C:/Projects/browser-mcp/package.json'] });
@@ -659,7 +705,11 @@ function listen(i = 0) {
         if (hello) return;
         hello = m.instance;
         await new Promise(r => setTimeout(r, 2000)); // let the worker settle
+        const fixtures = await startFixtures();
+        BASE = fixtures.base;
+        console.log(`fixtures served from ${BASE}`);
         try { await suite(); } catch (e) { check('suite aborted', false, e.message); }
+        fixtures.server.close();
         const passed = results.filter(r => r.pass).length;
         console.log(`\n${passed}/${results.length} passed`);
         const failed = results.filter(r => !r.pass);

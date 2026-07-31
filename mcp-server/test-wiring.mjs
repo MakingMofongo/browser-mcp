@@ -56,6 +56,33 @@ for (const guard of ["batch cannot be nested", "ask_user"]) {
 const bgCopy = readFileSync(new URL('./extension/background.js', import.meta.url), 'utf8');
 if (bgCopy !== bgSrc) fail('mcp-server/extension/background.js out of sync with extension/background.js');
 
+// 7. Every tool is exercised by the live suite.
+//
+// Five tools shipped having never once worked — clipboard, upload_file and
+// select_frame did nothing at all, scroll and drag hung for ever — and every one
+// of them was found within minutes of a first call. Nothing was subtly wrong with
+// any of them; they had simply never been run. So the rule is not "write good
+// tests", it is that a tool with no caller in the suite does not ship.
+//
+// Anything genuinely unreachable from a headless run belongs below WITH a reason.
+// An entry here is a claim that the tool cannot be tested, not that testing it was
+// inconvenient, and it is the first place to look when one of these breaks.
+const suiteSrc = readFileSync(new URL('./test-suite.mjs', import.meta.url), 'utf8');
+const UNTESTABLE = {
+  browser_list_browsers: 'needs a second browser connected to mean anything',
+  browser_select_browser: 'needs a second browser connected to mean anything',
+};
+for (const t of TOOLS) {
+  const m = t.name.replace(/^browser_/, '');
+  const called = suiteSrc.includes(`send('${m}'`) || suiteSrc.includes(`"${m}"`) || suiteSrc.includes(`name: '${m}'`);
+  if (!called && !UNTESTABLE[t.name]) {
+    fail(`tool ${t.name} is never called by test-suite.mjs — add a check, or add it to UNTESTABLE with the reason it cannot be`);
+  }
+}
+for (const name of Object.keys(UNTESTABLE)) {
+  if (!TOOLS.some(t => t.name === name)) fail(`UNTESTABLE lists ${name}, which is no longer a tool — remove it`);
+}
+
 console.log(failures === 0
   ? `PASS: ${TOOLS.length} tools, ${Object.keys(mapEntries).length} routed methods, all wired.`
   : `${failures} failure(s)`);
