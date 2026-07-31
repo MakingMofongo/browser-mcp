@@ -15,9 +15,14 @@
  * It takes no tabs and touches no pages.
  */
 import { WebSocketServer } from 'ws';
-import { requireFreeBrowser } from './browser-is-free.mjs';
+import { requireFreeBrowser, warnIfOthersConnected } from './browser-is-free.mjs';
 
 requireFreeBrowser('test-heartbeat-live.mjs', 'holds a connection to the extension for ninety seconds and will disconnect a session that lands on the same port');
+// This one deliberately stops answering, to watch the extension give up on a dead
+// connection. Another session connected at the same time is answering normally on
+// its own socket, which is fine — but if this ever reads as "it never dropped",
+// a second connection keeping the offscreen document busy is worth knowing about.
+await warnIfOthersConnected('test-heartbeat-live.mjs');
 
 const results = [];
 const check = (name, pass, detail = '') => {

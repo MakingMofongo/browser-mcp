@@ -214,6 +214,15 @@ export function startFixtures() {
           const next = n < 3 ? `<a id="next" href="/records/${n + 1}">Next</a>` : '';
           return html(page(`Records ${n}`, `<h3>Records page ${n}</h3><div id="list">${rows}</div>${next}`));
         }
+        // A JSON response of a requested size, for filling the per-tab body budget.
+        // The budget is megabytes, so proving that a full tab still captures its
+        // newest response needs bulk that no other fixture produces.
+        case '/bulk': {
+          const q = new URLSearchParams(req.url.split('?')[1] || '');
+          const bytes = Math.min(Number(q.get('bytes') || 250_000), 1_000_000);
+          res.writeHead(200, { 'content-type': 'application/json' });
+          return res.end(JSON.stringify({ tag: q.get('tag') || 'bulk', pad: 'x'.repeat(bytes) }));
+        }
         case '/status_codes': return html(STATUS_CODES, 404);
         // What a server's own error page looks like: the status first, little else.
         case '/server_error': return html(page('503 Service Temporarily Unavailable', '<h1>503 Service Temporarily Unavailable</h1>'), 503);

@@ -225,14 +225,23 @@ async function getSessionTab(port) {
   let blankFallback = null;
   const consider = (tab) => {
     if (!tab) return false;
-    if (tab.url.startsWith('chrome://')) return false;
+    // Chrome reports an empty url for a tab that is still committing a navigation,
+    // and pendingUrl is where the destination lives until it does. An empty string
+    // passes every test below, so a tab caught mid-navigation was adopted on the
+    // strength of knowing nothing about it — which is how a session ended up holding
+    // another extension's page and failing every action with an attach error that
+    // read like debugger contention. Not knowing what a tab is has to disqualify it,
+    // the same as knowing it is unusable.
+    const url = tab.url || tab.pendingUrl || '';
+    if (!url) return false;
+    if (url.startsWith('chrome://')) return false;
     // A page belonging to an extension — ours or anyone's — cannot be driven:
     // Chrome refuses to attach a debugger to another extension's page, and every
     // action on it fails with an attach error that reads like debugger contention
     // rather than what it is. Picking one is how a session ends up unable to do
     // anything while looking like it has a perfectly good tab.
-    if (tab.url.startsWith('chrome-extension://') || tab.url.startsWith('edge://') || tab.url.startsWith('devtools://')) return false;
-    if (tab.url.startsWith('about:')) { if (!blankFallback) blankFallback = tab; return false; }
+    if (url.startsWith('chrome-extension://') || url.startsWith('edge://') || url.startsWith('devtools://')) return false;
+    if (url.startsWith('about:')) { if (!blankFallback) blankFallback = tab; return false; }
     return true;
   };
 
@@ -386,8 +395,18 @@ async function debuggerAttach(tabId) {
     if (attempt >= 1) { try { await chrome.debugger.detach({ tabId }); } catch {} }
     if (attempt < 5) await new Promise(r => setTimeout(r, 200 + attempt * 300));
   }
+  // What the tab actually is, not just its number. This error named a tab id and a
+  // Chrome message, and the message "cannot access a chrome-extension:// URL of
+  // different extension" does not say WHICH page — so working out how a session
+  // came to be pointed at one meant guessing, twice, wrongly. The URL is the whole
+  // answer and it was one call away.
+  let what = '';
+  try {
+    const t = await chrome.tabs.get(tabId);
+    what = ` The tab is at ${t.url || t.pendingUrl || '(no readable url)'}${t.title ? ` — "${t.title}"` : ''}.`;
+  } catch { what = ' The tab no longer exists.'; }
   throw new Error(
-    `Debugger attach failed after 6 force-grab attempts (tab ${tabId}). Last: ${lastMsg}. ` +
+    `Debugger attach failed after 6 force-grab attempts (tab ${tabId}). Last: ${lastMsg}.${what} ` +
     `Chrome allows ONE debugger client per tab — check for another automation extension ` +
     `(e.g. Claude in Chrome) or an open DevTools window on this tab, then call browser_reattach_debugger. ` +
     `Note: interactive tools still work via the synthetic fallback; only isTrusted=true is lost.`
@@ -430,11 +449,66 @@ const NET_MAX = 300;
 const NET_BODY_MAX = 200_000;      // per response
 const NET_BODY_BUDGET = 4_000_000; // per tab, so a chatty page cannot grow without bound
 
+// A fingerprint of the source actually running, as opposed to the version it calls
+// itself. Editing a file and copying it into place changes nothing in Chrome until
+// the extension is reloaded, so a test run after a sync-without-reload exercises the
+// old code and passes or fails for reasons that have nothing to do with the edit.
+// That happened twice in one evening here and cost two wrong diagnoses, because
+// nothing anywhere compared what was running against what was on disk. The version
+// number cannot answer this — it only moves on release, not on every edit.
+const FINGERPRINT_FILES = [
+  'manifest.json', 'background.js', 'console-capture.js',
+  'offscreen.js', 'heartbeat-policy.js', 'popup.js',
+];
+let sourceFingerprint = null;
+async function computeFingerprint() {
+  if (sourceFingerprint) return sourceFingerprint;
+  const hex = (buf, n) => [...new Uint8Array(buf)].slice(0, n).map(b => b.toString(16).padStart(2, '0')).join('');
+  const sha = async (s) => crypto.subtle.digest('SHA-256', new TextEncoder().encode(s));
+  const parts = [];
+  for (const f of FINGERPRINT_FILES) {
+    try {
+      const text = await (await fetch(chrome.runtime.getURL(f))).text();
+      parts.push(`${f}:${text.length}:${hex(await sha(text), 4)}`);
+    } catch {
+      parts.push(`${f}:absent`);
+    }
+  }
+  sourceFingerprint = hex(await sha(parts.join('|')), 8);
+  return sourceFingerprint;
+}
+
 function netBodyBytes(tabId) {
   const buf = networkLogs.get(tabId) || [];
   let n = 0;
   for (const e of buf) n += e.body ? e.body.length : 0;
   return n;
+}
+
+// Make room for a body that is about to be captured, by dropping the oldest ones.
+//
+// The budget used to be a hard stop: once a tab had accumulated its 4MB, capture
+// simply ceased for the life of that tab. That inverts what anyone wants — the
+// responses worth reading are the ones a caller has just triggered, and those were
+// exactly the ones being refused while bodies from ten minutes ago sat there
+// keeping them out. A long-lived session tab reaches this state quietly and then
+// never captures another body.
+//
+// The entries stay; only the bodies go, so the log still shows what was requested.
+function makeRoomForBody(tabId) {
+  const buf = networkLogs.get(tabId) || [];
+  let bytes = netBodyBytes(tabId);
+  if (bytes < NET_BODY_BUDGET) return 0;
+  let freed = 0;
+  for (const e of buf) { // oldest first
+    if (bytes < NET_BODY_BUDGET) break;
+    if (e.body == null) continue;
+    bytes -= e.body.length;
+    delete e.body; delete e.body_bytes; delete e.body_truncated;
+    e.body_note = 'body dropped to make room for newer responses; re-issue the request to read it';
+    freed++;
+  }
+  return freed;
 }
 
 function netBuf(tabId) {
@@ -459,7 +533,16 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
     if (buf.length > NET_MAX) buf.splice(0, buf.length - NET_MAX);
   } else if (method === 'Network.responseReceived') {
     const e = buf.find(x => x.id === params.requestId);
-    if (e) { e.status = params.response?.status; e.mime = params.response?.mimeType; }
+    if (e) {
+      e.status = params.response?.status;
+      e.mime = params.response?.mimeType;
+      // The authoritative resource type. The one on requestWillBeSent is optional in
+      // the protocol and is sent before any response exists; when it is absent, a
+      // fetch returning HTML looks like a plain document to the body-capture rule
+      // below and its body is skipped, leaving an entry indistinguishable from a
+      // response that had none.
+      if (params.type) e.type = params.type;
+    }
   } else if (method === 'Network.loadingFinished' || method === 'Network.loadingFailed') {
     const e = buf.find(x => x.id === params.requestId);
     if (e) {
@@ -472,7 +555,8 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
       // the page already fetched. Bodies are held but only returned on request.
       const isData = e.type === 'XHR' || e.type === 'Fetch' ||
         (e.mime && /json|javascript|text\/plain|xml/i.test(e.mime));
-      if (method === 'Network.loadingFinished' && isData && netBodyBytes(tabId) < NET_BODY_BUDGET) {
+      if (method === 'Network.loadingFinished' && isData) {
+        makeRoomForBody(tabId);
         chrome.debugger.sendCommand({ tabId }, 'Network.getResponseBody', { requestId: params.requestId })
           .then((r) => {
             if (!r || r.body == null) return;
@@ -481,8 +565,16 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
             e.body_bytes = s.length;
             e.body = s.length > NET_BODY_MAX ? s.slice(0, NET_BODY_MAX) : s;
             if (s.length > NET_BODY_MAX) e.body_truncated = s.length;
+            delete e.body_note; // an earlier eviction note no longer describes this entry
           })
-          .catch(() => { /* body already evicted from Chrome's cache */ });
+          // Says which failure it was. This was a bare catch on the assumption that
+          // the body had been evicted, and that assumption then stood in for every
+          // reason the call can fail — leaving an entry that looks exactly like a
+          // response that never had a body. It cost a release gate and two wrong
+          // diagnoses before the error itself was ever read.
+          .catch((err) => {
+            e.body_note = `body not retrieved: ${String(err?.message || err).split('\n')[0]}`;
+          });
       }
     }
   }
@@ -6261,7 +6353,14 @@ async function dispatchCore(port, method, params) {
 
     case 'network_log': {
       const tab = await getSessionTab(port);
-      await debuggerAttach(tab.id).catch(() => {}); // ensures Network.enable ran
+      // Bodies are captured through the debugger, so a failed attach means there
+      // are none to be had — and swallowing that returned entries without bodies,
+      // which reads as "these responses had no body" rather than "nothing was
+      // recording them". Asking for bodies and being quietly given none is the
+      // shape of every other silence in this codebase, and it made a failing check
+      // give no clue why.
+      let attachFailed = null;
+      await debuggerAttach(tab.id).catch((e) => { attachFailed = String(e?.message || e).split('\n')[0]; });
       const buf = networkLogs.get(tab.id) || [];
       const pat = params.url_pattern || '';
       // Other extensions' content scripts fetch their own assets through the page,
@@ -6313,8 +6412,12 @@ async function dispatchCore(port, method, params) {
       if (params.clear) networkLogs.set(tab.id, []);
       return {
         requests: out, total_matched: total, buffered: buf.length,
+        ...(attachFailed ? {
+          recording: false,
+          note: `Not recording this tab: ${attachFailed}. Anything below was captured earlier; nothing new is being added, and no response bodies are available. Another debugger client — DevTools, or a second extension — is the usual reason.`,
+        } : {}),
         ...(params.include_body ? {} : { hint: 'Entries marked has_body carry a captured response; pass include_body:true to read them.' }),
-        ...(buf.length === 0 ? { note: 'Empty — recording starts when the debugger attaches to a tab. Reload the page to capture its full load sequence.' } : {}),
+        ...(buf.length === 0 && !attachFailed ? { note: 'Empty — recording starts when the debugger attaches to a tab. Reload the page to capture its full load sequence.' } : {}),
       };
     }
 
@@ -7781,6 +7884,8 @@ async function dispatchCore(port, method, params) {
         // One machine here sat on a version from before a week of work without
         // anything ever saying so.
         extension_version: chrome.runtime.getManifest().version,
+        // And which source, which the version cannot tell you between releases.
+        source_fingerprint: await computeFingerprint(),
         // An install with no update address will never update, whatever the
         // channel publishes, and nothing about it looks wrong from the outside —
         // it answers every command while running whatever it was installed with.

@@ -20,9 +20,13 @@
  */
 import { WebSocketServer } from 'ws';
 import { startFixtures } from './fixtures.mjs';
-import { requireFreeBrowser } from './browser-is-free.mjs';
+import { requireFreeBrowser, warnIfOthersConnected } from './browser-is-free.mjs';
+import { fingerprintDir } from './fingerprint.mjs';
+import { dirname, join } from 'path';
+import { fileURLToPath } from 'url';
 
 requireFreeBrowser('test-suite.mjs');
+await warnIfOthersConnected('test-suite.mjs');
 
 let BASE = ''; // set from the local fixture server before the suite runs
 const results = [];
@@ -52,6 +56,30 @@ function check(name, cond, detail = '') {
 const setup = (js) => send('execute_script', { code: js });
 
 async function suite() {
+  // ── the browser is running the code we think it is ──────────────────────
+  // Copying a file into place does not change what Chrome is running; only a
+  // reload does. Twice in one evening a suite ran against the previous build after
+  // a sync-without-reload, and both times the results were read as findings about
+  // the edit — once concluding a fix worked when it had never loaded, once
+  // diagnosing a bug that had already been fixed. Nothing compared the two, so
+  // there was no way to notice.
+  //
+  // Stops the run outright. A suite that cannot say which code it tested produces
+  // findings that have to be thrown away, and it takes several minutes to find out.
+  const health = await send('health', {});
+  const onDisk = fingerprintDir(join(dirname(fileURLToPath(import.meta.url)), '..', 'extension'));
+  if (health.source_fingerprint && health.source_fingerprint !== onDisk) {
+    console.error(`\nThe extension running in Chrome is not the source in this repo.`);
+    console.error(`  running : ${health.source_fingerprint}  (version ${health.extension_version})`);
+    console.error(`  on disk : ${onDisk}`);
+    console.error(`\nReload it, then run this again:  node push-reload.mjs`);
+    console.error(`Every result below would otherwise describe code that is no longer here.\n`);
+    process.exit(3);
+  }
+  check('the extension in Chrome is built from the source in this repo',
+    health.source_fingerprint === onDisk,
+    health.source_fingerprint ? `${onDisk}` : 'this build does not report a fingerprint — reload it');
+
   // ── form_state ──────────────────────────────────────────────────────────
   await send('navigate', { url: `${BASE}/dropdown` });
   const fs = await send('form_state', {});
@@ -220,23 +248,66 @@ async function suite() {
   await group('response body capture', async () => {
     await send('navigate', { url: `${BASE}/login` });
     await send('network_log', { limit: 1 }); // attach before the request is made
-    let entry = null;
+    let entry = null, lastLog = null;
     for (let attempt = 0; attempt < 3 && !entry; attempt++) {
       await send('execute_script', { code: "const r = await fetch(location.href + '?probe=' + Date.now()); (await r.text()).length" });
       for (let i = 0; i < 10 && !entry; i++) {
         await new Promise(r => setTimeout(r, 400));
         const log = await send('network_log', { url_pattern: 'probe=', include_body: true, max_body_chars: 60 });
+        lastLog = log;
         entry = (log.requests || []).filter(r => r.body).sort((a, b) => (b.complete_bytes || 0) - (a.complete_bytes || 0))[0] || null;
       }
     }
+    // When there is no entry every field below is undefined, and JSON.stringify
+    // renders the lot as "{}" — which is what this printed the one time it failed a
+    // release gate, leaving nothing to go on but a re-run. A failure that erases its
+    // own evidence is worse than no check, so say what the log did hold.
     check('a capped body is marked truncated with a way back',
       entry?.truncated === true && !!entry?.id && entry.body.length <= 60,
-      JSON.stringify({ truncated: entry?.truncated, id: entry?.id, len: entry?.body?.length }));
+      entry
+        ? JSON.stringify({ truncated: entry.truncated, id: entry.id, len: entry.body?.length })
+        : `no captured body. recording=${lastLog?.recording !== false} matched=${(lastLog?.requests || []).length} ` +
+          `entries=${JSON.stringify((lastLog?.requests || []).map(r => ({ type: r.type, mime: r.mime, has_body: r.has_body, note: r.body_note }))).slice(0, 300)}` +
+          `${lastLog?.note ? ` note=${lastLog.note}` : ''}`);
+
+    // The mime here is text/html, so nothing about the content marks this as data —
+    // it qualifies only by being a fetch, which makes the recorded type the single
+    // thing standing between this response and being ignored. It is read from
+    // responseReceived, which is authoritative and always carries one; it used to be
+    // read only from requestWillBeSent, where it is optional. That was not what
+    // broke the gate this check belongs to — the budget was — but it is a real gap
+    // and this pins it shut.
+    check('a fetch that returns HTML is still recognised as data worth capturing',
+      entry?.type === 'Fetch' || entry?.type === 'XHR', `type=${entry?.type} mime=${entry?.mime}`);
 
     const full = await send('network_log', { request_id: entry?.id });
     check('re-pulling returns the whole response, not the capped copy',
       full.ok === true && full.body?.length === entry?.complete_bytes && full.body.length > 60,
       `${full.body?.length} of ${entry?.complete_bytes} bytes`);
+
+    // A tab that has been driven for a while fills the per-tab body budget, and the
+    // budget used to be a hard stop — so the longer a session ran, the less likely
+    // it was to capture the one response the caller was actually waiting for. It
+    // failed a release gate exactly that way, silently, looking like a response that
+    // had no body. Oldest bodies are aged out now instead.
+    //
+    // Runs last in this group because filling the budget evicts the bodies the
+    // checks above are reading.
+    await send('execute_script', {
+      code: `for (let i = 0; i < 24; i++) await fetch('/bulk?bytes=250000&tag=fill' + i); 'filled'`,
+    });
+    await send('execute_script', { code: "await (await fetch('/bulk?bytes=400&tag=NEWEST')).text(); 'done'" });
+    let newest = null;
+    for (let i = 0; i < 12 && !newest; i++) {
+      await new Promise(r => setTimeout(r, 400));
+      const log = await send('network_log', { url_pattern: 'tag=NEWEST', include_body: true, max_body_chars: 80 });
+      newest = (log.requests || []).filter(r => r.body)[0] || null;
+      if (!newest && i === 11) lastLog = log;
+    }
+    check('a tab that has filled its body budget still captures the newest response',
+      !!newest && newest.body.includes('NEWEST'),
+      newest ? `captured ${newest.complete_bytes || newest.body.length} bytes`
+             : `no body. ${JSON.stringify((lastLog?.requests || []).map(r => r.body_note)).slice(0, 200)}`);
   });
 
   // ── record, branch, replay ──────────────────────────────────────────────

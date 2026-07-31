@@ -10,10 +10,15 @@
  * look; anything in seconds is a stall, not a cost.
  */
 import { WebSocketServer } from 'ws';
-import { requireFreeBrowser } from './browser-is-free.mjs';
+import { requireFreeBrowser, warnIfOthersConnected } from './browser-is-free.mjs';
 import { startFixtures } from './fixtures.mjs';
 
 requireFreeBrowser('bench.mjs');
+// Timing is the one thing here that another session can ruin without failing
+// anything: its commands queue against the same extension and show up as this
+// run's milliseconds. The stall threshold gates releases, so a busy browser can
+// block one for reasons that have nothing to do with the build.
+await warnIfOthersConnected('bench.mjs');
 
 // Local, like the suite. Timing a tool against a public demo site measures that
 // site's day as much as anything here, and a run against one that is down reads
