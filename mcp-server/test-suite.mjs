@@ -213,6 +213,27 @@ async function suite() {
   check('structural divergence pauses with the queue intact',
     paused.paused_at_row === 0 && paused.pending === 2, JSON.stringify({ at: paused.paused_at_row, pending: paused.pending }));
 
+  // ── a covered element must not report a successful click ──
+  await group('overlay interception', async () => {
+    await send('navigate', { url: `${BASE}/login` });
+    await setup(`const d=document.createElement('div');d.id='cookie-consent';d.textContent='We use cookies';d.setAttribute('style','position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:9999');document.body.appendChild(d)`);
+    const blocked = await send('click', { selector: 'button[type=submit]' });
+    const url = await send('execute_script', { code: 'location.pathname' });
+    check('a click onto a covered control is refused, not reported as done',
+      blocked.ok === false && /consent|cookies/i.test(blocked.intercepted_by || ''), blocked.intercepted_by);
+    check('nothing was actually clicked while the overlay was up',
+      url.result === '/login', url.result);
+
+    // Twin: the common shapes that look like interception but are not — the icon
+    // inside a button, and a label bound to its input. Refusing those would make
+    // click useless on most real pages.
+    await send('navigate', { url: `${BASE}/login` });
+    await setup(`document.querySelector('button[type=submit]').innerHTML = '<i class="fa">go</i>'`);
+    const iconClick = await send('click', { selector: 'button[type=submit]' });
+    check('an icon inside the button is not mistaken for an overlay',
+      iconClick.ok === true, JSON.stringify({ ok: iconClick.ok, by: iconClick.intercepted_by }));
+  });
+
   // ── health carries the two reasons a page stops responding that aren't faults ──
   await group('health reports what is actually blocking', async () => {
     await send('navigate', { url: 'https://example.com' });
