@@ -278,6 +278,20 @@ async function suite() {
     const sw = await send('switch_tab', { tab_id: nt.id });
     check('switch_tab makes that tab current', sw.id === nt.id, String(sw.id));
 
+    await send('navigate', { url: `${BASE}/drag_and_drop` });
+    const dragged = await send('drag', { from_selector: '#column-a', to_selector: '#column-b' });
+    const order = await send('execute_script', { code: "[...document.querySelectorAll('#columns .column header')].map(h=>h.textContent)" });
+    check('drag actually moves the thing it dragged',
+      dragged.ok === true && order.result.join('') === 'BA', JSON.stringify({ m: dragged.method, order: order.result }));
+
+    await send('navigate', { url: `${BASE}/iframe` });
+    const frames2 = await send('list_frames', {});
+    const inFrame = await send('select_frame', { frame_index: 1, code: 'document.body.innerText.slice(0,40)' });
+    check('select_frame runs code inside the frame',
+      inFrame.ok === true && /content goes here/i.test(String(inFrame.result || '')), JSON.stringify(inFrame.result));
+    check('list_frames sees the nested frame', frames2.frames?.length >= 2, String(frames2.frames?.length));
+
+    await send('navigate', { url: `${BASE}/login` });
     const dd = await send('drop_file', { selector: '#username', files: ['C:/Projects/browser-mcp/package.json'] });
     check('drop_file refuses a target with no file input rather than pretending',
       dd.ok === false && /no-file-input-found/.test(dd.error || ''), dd.error);
