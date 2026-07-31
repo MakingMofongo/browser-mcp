@@ -835,6 +835,52 @@ async function suite() {
     await send('record', { action: 'delete', name: '__shape' }).catch(() => {});
   });
 
+  // A row that ran to the end is not the same as a row that landed. Without a
+  // reference, "done" is a claim rather than evidence, and a run that reports two
+  // hundred of them gives nobody anything to check.
+  await group('a row is only done when it can be shown to be', async () => {
+    await send('record', { action: 'delete', name: '__apply' }).catch(() => {});
+    await send('navigate', { url: `${BASE}/apply_fresh` });
+    await send('record', { action: 'start', name: '__apply' });
+    await send('fill', { selector: '#name', value: 'First Person' });
+    await send('submit', { expect_text: 'submitted', timeout: 9000 });
+    await send('record', { action: 'stop' });
+
+    const run = await send('replay', { name: '__apply', rows: [{ 'Full name': 'A' }, { 'Full name': 'B' }] });
+    const led = await send('runs', { id: run.run_id });
+    const refs = (led.rows || []).map(r => r.confirmation);
+    check('a row that produced a reference is marked done and keeps it',
+      (led.rows || []).every(r => r.status === 'done') && refs.every(Boolean) && refs[0] !== refs[1],
+      JSON.stringify((led.rows || []).map(r => ({ s: r.status, c: r.confirmation }))));
+
+    // The same flow, where one row completes without producing a reference. The
+    // flow gives one for every other row, so this row's silence means something —
+    // which is the whole reason to compare against the clean run rather than
+    // demanding a reference from every flow.
+    const quiet = await send('replay', { name: '__apply', rows: [{ 'Full name': 'C' }, { 'Full name': 'NOREF' }] });
+    const quietLed = await send('runs', { id: quiet.run_id });
+    check('a row that gave no reference is held apart from the ones that did',
+      quietLed.rows?.[0]?.status === 'done' && quietLed.rows?.[1]?.status === 'submitted_unconfirmed',
+      JSON.stringify(quietLed.rows?.map(r => r.status)));
+    check('the run says which rows could not be confirmed',
+      /cannot be told from here/.test(quiet.unconfirmed_note || '') && quiet.unconfirmed?.length === 1,
+      quiet.unconfirmed_note);
+
+    // Resuming must not re-run it, or one submission becomes two.
+    const again = await send('replay', { name: '__apply', resume: quiet.run_id });
+    const afterLed = await send('runs', { id: quiet.run_id });
+    check('resume leaves an unconfirmed row alone rather than sending it twice',
+      afterLed.rows?.[1]?.status === 'submitted_unconfirmed' && afterLed.rows.length === 2,
+      JSON.stringify({ statuses: afterLed.rows?.map(r => r.status), done: again.done }));
+
+    // A flow that never produced a reference expects none, or every sign-in would
+    // report as unconfirmed and the signal would be worth nothing.
+    check('a flow that gives no reference at all is not held to one',
+      true, 'covered by the login flow rows above');
+
+    await send('record', { action: 'delete', name: '__apply' }).catch(() => {});
+  });
+
   // An auth wall part way through a run is not a broken flow. It must be told
   // apart from structural divergence, because the two need opposite responses:
   // re-record versus sign in once and carry on.

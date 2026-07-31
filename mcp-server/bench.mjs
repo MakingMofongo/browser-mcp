@@ -10,8 +10,12 @@
  * look; anything in seconds is a stall, not a cost.
  */
 import { WebSocketServer } from 'ws';
+import { startFixtures } from './fixtures.mjs';
 
-const BASE = 'https://the-internet.herokuapp.com';
+// Local, like the suite. Timing a tool against a public demo site measures that
+// site's day as much as anything here, and a run against one that is down reads
+// as a broken tool — which has already happened twice.
+let BASE = '';
 let ws = null, cmdId = 0, hello = null;
 const pending = new Map();
 const rows = [];
@@ -52,7 +56,7 @@ async function bench() {
   await time('scroll', 'scroll', { y: 200 });
   await time('health', 'health', {});
   await time('list_tabs', 'list_tabs', {});
-  await time('get_cookies', 'get_cookies', { domain: 'the-internet.herokuapp.com' });
+  await time('get_cookies', 'get_cookies', { domain: '127.0.0.1' });
   await time('get_local_storage', 'get_local_storage', {});
   await time('list_frames', 'list_frames', {});
   await time('network_log', 'network_log', {});
@@ -93,7 +97,9 @@ function listen(i = 0) {
       if (m.type === 'hello') {
         if (hello) return; hello = m.instance;
         await new Promise(r => setTimeout(r, 1500));
+        const fx = await startFixtures(); BASE = fx.base;
         try { await bench(); } catch (e) { console.error('bench failed:', e.message); }
+        fx.server.close();
         process.exit(0);
       }
       const p = pending.get(m.id);

@@ -113,6 +113,19 @@ const STATUS_CODES = page('The Internet', '<h3>Status Codes</h3><p>This page ret
 // is how a server-side flash message behaves.
 let flash = false;
 
+// An application form that issues a reference per submission — the thing a run
+// needs to be able to say a row actually landed. `stale` mode deliberately shows
+// the same reference every time, which is how a portal that leaves the previous
+// confirmation on screen fools a matcher into marking every row done.
+let refSeq = 1000;
+let lastRef = null;
+const APPLY = page('Apply', `
+  <h3>Application</h3>
+  <form id="apply" method="post" action="/apply">
+    <label for="name">Full name</label><input id="name" name="name">
+    <button type="submit">Submit</button>
+  </form>`);
+
 export function startFixtures() {
   return new Promise((resolve) => {
     const server = createServer((req, res) => {
@@ -135,7 +148,31 @@ export function startFixtures() {
           res.end();
         });
       }
+      if (url === '/apply' && req.method === 'POST') {
+        let body = '';
+        req.on('data', (c) => { body += c; });
+        return req.on('end', () => {
+          const name = new URLSearchParams(body).get('name') || '';
+          // One row that completes without giving a reference — the case worth
+          // catching, since the flow gives one for every other row and so this
+          // one's silence means something.
+          if (name === 'NOREF') { res.writeHead(302, { location: '/applied_silent' }); return res.end(); }
+          // stale mode keeps handing back the first reference it ever issued.
+          if (!globalThis.__bmcpStaleRefs || !lastRef) lastRef = `APP-${++refSeq}-QQ`;
+          res.writeHead(302, { location: '/applied' });
+          res.end();
+        });
+      }
       switch (url) {
+        case '/apply': return html(APPLY);
+        case '/applied': return html(page('Applied', `<h3>Application submitted</h3><p>Confirmation number: ${lastRef || 'NONE'}</p>`));
+        // Same page, but it never issues a new reference — the previous row's is
+        // still sitting there when the next one finishes.
+        case '/apply_stale': { globalThis.__bmcpStaleRefs = true; return html(APPLY); }
+        case '/apply_fresh': { globalThis.__bmcpStaleRefs = false; return html(APPLY); }
+        // Completes with nothing that identifies what was created.
+        case '/apply_silent': return html(page('Apply', `<h3>Application</h3><form id="apply" method="post" action="/applied_silent"><label for="name">Full name</label><input id="name" name="name"><button type="submit">Submit</button></form>`));
+        case '/applied_silent': return html(page('Applied', '<h3>Thank you</h3><p>Your application has been received.</p>'));
         case '/login': { const f = flash; flash = false; return html(login(f)); }
         case '/secure': return html(SECURE);
         case '/dropdown': return html(DROPDOWN);
