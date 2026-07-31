@@ -4,3 +4,7 @@ node_modules/
 .env
 .env.*
 .npmrc
+
+# signing key — must never be committed
+*.pem
+extension.crx
