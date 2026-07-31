@@ -213,6 +213,45 @@ async function suite() {
   check('structural divergence pauses with the queue intact',
     paused.paused_at_row === 0 && paused.pending === 2, JSON.stringify({ at: paused.paused_at_row, pending: paused.pending }));
 
+  // An auth wall part way through a run is not a broken flow. It must be told
+  // apart from structural divergence, because the two need opposite responses:
+  // re-record versus sign in once and carry on.
+  await group('auth wall', async () => {
+    await send('navigate', { url: 'https://example.com' });
+    await setup(`document.body.innerHTML = '<h1>Verify it is you</h1><p>Enter the code we sent you.</p><input autocomplete="one-time-code" name="otp">'`);
+    const wall = await send('replay', {
+      name: '__suite', start_url: false,
+      rows: [{ Username: 'a' }, { Username: 'b' }, { Username: 'c' }],
+    });
+    check('an auth wall pauses the run and says so',
+      wall.paused_for === 'authentication' && wall.paused_at_row === 0, JSON.stringify({ for: wall.paused_for, at: wall.paused_at_row }));
+    check('an auth wall leaves every row still to run',
+      wall.remaining === 3, `remaining=${wall.remaining}`);
+    const led = await send('runs', { id: wall.run_id });
+    check('the parked row is pending, not counted as failed',
+      led.rows?.[0]?.status === 'pending', JSON.stringify(led.rows?.map(r => r.status)));
+
+    // Parking is only useful if the run can be picked back up. Clear the wall
+    // and resume: nothing may be left stranded in pending.
+    const resumed = await send('replay', { name: '__suite', resume: wall.run_id });
+    const after = await send('runs', { id: wall.run_id });
+    check('resuming after the wall clears runs every parked row',
+      !(after.rows || []).some(r => r.status === 'pending') && (after.rows || []).length === 3,
+      JSON.stringify(after.rows?.map(r => r.status)));
+    check('the resumed run does not report the wall again',
+      resumed.paused_for !== 'authentication', String(resumed.paused_for));
+
+    // Twin: a bare password field is how ordinary login pages look, so treating
+    // one as an auth wall would park runs that have genuinely broken.
+    await send('navigate', { url: 'https://example.com' });
+    await setup(`document.body.innerHTML = '<h1>Example</h1><input type="password" name="p">'`);
+    const notWall = await send('replay', {
+      name: '__suite', start_url: false, rows: [{ Username: 'a' }, { Username: 'b' }],
+    });
+    check('a bare password field is not mistaken for an auth wall',
+      !notWall.paused_for && notWall.paused_at_row === 0, JSON.stringify({ for: notWall.paused_for, at: notWall.paused_at_row }));
+  });
+
   await send('record', { action: 'delete', name: '__suite' }).catch(() => {});
 
 
