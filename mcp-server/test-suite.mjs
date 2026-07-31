@@ -477,11 +477,46 @@ async function suite() {
     await setup(`document.querySelector('#username').addEventListener('input',e=>{document.querySelector('#password').value=e.target.value}); 1`);
     const leaked = await send('fill', { selector: '#username', value: 'tomsmith' });
     const both = await send('execute_script', { code: "[document.querySelector('#username').value, document.querySelector('#password').value]" });
-    check('a value that also lands elsewhere is not reported as success',
-      leaked.ok === false && /password/.test(JSON.stringify(leaked.collateral_written || [])),
-      JSON.stringify(leaked.collateral_written));
+    // Named, but not failed: the value did not come from a password field, so
+    // this is the mirror case. It used to fail the write, which would have halted
+    // a long run on any confirm-email box it met.
+    check('a value that also lands elsewhere is named',
+      leaked.ok === true && /password/.test(JSON.stringify(leaked.also_received_this_value || [])),
+      JSON.stringify(leaked.also_received_this_value));
     check('the target itself was still written correctly',
       both.result[0] === 'tomsmith' && both.result[1] === 'tomsmith', JSON.stringify(both.result));
+
+    // A mirrored field — confirm-email, billing-same-as-shipping, two inputs on
+    // one model — is the page working as intended, and is indistinguishable from
+    // a misdirected write by looking at the page alone. Halting on it would stop
+    // a long run on its second row to prevent a problem it does not have, so it
+    // is said and passed over.
+    await send('navigate', { url: `${BASE}/login` });
+    await setup(`document.body.insertAdjacentHTML('beforeend',
+      '<form id=signup><h3>Create account</h3><label for=em>Email</label><input id=em name=email>' +
+      '<label for=em2>Confirm email</label><input id=em2 name=email_confirm></form>');
+      document.getElementById('em').addEventListener('input',e=>{document.getElementById('em2').value=e.target.value}); 1`);
+    const mirrored = await send('fill', { selector: '#em', value: 'rasheed@example.com' });
+    check('a mirrored field is reported without failing the write',
+      mirrored.ok === true && /email_confirm/.test(JSON.stringify(mirrored.also_received_this_value || [])),
+      JSON.stringify(mirrored.also_received_this_value));
+    check('a write says which field and section it landed in',
+      mirrored.wrote_into?.label === 'Email' && mirrored.wrote_into?.in === 'Create account',
+      JSON.stringify(mirrored.wrote_into));
+
+    // The same shape, but the value came out of a password field. That one cannot
+    // be taken back once it is on screen and in a screenshot, so it fails.
+    await send('navigate', { url: `${BASE}/login` });
+    await setup(`document.querySelector('#password').value='Hunter2-SECRET';
+      document.body.insertAdjacentHTML('beforeend','<input id=notes name=notes><input id=public name=public_display>');
+      document.getElementById('notes').addEventListener('input',e=>{document.getElementById('public').value=e.target.value}); 1`);
+    await send('clipboard', { action: 'copy', selector: '#password' });
+    const leak = await send('clipboard', { action: 'paste', selector: '#notes' });
+    check('a secret reaching a field that is not secret fails the write',
+      leak.ok === false && /password field/.test(leak.error || '') && /public_display/.test(leak.error || ''),
+      String(leak.error).slice(0, 80));
+    check('the secret itself never appears in the result',
+      !JSON.stringify(leak).includes('Hunter2-SECRET'), 'checked whole result');
 
     // Twin: a page that fills a DIFFERENT dependent value is behaving normally
     // and must not be called a fault, or every real form would fail.
