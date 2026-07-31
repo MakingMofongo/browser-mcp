@@ -106,12 +106,14 @@ export const TOOLS = [
   },
   {
     name: 'browser_replay',
-    description: 'Replay a saved flow. Each step is re-pointed at whatever now matches its recorded identity, and values can be overridden per run by passing a row whose keys match the recorded field names. Stops at the first step where the page no longer matches the recording and reports what differed, so the run can be inspected and resumed rather than continuing blindly.',
+    description: 'Replay a saved flow. Each step is re-pointed at whatever now matches its recorded identity, and values can be overridden per run by passing a row whose keys match the recorded field names. Pass rows to run the flow once per record in a single call. Stops at the first step where the page no longer matches the recording and reports what differed, so the run can be inspected and resumed rather than continuing blindly.',
     inputSchema: {
       type: 'object',
       properties: {
         name: { type: 'string', description: 'Flow name from browser_record' },
         row: { type: 'object', description: 'Values for this run, keyed by field name, for example {"Email":"a@b.com"}' },
+        rows: { type: 'array', items: { type: 'object' }, description: 'Run the flow once per row in a single call, up to 500. Returns which rows completed and which diverged.' },
+        on_error: { type: 'string', enum: ['stop', 'continue'], description: 'With rows: stop leaves the remaining rows untouched (default); continue works through them and collects the failures.' },
         start_url: { type: 'boolean', description: 'Navigate to the recorded starting URL first (default: true)' },
         verbose: { type: 'boolean', description: 'Include per-step results' },
       },
