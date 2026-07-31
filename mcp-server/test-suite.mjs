@@ -384,6 +384,75 @@ async function suite() {
       !JSON.stringify(posted.sent || []).includes('SuperSecretPassword'), JSON.stringify(posted.sent));
   });
 
+  // Parameters, not tools. The coverage gate asks whether a tool is ever called,
+  // which a tool with fourteen options passes on one call using none of them. Two
+  // thirds of the parameters here had never been passed by anything, including one
+  // added a day earlier. These are the ones where being wrong costs something.
+  await group('parameters that change what a tool does', async () => {
+    await send('navigate', { url: `${BASE}/login` });
+
+    // visible:false is the difference between "not there" and "there but hidden",
+    // which is the distinction wait exists to make.
+    await setup(`document.body.insertAdjacentHTML('beforeend','<div id=ghost style="display:none">hidden thing</div>'); 1`);
+    const strict = await send('wait', { selector: '#ghost', timeout: 800 });
+    const loose = await send('wait', { selector: '#ghost', timeout: 800, visible: false });
+    check('wait visible:false matches an element that is present but hidden',
+      strict.found === false && loose.found === true && loose.visible === false,
+      JSON.stringify({ strict: strict.found, loose: loose.found }));
+
+    // article strips the furniture; html keeps the markup. Same page, and the
+    // three must not all return the same thing.
+    await send('navigate', { url: `${BASE}/large` });
+    const asText = await send('get_page_content', { format: 'text' });
+    const asHtml = await send('get_page_content', { format: 'html' });
+    check('get_page_content format changes what comes back',
+      /<p>|<div/i.test(asHtml.content || '') && !/<p>/i.test(asText.content || ''),
+      JSON.stringify({ text: (asText.content || '').slice(0, 20), html: (asHtml.content || '').slice(0, 20) }));
+
+    // A modifier that is ignored looks exactly like one that worked.
+    await send('navigate', { url: `${BASE}/login` });
+    await send('fill', { selector: '#username', value: 'select me' });
+    await setup(`window.__mod = null; document.addEventListener('keydown', e => { if (e.key === 'a') window.__mod = { ctrl: e.ctrlKey, shift: e.shiftKey }; }, true); 1`);
+    await send('press_key', { key: 'a', ctrl: true });
+    const mods = await send('execute_script', { code: 'JSON.stringify(window.__mod)' });
+    check('press_key carries its modifier keys to the page',
+      /"ctrl":true/.test(mods.result || ''), mods.result);
+
+    // screenshot:"always" is the opt-in half of the anomaly screenshot. It has to
+    // attach an image on a perfectly ordinary action, or it does nothing at all.
+    const shot = await send('click', { selector: 'h2', screenshot: 'always' });
+    const plain = await send('click', { selector: 'h2' });
+    check('screenshot:"always" attaches an image to an action that went fine',
+      /^data:image\/(jpeg|png);base64,/.test(shot.screenshot?.data || '') && shot.screenshot.data.length > 500,
+      JSON.stringify({ reason: shot.screenshot?.reason, bytes: (shot.screenshot?.data || '').length }));
+    check('an action that went fine attaches nothing when it was not asked to',
+      !plain.screenshot, JSON.stringify({ has: !!plain.screenshot }));
+
+    // The clipboard reads an attribute rather than the value when asked.
+    await setup(`document.querySelector('#username').setAttribute('data-token','ABC-123'); 1`);
+    const copied = await send('clipboard', { action: 'copy', selector: '#username', attribute: 'data-token' });
+    const pasted = await send('clipboard', { action: 'paste', selector: '#password' });
+    const landed = await send('execute_script', { code: "document.querySelector('#password').value" });
+    check('clipboard attribute copies the attribute, not the field value',
+      copied.ok === true && landed.result === 'ABC-123', JSON.stringify({ chars: copied.copied_chars, got: landed.result }));
+
+    // pace_ms was added a day before this test and had never been passed.
+    const t0 = Date.now();
+    await send('record', { action: 'delete', name: '__pp' }).catch(() => {});
+    await send('navigate', { url: `${BASE}/apply` });
+    await send('record', { action: 'start', name: '__pp' });
+    await send('fill', { selector: '#name', value: 'First' });
+    await send('submit', { expect_text: 'submitted', timeout: 4000 });
+    await send('record', { action: 'stop' });
+    const tRecord = Date.now() - t0;
+    const t1 = Date.now();
+    const paced = await send('replay', { name: '__pp', pace_ms: 1500, rows: [{ 'Full name': 'A' }, { 'Full name': 'B' }] });
+    const tPaced = Date.now() - t1;
+    check('pace_ms actually slows a run down',
+      paced.done === 2 && tPaced > 2400, JSON.stringify({ ms: tPaced, recorded_in: tRecord }));
+    await send('record', { action: 'delete', name: '__pp' }).catch(() => {});
+  });
+
   // The failure half of the contract. Every tool caught reporting success while
   // doing nothing was caught by looking at what came back; these check the shape
   // that answer has to have when the work genuinely cannot be done — ok:false and
