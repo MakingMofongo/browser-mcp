@@ -17,7 +17,7 @@ import { execSync } from 'child_process';
 import { dirname, join, resolve } from 'path';
 import { fileURLToPath } from 'url';
 import { readFileSync, writeFileSync, mkdirSync } from 'fs';
-import { TOOLS, PROVIDER_PAGES } from './tools.js';
+import { TOOLS } from './tools.js';
 
 // Read version from package.json — single source of truth, never drifts
 const PKG_VERSION = JSON.parse(
@@ -211,7 +211,7 @@ const INSTRUCTIONS = `You control the user's real Chrome browser via this MCP se
 - **browser_health** pre-checks the tab: debugger attachable, scripting injectable. Call it when actions start failing instead of retrying blind.
 
 ## Key behaviors
-- **Always use browser_ask_user** when you need credentials, 2FA codes, CAPTCHA help, or any user input. Never guess passwords or tokens.
+- **Ask the user directly in chat** when you need credentials, a 2FA code or a decision. Never guess secrets.
 - **Close tabs when a task is fully done** with browser_close_tab. Closing your last tab no longer kills the session — the server stays alive and the next navigate creates a fresh tab.
 - **Check existing tabs first** with browser_list_tabs before navigating — reuse tabs instead of opening duplicates.
 - **One task per tab** — navigate to a URL, do your work, then close or move on.
@@ -229,10 +229,10 @@ If the user runs the extension in several Chrome profiles or machines, browser_l
 
 ## Authentication flows
 1. Navigate to login page
-2. Use browser_ask_user with fields for email/password
+2. Ask the user in chat for the credentials
 3. Fill credentials with browser_fill
 4. Click submit with browser_click
-5. If 2FA required, use browser_ask_user again: "Please enter the 2FA code shown in your authenticator app"
+5. If 2FA is required, ask the user in chat for the code
 6. After success, extract what you need with browser_get_page_content
 
 ## Screenshots
@@ -282,7 +282,7 @@ For image grid challenges: cells are 0-indexed, left-to-right, top-to-bottom. A 
 - Element not found → try text-based selector instead of CSS
 - Screenshot fails → debugger fallback is automatic
 - Click doesn't work on SPA → debugger mouse events are used automatically
-- CAPTCHA blocks page → use browser_ask_user, let human solve it
+- CAPTCHA blocks the page → tell the user and let them solve it in the browser
 - browser_fill seemingly succeeds but value reverts → switch to browser_set_date or browser_set_combobox (most reverts are React-controlled validators)
 
 ## Extension updates
@@ -291,8 +291,7 @@ If the extension files were updated, ask the user to reload it:
 "The Browser MCP extension was updated. Please go to chrome://extensions, find 'Agent360 Browser MCP', and click the reload icon (🔄) to apply the update."
 You cannot navigate to chrome:// pages — the user must do this manually.
 
-## Sharing wishes / use-cases / bugs
-Browser MCP is community-shaped. Whenever the user (a) says "I wish browser-mcp could…" or expresses a missing feature, (b) hits something broken or unexpected that looks like a bug in browser-mcp itself, or (c) describes something cool they built with it — call **browser_about** with the matching intent ("wish" / "use_case" / "bug") and a short title + body, then offer the returned submit_url to the user as a clickable link. Don't ask permission, just draft + offer the link. This is the user's path to contribute back, and they usually don't know it exists.`;
+`;
 
 const mcpServer = new Server(
   { name: 'agent360-browser', version: PKG_VERSION },
@@ -327,7 +326,6 @@ mcpServer.setRequestHandler(CallToolRequestSchema, async (request) => {
       browser_list_tabs: 'list_tabs',
       browser_get_cookies: 'get_cookies',
       browser_get_local_storage: 'get_local_storage',
-      browser_ask_user: 'ask_user',
       browser_select_frame: 'select_frame',
       browser_list_frames: 'list_frames',
       browser_get_new_tab: 'get_new_tab',
@@ -363,14 +361,6 @@ mcpServer.setRequestHandler(CallToolRequestSchema, async (request) => {
       browser_detach_tab: 'detach_tab',
     };
 
-    if (name === 'browser_about') {
-      return handleAbout(args);
-    }
-
-    if (name === 'browser_extract_token') {
-      return await handleExtractToken(args);
-    }
-
     // Multi-browser management — answered from server state, no extension round-trip
     if (name === 'browser_list_browsers') {
       const list = [...extConnections.entries()].map(([ws, meta]) => ({
@@ -399,8 +389,7 @@ mcpServer.setRequestHandler(CallToolRequestSchema, async (request) => {
       return { content: [{ type: 'text', text: `Unknown tool: ${name}` }], isError: true };
     }
 
-    const timeout = method === 'ask_user' ? (args?.timeout || 120000) + 5000 :
-                    method === 'solve_captcha' ? 60000 :
+    const timeout = method === 'solve_captcha' ? 60000 :
                     method === 'batch' ? 180000 :
                     method === 'submit' ? (args?.timeout || 15000) + 20000 : 30000;
     const result = await sendToExtension(method, args || {}, timeout);
@@ -466,65 +455,8 @@ mcpServer.setRequestHandler(CallToolRequestSchema, async (request) => {
   }
 });
 
-const REPO_URL = 'https://github.com/Agent360dk/browser-mcp';
-const ISSUE_TEMPLATES = { wish: 'wish.yml', use_case: 'use-case.yml', bug: 'bug.yml' };
 
-function handleAbout(args) {
-  const intent = args?.intent || 'info';
-  const title = args?.title || '';
-  const body = args?.body || '';
 
-  const submit_url = intent === 'info' || !ISSUE_TEMPLATES[intent]
-    ? `${REPO_URL}/issues/new/choose`
-    : `${REPO_URL}/issues/new?template=${ISSUE_TEMPLATES[intent]}` +
-      (title ? `&title=${encodeURIComponent(title)}` : '') +
-      (body ? `&body=${encodeURIComponent(body)}` : '');
-
-  const instruction =
-    intent === 'wish'
-      ? `Share this exact submission link with the user as a clickable link, with a short note like "Click to submit your wish — it'll open a pre-filled GitHub issue you can review before submitting": ${submit_url}`
-      : intent === 'use_case'
-      ? `Share this exact submission link with the user as a clickable link, with a short note like "Click to share your use-case — pre-filled, you can edit before submitting": ${submit_url}`
-      : intent === 'bug'
-      ? `Share this exact bug-report link with the user as a clickable link, with a short note like "Click to report — pre-filled, please add reproduction steps before submitting": ${submit_url}`
-      : `Browser MCP is community-shaped. Open wishlist: ${REPO_URL}/blob/main/WISHLIST.md · Use-cases: ${REPO_URL}/blob/main/USE_CASES.md · Submit anything: ${REPO_URL}/issues/new/choose`;
-
-  return {
-    content: [{
-      type: 'text',
-      text: JSON.stringify({
-        name: 'Browser MCP by Agent360',
-        version: PKG_VERSION,
-        repo: REPO_URL,
-        wishlist: `${REPO_URL}/blob/main/WISHLIST.md`,
-        use_cases: `${REPO_URL}/blob/main/USE_CASES.md`,
-        submit_url,
-        instruction,
-      }, null, 2),
-    }],
-  };
-}
-
-async function handleExtractToken(args) {
-  const { provider } = args;
-  const info = PROVIDER_PAGES[provider];
-
-  if (!info) {
-    return {
-      content: [{
-        type: 'text',
-        text: `Unknown provider: ${provider}. Known: ${Object.keys(PROVIDER_PAGES).join(', ')}\n\nYou can still use browser_navigate + browser_get_page_content to extract tokens from any provider manually.`,
-      }],
-    };
-  }
-
-  const nav = await sendToExtension('navigate', { url: info.url });
-  return {
-    content: [
-      { type: 'text', text: `Navigated to ${info.url} (${nav.title})\n\nInstructions: ${info.instructions}\n\nUse browser_get_page_content or browser_screenshot to find the token, then use browser_execute_script to extract it.` },
-    ],
-  };
-}
 
 // ── Graceful shutdown ──────────────────────────────────────────────────────
 // All shutdown paths funnel through gracefulShutdown so the cleanup chain runs

@@ -534,32 +534,7 @@ export const TOOLS = [
       },
     },
   },
-  {
-    name: 'browser_ask_user',
-    description: 'Show a dialog in the page asking the user to act or to provide information such as credentials, a 2FA code or CAPTCHA help. Optional input fields are returned as values. Use whenever a secret or a human decision is needed rather than guessing.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        message: { type: 'string', description: 'What the user needs to do or provide' },
-        title: { type: 'string', description: 'Dialog title (default: "Agent360 — Action Required")' },
-        fields: {
-          type: 'array',
-          description: 'Input fields for user to fill in. Each field has: name (key), label (display text), type (text/password/email). Omit for simple "Done/Skip" confirmation.',
-          items: {
-            type: 'object',
-            properties: {
-              name: { type: 'string', description: 'Field key (returned in response)' },
-              label: { type: 'string', description: 'Display label' },
-              type: { type: 'string', enum: ['text', 'password', 'email', 'number'], description: 'Input type (default: text)' },
-            },
-            required: ['name', 'label'],
-          },
-        },
-        timeout: { type: 'number', description: 'Max wait time in ms (default: 120000 = 2 min)' },
-      },
-      required: ['message'],
-    },
-  },
+
   {
     name: 'browser_list_frames',
     description: 'List the frames in the current page with their URLs and indices, for use with browser_select_frame.',
@@ -617,17 +592,7 @@ export const TOOLS = [
       required: ['files'],
     },
   },
-  {
-    name: 'browser_extract_token',
-    description: 'Open a provider\'s API settings page so its token can be read from the page. Returns the URL opened and where on that page the token is normally shown.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        provider: { type: 'string', description: 'Provider slug (stripe, hubspot, slack, etc.)' },
-      },
-      required: ['provider'],
-    },
-  },
+
   {
     name: 'browser_solve_captcha',
     description: 'Detect and attempt to solve CAPTCHAs on the page. Recognises reCAPTCHA v2 and v3, hCaptcha, Cloudflare Turnstile and FunCaptcha. Can click the reCAPTCHA checkbox, click specific grid cells for image challenges, or hand the challenge to the user.',
@@ -643,66 +608,5 @@ export const TOOLS = [
       },
     },
   },
-  {
-    name: 'browser_about',
-    description: 'Return information about Browser MCP along with a pre-filled URL the user can open to submit a feature request, share a use-case or report a bug. Pass intent as wish, use_case, bug or info, with an optional title and body.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        intent: {
-          type: 'string',
-          enum: ['wish', 'use_case', 'bug', 'info'],
-          description: 'What the user wants to share. "wish" = feature request, "use_case" = share what they built, "bug" = something broken, "info" = general (default: "info").',
-        },
-        title: {
-          type: 'string',
-          description: 'Optional pre-filled issue title (e.g. "Support hCaptcha v3"). Will be URL-encoded into the submit link.',
-        },
-        body: {
-          type: 'string',
-          description: 'Optional pre-filled body / first-comment draft. Will be URL-encoded into the submit link. Keep it short; user can expand on GitHub.',
-        },
-      },
-    },
-  },
-];
 
-// Known provider token pages for browser_extract_token
-export const PROVIDER_PAGES = {
-  stripe: {
-    url: 'https://dashboard.stripe.com/apikeys',
-    instructions: 'Look for the Secret key starting with sk_live_ or sk_test_',
-  },
-  hubspot: {
-    url: 'https://app.hubspot.com/settings/',
-    instructions: 'Navigate to Integrations → Private Apps → create or find existing app → Access Token',
-  },
-  slack: {
-    url: 'https://api.slack.com/apps',
-    instructions: 'Select app → OAuth & Permissions → Bot User OAuth Token (xoxb-...)',
-  },
-  shopify: {
-    url: 'https://admin.shopify.com/store/',
-    instructions: 'Settings → Apps → Develop apps → find app → Admin API access token',
-  },
-  mailchimp: {
-    url: 'https://us1.admin.mailchimp.com/account/api/',
-    instructions: 'Look for the API key or create a new one',
-  },
-  pipedrive: {
-    url: 'https://app.pipedrive.com/settings/api',
-    instructions: 'Copy the personal API token shown on the page',
-  },
-  calendly: {
-    url: 'https://calendly.com/integrations/api_webhooks',
-    instructions: 'Copy the personal access token or generate a new one',
-  },
-  google: {
-    url: 'https://console.cloud.google.com/apis/credentials',
-    instructions: 'Find or create an API key / OAuth client',
-  },
-  linkedin: {
-    url: 'https://www.linkedin.com/developers/apps',
-    instructions: 'Select app → Auth → Client credentials',
-  },
-};
+];

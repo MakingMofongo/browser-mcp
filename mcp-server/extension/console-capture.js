@@ -10,6 +10,22 @@
  * which never pass through console.* and were previously invisible.
  */
 (() => {
+  // Trusted Types shim. Sites with `require-trusted-types-for 'script'` (Gmail,
+  // Google Workspace, many banks) reject any string assigned to innerHTML or
+  // similar sinks, so injected helper code fails with
+  // "This document requires 'TrustedHTML' assignment". Registering a pass-through
+  // policy up front gives page-context code a legal way to build those values.
+  // Only affects code that opts in via window.__bmcpTT — page behaviour is untouched.
+  try {
+    if (window.trustedTypes && window.trustedTypes.createPolicy && !window.__bmcpTT) {
+      window.__bmcpTT = window.trustedTypes.createPolicy('bmcp', {
+        createHTML: (s) => s,
+        createScript: (s) => s,
+        createScriptURL: (s) => s,
+      });
+    }
+  } catch (e) { /* policy name taken or policies locked down — callers fall back */ }
+
   if (window.__mcpConsoleLogs) return; // already installed (SPA soft-nav, double-inject)
   const MAX = 500;
   const logs = [];

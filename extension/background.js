@@ -2322,8 +2322,11 @@ async function dispatch(port, method, params) {
       if (tab.url.startsWith('chrome://')) throw new Error('Cannot access chrome:// pages');
       const format = params.format || 'text';
       const maxChars = Math.max(1000, params.max_chars || 60000);
-      // Serialized-func injection is CSP-immune (no string eval), so no debugger needed.
-      const [res] = await chrome.scripting.executeScript({
+      // A tab showing Chrome's network-error page cannot be injected into. That is
+      // a page STATE, not a tool failure, so report it as data instead of throwing.
+      let res;
+      try {
+      [res] = await chrome.scripting.executeScript({
         target: { tabId: tab.id },
         world: 'MAIN',
         args: [format],
@@ -2362,6 +2365,18 @@ async function dispatch(port, method, params) {
           return text;
         },
       });
+      } catch (e) {
+        const msg = String(e?.message || e);
+        if (/showing error page|Frame with ID|cannot be scripted|No frame with id/i.test(msg)) {
+          const t = await chrome.tabs.get(tab.id).catch(() => null);
+          return {
+            content: '', url: t?.url || tab.url, title: t?.title || '', length: 0, format,
+            error_page: true,
+            note: 'The tab is displaying a browser error page (DNS failure, connection refused or similar), so it has no document to read. Check the URL or connectivity, then navigate again.',
+          };
+        }
+        throw e;
+      }
       let content = res?.result ?? '';
       const fullLength = content.length;
       if (content.length > maxChars) {
@@ -2449,6 +2464,19 @@ async function dispatch(port, method, params) {
       // so `const r = await fetch(...); r.status` and top-level `return x` both work.
       const replFunc = (codeStr) => {
         const asErr = (e) => ({ __scriptingError: true, message: String(e?.message || e), name: e?.name });
+        // Under `require-trusted-types-for 'script'` (Gmail, Workspace, banks) the
+        // Function constructor rejects plain strings. Route the source through a
+        // pass-through policy so the same code is legal on hardened pages.
+        try {
+          if (window.trustedTypes && window.trustedTypes.createPolicy) {
+            if (!window.__bmcpTT) {
+              window.__bmcpTT = window.trustedTypes.createPolicy('bmcp-exec', {
+                createHTML: (s) => s, createScript: (s) => s, createScriptURL: (s) => s,
+              });
+            }
+            if (window.__bmcpTT && window.__bmcpTT.createScript) codeStr = window.__bmcpTT.createScript(codeStr);
+          }
+        } catch (e) { /* policy blocked; fall through and let the debugger path handle it */ }
         const tryEval = (build) => {
           const fn = build();
           const v = fn();
@@ -2975,6 +3003,19 @@ async function dispatch(port, method, params) {
       // FB/Twitter/IG only trigger lazy-load on continuous wheel events, not a single large delta.
       const dx = params.x || 0;
       const dy = params.y || 0;
+      // Scripting fallback first-class: scrolling must not hard-fail just because
+      // the debugger is unavailable — window.scrollBy works on almost every page.
+      const scrollViaScripting = async () => {
+        const [r] = await chrome.scripting.executeScript({
+          target: { tabId: tab.id }, world: 'MAIN', args: [dx, dy],
+          func: (x, y) => {
+            const before = window.scrollY;
+            window.scrollBy({ left: x, top: y, behavior: 'instant' });
+            return { scrolled: window.scrollY - before, at: window.scrollY, max: document.documentElement.scrollHeight };
+          },
+        });
+        return r?.result;
+      };
       try {
         await debuggerAttach(tab.id);
         const STEP_SIZE = 300; // pixels per wheel-event (matches a typical mouse-wheel notch)
@@ -2992,9 +3033,9 @@ async function dispatch(port, method, params) {
         // before any subsequent commands run (caller often scrapes immediately after)
         await new Promise(r => setTimeout(r, 600));
       } catch (e) {
-        // Fallback to window.scrollBy for simple pages (synthetic but works on non-anti-scrape sites)
-        await debuggerEval(tab.id, `window.scrollBy(${dx}, ${dy})`);
-        return { ok: true, scrolled: { x: dx, y: dy }, method: 'fallback', fallback_reason: e.message };
+        const r = await scrollViaScripting().catch(() => null);
+        if (r) return { ok: true, scrolled: { x: dx, y: dy }, position: r.at, method: 'scripting-fallback', fallback_reason: e.message };
+        return { ok: false, error: 'Scroll failed on both the debugger and scripting paths: ' + (e?.message || e) };
       }
       return { ok: true, scrolled: { x: dx, y: dy }, method: 'mouseWheel-stepped' };
     }
@@ -3719,146 +3760,6 @@ async function dispatch(port, method, params) {
       return r;
     }
 
-    case 'ask_user': {
-      const tab = await getSessionTab(port, true);
-      const timeout = params.timeout || 120000;
-      const fields = params.fields || [];
-      const hasFields = fields.length > 0;
-      const session = getSession(port);
-
-      // Activate tab + alert badge
-      await chrome.tabs.update(tab.id, { active: true });
-      chrome.action.setBadgeText({ text: '!' });
-      chrome.action.setBadgeBackgroundColor({ color: '#f59e0b' });
-      const notifId = 'mcp-ask-' + Date.now();
-      chrome.notifications.create(notifId, {
-        type: 'basic',
-        iconUrl: 'icons/icon-128.png',
-        title: `${session.label} — Action Required`,
-        message: params.message,
-        requireInteraction: true,
-        silent: false,
-        priority: 2,
-      });
-
-      const [result] = await chrome.scripting.executeScript({
-        target: { tabId: tab.id },
-        func: (message, title, fields, hasFields, timeout, sessionLabel) => {
-          return new Promise((resolve) => {
-            document.getElementById('a360-overlay')?.remove();
-
-            // Notification sound — short pleasant chime
-            try {
-              const ctx = new AudioContext();
-              const osc = ctx.createOscillator();
-              const gain = ctx.createGain();
-              osc.connect(gain);
-              gain.connect(ctx.destination);
-              osc.frequency.value = 880;
-              osc.type = 'sine';
-              gain.gain.setValueAtTime(0.3, ctx.currentTime);
-              gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.4);
-              osc.start(ctx.currentTime);
-              osc.stop(ctx.currentTime + 0.4);
-              // Second tone (higher, pleasant ding-dong)
-              setTimeout(() => {
-                const osc2 = ctx.createOscillator();
-                const gain2 = ctx.createGain();
-                osc2.connect(gain2);
-                gain2.connect(ctx.destination);
-                osc2.frequency.value = 1320;
-                osc2.type = 'sine';
-                gain2.gain.setValueAtTime(0.2, ctx.currentTime);
-                gain2.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.3);
-                osc2.start(ctx.currentTime);
-                osc2.stop(ctx.currentTime + 0.3);
-              }, 150);
-            } catch {}
-
-            // Inject animation keyframes
-            if (!document.getElementById('a360-styles')) {
-              const style = document.createElement('style');
-              style.id = 'a360-styles';
-              style.textContent = `
-                @keyframes a360-fade-in { from { opacity: 0; } to { opacity: 1; } }
-                @keyframes a360-slide-up { from { opacity: 0; transform: translateY(30px) scale(0.95); } to { opacity: 1; transform: translateY(0) scale(1); } }
-              `;
-              document.head.appendChild(style);
-            }
-
-            const overlay = document.createElement('div');
-            overlay.id = 'a360-overlay';
-            overlay.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.6);z-index:2147483647;display:flex;align-items:center;justify-content:center;font-family:-apple-system,BlinkMacSystemFont,sans-serif;animation:a360-fade-in 0.3s ease-out';
-
-            const card = document.createElement('div');
-            card.style.cssText = 'background:#1e293b;border-radius:12px;padding:24px;max-width:420px;width:90%;color:#e2e8f0;box-shadow:0 20px 60px rgba(0,0,0,0.5);animation:a360-slide-up 0.4s ease-out';
-
-            const h = document.createElement('div');
-            h.style.cssText = 'font-size:14px;font-weight:600;color:#3b82f6;margin-bottom:4px';
-            h.textContent = title || 'Agent360 — Action Required';
-            card.appendChild(h);
-            const badge = document.createElement('div');
-            badge.style.cssText = 'font-size:10px;color:#94a3b8;margin-bottom:12px';
-            badge.textContent = sessionLabel;
-            card.appendChild(badge);
-            const msg = document.createElement('div');
-            msg.style.cssText = 'font-size:13px;color:#cbd5e1;margin-bottom:16px;line-height:1.5';
-            msg.textContent = message;
-            card.appendChild(msg);
-            const inputs = {};
-            if (hasFields) {
-              fields.forEach(f => {
-                const label = document.createElement('label');
-                label.style.cssText = 'display:block;font-size:11px;color:#94a3b8;margin-bottom:4px;margin-top:8px';
-                label.textContent = f.label || f.name;
-                card.appendChild(label);
-                const input = document.createElement('input');
-                input.type = f.type || 'text';
-                input.placeholder = f.label || f.name;
-                input.style.cssText = 'width:100%;padding:8px 10px;background:#0f172a;border:1px solid #334155;border-radius:6px;color:#e2e8f0;font-size:13px;outline:none;box-sizing:border-box';
-                input.addEventListener('focus', () => input.style.borderColor = '#3b82f6');
-                input.addEventListener('blur', () => input.style.borderColor = '#334155');
-                card.appendChild(input);
-                inputs[f.name] = input;
-              });
-            }
-            const btnRow = document.createElement('div');
-            btnRow.style.cssText = 'display:flex;gap:8px;margin-top:16px';
-            const doneBtn = document.createElement('button');
-            doneBtn.textContent = hasFields ? 'Submit' : '✓ Done';
-            doneBtn.style.cssText = 'flex:1;padding:10px;background:#3b82f6;color:white;border:none;border-radius:6px;font-size:13px;cursor:pointer;font-weight:500';
-            doneBtn.addEventListener('click', () => {
-              const values = {};
-              Object.entries(inputs).forEach(([k, el]) => values[k] = el.value);
-              overlay.remove();
-              resolve({ acknowledged: true, action: 'done', values });
-            });
-            const skipBtn = document.createElement('button');
-            skipBtn.textContent = '✗ Skip';
-            skipBtn.style.cssText = 'flex:1;padding:10px;background:#334155;color:#94a3b8;border:none;border-radius:6px;font-size:13px;cursor:pointer';
-            skipBtn.addEventListener('click', () => { overlay.remove(); resolve({ acknowledged: true, action: 'skip', values: {} }); });
-            btnRow.appendChild(doneBtn);
-            btnRow.appendChild(skipBtn);
-            card.appendChild(btnRow);
-            overlay.appendChild(card);
-            document.body.appendChild(overlay);
-            const firstInput = Object.values(inputs)[0];
-            if (firstInput) setTimeout(() => firstInput.focus(), 100);
-            card.addEventListener('keydown', (e) => { if (e.key === 'Enter') doneBtn.click(); });
-            setTimeout(() => { if (document.getElementById('a360-overlay')) { overlay.remove(); resolve({ acknowledged: false, action: 'timeout', values: {} }); } }, timeout);
-          });
-        },
-        args: [params.message, params.title, fields, hasFields, timeout, session.label],
-        world: 'MAIN',
-      });
-
-      // Restore badge
-      const count = sessions.size;
-      chrome.action.setBadgeText({ text: count > 0 ? String(count) : '' });
-      chrome.action.setBadgeBackgroundColor({ color: '#22c55e' });
-      chrome.notifications.clear(notifId);
-      return result.result;
-    }
 
     case 'select_frame': {
       const tab = await getSessionTab(port);
@@ -3885,15 +3786,27 @@ async function dispatch(port, method, params) {
     }
 
     case 'get_new_tab': {
-      if (!lastCreatedTabId) return { error: 'No new tab detected' };
-      try {
-        const tab = await chrome.tabs.get(lastCreatedTabId);
-        // Claim the new tab for this session
-        await addTabToSession(port, tab.id);
-        return { id: tab.id, url: tab.url, title: tab.title };
-      } catch {
-        return { error: 'Tab no longer exists' };
+      // The remembered id can be stale (the popup closed, or the service worker
+      // restarted and lost it). Fall back to the newest tab in the window that no
+      // session owns — which is what "the tab that just opened" means in practice.
+      const session = getSession(port);
+      const owned = new Set([...sessions.values()].flatMap(s => [...s.tabIds]));
+      let tab = null;
+      if (lastCreatedTabId) tab = await chrome.tabs.get(lastCreatedTabId).catch(() => null);
+      if (!tab) {
+        const all = await chrome.tabs.query({});
+        const candidates = all
+          .filter(t => !owned.has(t.id) && !(t.url || '').startsWith('chrome://'))
+          .sort((a, b) => b.id - a.id); // Chrome ids increase monotonically
+        tab = candidates[0] || null;
       }
+      if (!tab) {
+        return { ok: false, error: 'No unclaimed tab found. List everything with browser_list_tabs({all:true}) and attach one with browser_attach_tab.' };
+      }
+      await addTabToSession(port, tab.id);
+      session.activeTabId = tab.id;
+      persistSessions();
+      return { ok: true, id: tab.id, url: tab.url || tab.pendingUrl || '', title: tab.title, window_id: tab.windowId, matched: lastCreatedTabId === tab.id ? 'last-created' : 'newest-unclaimed' };
     }
 
     case 'attach_tab': {
