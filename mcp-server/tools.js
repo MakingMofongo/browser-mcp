@@ -76,6 +76,31 @@ export const TOOLS = [
     },
   },
   {
+    name: 'browser_record',
+    description: 'Record a flow so it can be replayed later. Start recording, run the flow once, then stop to save it. Only page-changing actions are recorded, and each target is stored by a durable identity rather than a reference ID so it survives a fresh page load. Also lists, shows and deletes saved flows.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['start', 'stop', 'list', 'show', 'delete'], description: 'Default is start' },
+        name: { type: 'string', description: 'Flow name, required for start, show and delete' },
+      },
+    },
+  },
+  {
+    name: 'browser_replay',
+    description: 'Replay a saved flow. Each step is re-pointed at whatever now matches its recorded identity, and values can be overridden per run by passing a row whose keys match the recorded field names. Stops at the first step where the page no longer matches the recording and reports what differed, so the run can be inspected and resumed rather than continuing blindly.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Flow name from browser_record' },
+        row: { type: 'object', description: 'Values for this run, keyed by field name, for example {"Email":"a@b.com"}' },
+        start_url: { type: 'boolean', description: 'Navigate to the recorded starting URL first (default: true)' },
+        verbose: { type: 'boolean', description: 'Include per-step results' },
+      },
+      required: ['name'],
+    },
+  },
+  {
     name: 'browser_extract',
     description: 'Extract structured rows from the page. Uses a real table when there is one, otherwise infers the repeated block behind a card or list layout and lines the items up into columns. Returns the columns, the rows and where they came from. Set paginate to follow the next-page control and merge the pages.',
     inputSchema: {

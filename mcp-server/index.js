@@ -387,6 +387,8 @@ mcpServer.setRequestHandler(CallToolRequestSchema, async (request) => {
       browser_health: 'health',
       browser_form_state: 'form_state',
       browser_submit: 'submit',
+      browser_record: 'record',
+      browser_replay: 'replay',
       browser_extract: 'extract',
       browser_wait_idle: 'wait_idle',
       browser_network_log: 'network_log',
@@ -428,6 +430,7 @@ mcpServer.setRequestHandler(CallToolRequestSchema, async (request) => {
     const timeout = method === 'solve_captcha' ? 60000 :
                     method === 'batch' ? 180000 :
                     method === 'extract' ? 120000 :
+                    method === 'replay' ? 300000 :
                     method === 'submit' ? (args?.timeout || 15000) + 20000 : 30000;
     const result = await sendToExtension(method, args || {}, timeout);
 

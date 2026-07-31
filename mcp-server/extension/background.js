@@ -2316,6 +2316,85 @@ async function dropFileOnTarget(tabId, selector, files) {
 
 // ── Command Dispatcher ──────────────────────────────────────────────────────
 
+// ── Flow recording and replay ──────────────────────────────────────────────
+// A recorded step must survive a fresh page load, so the target is stored as a
+// durable identity (id, name attribute, or role + accessible name + index) rather
+// than a ref number, which is only meaningful within one page instance.
+
+function bmcpPortableTarget(selector) {
+  const deepQ = (root, s) => {
+    let el = null;
+    try { el = root.querySelector(s); } catch (e) { return null; }
+    if (el) return el;
+    for (const n of root.querySelectorAll('*')) if (n.shadowRoot) { const f = deepQ(n.shadowRoot, s); if (f) return f; }
+    return null;
+  };
+  const walkAll = (root, out) => {
+    for (const e of root.querySelectorAll('*')) { out.push(e); if (e.shadowRoot) walkAll(e.shadowRoot, out); }
+    return out;
+  };
+  const nm = (e) => {
+    const a = e.getAttribute && e.getAttribute('aria-label');
+    if (a) return a.trim();
+    if (e.labels && e.labels[0]) return e.labels[0].textContent.trim().replace(/\s+/g, ' ');
+    if (e.placeholder) return e.placeholder.trim();
+    const t = (e.textContent || '').trim().replace(/\s+/g, ' ');
+    return t ? t.slice(0, 80) : (e.name || e.id || '');
+  };
+  let el = null;
+  const rm = /^ref[_=](\d+)$/.exec(selector || '');
+  if (rm) el = (window.__bmcpRefEls || {})['ref_' + rm[1]];
+  else if (selector && (selector.startsWith('text=') || /^\w+:text\(/.test(selector))) {
+    const tm = /^(\w+):text\((.+)\)$/.exec(selector);
+    const needle = (tm ? tm[2] : selector.slice(5)).trim();
+    const want = tm ? tm[1].toUpperCase() : null;
+    const all = walkAll(document, []);
+    const m = all.filter(e => (!want || e.tagName === want) && (e.textContent || '').trim().includes(needle));
+    el = m.filter(e => !m.some(o => o !== e && e.contains && e.contains(o)))[0] || m[0] || null;
+  } else if (selector) el = deepQ(document, selector);
+  if (!el || !el.isConnected) return null;
+
+  const name = nm(el);
+  const peers = walkAll(document, []).filter(p => p.tagName === el.tagName && nm(p) === name);
+  return {
+    css: el.id ? '#' + CSS.escape(el.id)
+       : (el.getAttribute('name') ? `${el.tagName.toLowerCase()}[name="${el.getAttribute('name')}"]` : null),
+    tag: el.tagName,
+    type: (el.type || '').toLowerCase(),
+    name,
+    idx: Math.max(0, peers.indexOf(el)),
+    label_source: el.getAttribute('aria-label') ? 'aria-label' : (el.labels && el.labels[0] ? 'label' : 'text'),
+  };
+}
+
+// Turn a stored identity back into a live element on whatever page is loaded now.
+function bmcpResolvePortable(t) {
+  const walkAll = (root, out) => {
+    for (const e of root.querySelectorAll('*')) { out.push(e); if (e.shadowRoot) walkAll(e.shadowRoot, out); }
+    return out;
+  };
+  const nm = (e) => {
+    const a = e.getAttribute && e.getAttribute('aria-label');
+    if (a) return a.trim();
+    if (e.labels && e.labels[0]) return e.labels[0].textContent.trim().replace(/\s+/g, ' ');
+    if (e.placeholder) return e.placeholder.trim();
+    const x = (e.textContent || '').trim().replace(/\s+/g, ' ');
+    return x ? x.slice(0, 80) : (e.name || e.id || '');
+  };
+  if (t.css) {
+    try { const el = document.querySelector(t.css); if (el) return { found: true, css: t.css }; } catch (e) {}
+  }
+  const cands = walkAll(document, []).filter(e =>
+    e.tagName === t.tag && (t.type ? (e.type || '').toLowerCase() === t.type : true) && nm(e) === t.name);
+  if (!cands.length) return { found: false, tried: t };
+  const el = cands[Math.min(t.idx || 0, cands.length - 1)];
+  // Hand back a one-shot ref so the caller can act on exactly this element.
+  if (!window.__bmcpRefEls) { window.__bmcpRefEls = {}; window.__bmcpRefSeq = 0; }
+  const key = 'ref_' + (++window.__bmcpRefSeq);
+  window.__bmcpRefEls[key] = el;
+  return { found: true, ref: key, ambiguous: cands.length > 1 ? cands.length : undefined };
+}
+
 // ── Structured extraction ──────────────────────────────────────────────────
 // Injected whole (chrome.scripting does not serialise closures). Prefers a real
 // <table>; otherwise infers the repeated block that makes up a card or list layout
@@ -2500,7 +2579,51 @@ const OBSERVABLE = new Set([
   'double_click', 'click_xy', 'submit', 'set_date', 'set_combobox', 'hover', 'scroll',
 ]);
 
+// Steps worth reproducing. Reads are excluded: replay repeats what changes the
+// page, and re-running perception adds time without affecting the outcome.
+const RECORDABLE = new Set([
+  'navigate', 'click', 'fill', 'press_key', 'select_option', 'submit', 'drag',
+  'set_date', 'set_combobox', 'double_click', 'triple_click', 'upload_file',
+  'drop_file', 'wait', 'wait_idle', 'dismiss_overlays', 'scroll',
+]);
+const recording = new Map(); // port → { name, steps: [] }
+
+async function recordStep(port, method, params, result) {
+  const rec = recording.get(port);
+  if (!rec || !RECORDABLE.has(method)) return;
+  const step = { method, params: { ...params } };
+  delete step.params.observe;
+  if (params?.selector) {
+    try {
+      const tab = await getSessionTab(port);
+      const [r] = await chrome.scripting.executeScript({
+        target: { tabId: tab.id }, world: 'MAIN', func: bmcpPortableTarget, args: [params.selector],
+      });
+      if (r?.result) step.target = r.result;
+    } catch { /* selector may already be gone; the raw selector is kept as fallback */ }
+  }
+  if (result && typeof result === 'object') {
+    step.expect = {};
+    if (result.outcome) step.expect.outcome = result.outcome;
+    if (result.value_after !== undefined) step.expect.filled = true;
+    if (result.verified !== undefined) step.expect.verified = result.verified;
+    if (result.url_after) step.expect.url = result.url_after;
+    if (!Object.keys(step.expect).length) delete step.expect;
+  }
+  rec.steps.push(step);
+}
+
 async function dispatch(port, method, params) {
+  const rec = recording.get(port);
+  if (rec && RECORDABLE.has(method)) {
+    const result = await dispatchInner(port, method, params);
+    await recordStep(port, method, params, result).catch(() => {});
+    return result;
+  }
+  return dispatchInner(port, method, params);
+}
+
+async function dispatchInner(port, method, params) {
   if (!params || !params.observe || !OBSERVABLE.has(method)) {
     return dispatchCore(port, method, params);
   }
@@ -3489,7 +3612,7 @@ async function dispatchCore(port, method, params) {
         selector = f.result.ref;
       }
 
-      const clickRes = await dispatch(port, 'click', { selector });
+      const clickRes = await dispatchCore(port, 'click', { selector });
       if (clickRes && clickRes.ok === false) {
         return { ok: false, outcome: 'click_failed', click: clickRes, error: clickRes.error };
       }
@@ -3535,6 +3658,124 @@ async function dispatchCore(port, method, params) {
         hint: clickRes?.verified === false
           ? 'The click never reached the page (verified:false). The control may be covered by an overlay or in an iframe — try browser_dismiss_overlays, browser_list_frames, or browser_click_xy from a screenshot.'
           : 'The click landed but the page did not react within the timeout: the control may need a different trigger (press Enter in the field), the form may be blocked by hidden/invalid fields (check browser_form_state), or the request is slow (check browser_network_log).',
+      };
+    }
+
+    case 'record': {
+      const action = params.action || 'start';
+      const store = await chrome.storage.local.get({ bmcpFlows: {} });
+      const flows = store.bmcpFlows;
+
+      if (action === 'list') {
+        return {
+          flows: Object.entries(flows).map(([name, f]) => ({
+            name, steps: f.steps.length, start_url: f.start_url, saved: f.saved,
+            fields: f.steps.filter(s => s.method === 'fill').map(s => s.target?.name || s.params?.selector),
+          })),
+          recording: recording.has(port) ? recording.get(port).name : null,
+        };
+      }
+      if (action === 'show') {
+        const f = flows[params.name];
+        if (!f) return { ok: false, error: `No flow named ${params.name}` };
+        return { name: params.name, ...f };
+      }
+      if (action === 'delete') {
+        if (!flows[params.name]) return { ok: false, error: `No flow named ${params.name}` };
+        delete flows[params.name];
+        await chrome.storage.local.set({ bmcpFlows: flows });
+        return { ok: true, deleted: params.name };
+      }
+      if (action === 'start') {
+        if (!params.name) return { ok: false, error: 'name required' };
+        const tab = await getSessionTab(port).catch(() => null);
+        recording.set(port, { name: params.name, steps: [], start_url: tab?.url || null });
+        return { ok: true, recording: params.name, note: 'Actions that change the page are being recorded. Call again with action:"stop" to save.' };
+      }
+      if (action === 'stop') {
+        const rec = recording.get(port);
+        if (!rec) return { ok: false, error: 'Not recording' };
+        recording.delete(port);
+        if (!rec.steps.length) return { ok: false, error: 'Nothing was recorded — no page-changing actions ran.' };
+        flows[rec.name] = { steps: rec.steps, start_url: rec.start_url, saved: new Date().toISOString() };
+        await chrome.storage.local.set({ bmcpFlows: flows });
+        return {
+          ok: true, saved: rec.name, steps: rec.steps.length,
+          fields: rec.steps.filter(s => s.method === 'fill').map(s => s.target?.name || s.params?.selector).filter(Boolean),
+          note: 'Replay with browser_replay. Field values can be overridden per run by passing row keys that match the field names above.',
+        };
+      }
+      return { ok: false, error: `Unknown action: ${action}` };
+    }
+
+    case 'replay': {
+      const store = await chrome.storage.local.get({ bmcpFlows: {} });
+      const flow = store.bmcpFlows[params.name];
+      if (!flow) return { ok: false, error: `No flow named ${params.name}. List them with browser_record({action:"list"}).` };
+      const row = params.row || null;
+      const results = [];
+      let diverged = null;
+
+      if (params.start_url !== false && flow.start_url) {
+        await dispatchCore(port, 'navigate', { url: flow.start_url }).catch(() => {});
+      }
+
+      for (let i = 0; i < flow.steps.length; i++) {
+        const step = flow.steps[i];
+        const p = { ...step.params };
+
+        // Re-point the step at whatever now matches its recorded identity.
+        if (step.target) {
+          const tab = await getSessionTab(port);
+          const [r] = await chrome.scripting.executeScript({
+            target: { tabId: tab.id }, world: 'MAIN', func: bmcpResolvePortable, args: [step.target],
+          }).catch(() => [null]);
+          const res = r?.result;
+          if (!res?.found) {
+            diverged = { step: i, method: step.method, reason: 'target-not-found', looked_for: step.target };
+            break;
+          }
+          p.selector = res.ref || res.css;
+          if (res.ambiguous) p._ambiguous = res.ambiguous;
+        }
+
+        // Per-run values: a row key matching the field's name wins over the recorded one.
+        if (step.method === 'fill' && row && step.target?.name) {
+          const key = Object.keys(row).find(k => k.toLowerCase() === String(step.target.name).toLowerCase());
+          if (key) p.value = String(row[key]);
+        }
+
+        let out;
+        try { out = await dispatchCore(port, step.method, p); }
+        catch (e) { out = { ok: false, error: e?.message || String(e) }; }
+        results.push({ step: i, method: step.method, ok: out?.ok !== false, value: p.value });
+
+        // Escalate on divergence rather than ploughing on into a wrong page.
+        const failed = out && typeof out === 'object' && (out.ok === false || out.found === false);
+        const wrongOutcome = step.expect?.outcome && out?.outcome && out.outcome !== step.expect.outcome;
+        if (failed || wrongOutcome) {
+          diverged = {
+            step: i, method: step.method,
+            reason: wrongOutcome ? 'different-outcome' : 'step-failed',
+            expected: step.expect || null,
+            actual: out,
+          };
+          break;
+        }
+      }
+
+      const tab = await getSessionTab(port).catch(() => null);
+      return {
+        ok: !diverged,
+        flow: params.name,
+        steps_run: results.length,
+        steps_total: flow.steps.length,
+        results: params.verbose ? results : undefined,
+        url: tab?.url,
+        ...(diverged ? {
+          diverged_at: diverged,
+          hint: 'The page no longer matches the recording at this step. Inspect with browser_form_state or browser_read_page, handle this case, then continue or re-record.',
+        } : {}),
       };
     }
 
