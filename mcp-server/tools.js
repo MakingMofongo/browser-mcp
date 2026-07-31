@@ -115,6 +115,8 @@ export const TOOLS = [
         row: { type: 'object', description: 'Values for this run, keyed by field name, for example {"Email":"a@b.com"}' },
         rows: { type: 'array', items: { type: 'object' }, description: 'Run the flow once per row in a single call, up to 500. A divergence is classified: a transient one is retried once, a row the page rejects is skipped, and a structural mismatch pauses the run with the remaining rows kept for resume.' },
         resume: { type: 'string', description: 'Run id from a paused run; continues with the rows still pending.' },
+        dry_run: { type: 'boolean', description: 'Drive the flow but hold back anything that would submit, then report whether the form would have been accepted. Use to check a batch against real validation before committing anything.' },
+        retry_committed: { type: 'boolean', description: 'On resume, also retry rows that failed after a request had already been sent. Those are held back by default because re-running them can create a duplicate.' },
         start_url: { type: 'boolean', description: 'Navigate to the recorded starting URL first (default: true)' },
         verbose: { type: 'boolean', description: 'Include per-step results' },
       },
@@ -128,7 +130,7 @@ export const TOOLS = [
       type: 'object',
       properties: {
         id: { type: 'string', description: 'Run id to inspect' },
-        status: { type: 'string', enum: ['pending', 'done', 'skipped', 'failed'], description: 'Only rows with this status' },
+        status: { type: 'string', enum: ['pending', 'done', 'skipped', 'failed', 'needs_review'], description: 'Only rows with this status' },
         delete: { type: 'string', description: 'Run id to remove' },
       },
     },
