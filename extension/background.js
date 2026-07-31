@@ -2091,6 +2091,22 @@ async function dismissOverlays(tabId, scope = 'non_critical', maxPasses = 3) {
         const hasTextFields = editableTextInputs.length > 0;
         const hasOnlyCheckboxRadios = !hasTextFields && allEditableInputs.length > 0;
 
+        // On plenty of portals the modal IS the workflow — it holds the form and the
+        // button that submits it. Closing that is not tidying up, it is discarding
+        // the step. Anything carrying a submit control is left alone unless the
+        // caller explicitly asked for aggressive.
+        const submitish = /^(submit|save|continue|next|apply|pay|confirm|send|finish|update|create|add|book|sign in|log in)\b/i;
+        const hasSubmit = !!overlay.querySelector('button[type="submit"], input[type="submit"]') ||
+          [...overlay.querySelectorAll('button, [role="button"], a.btn')].some(b => submitish.test((b.textContent || '').trim()));
+        if (s !== 'aggressive' && hasSubmit) {
+          skipped.push({
+            role,
+            reason: 'left alone: contains a submit control, so this dialog is probably the form itself',
+            hasTextFields,
+          });
+          continue;
+        }
+
         // Determine if ambiguous keywords (Skip/Cancel/Afvis) are allowed
         let allowAmbiguous;
         if (s === 'aggressive') {
@@ -2767,7 +2783,15 @@ async function dispatchCore(port, method, params) {
             // Require the candidate to hold a meaningful share of page text
             return (best && bestLen > 400) ? best : document.body;
           };
-          const root = pickRoot().cloneNode(true);
+          const picked = pickRoot();
+          // Readability-style extraction assumes a document. On a dashboard there is
+          // no article to find, so it returns navigation and widget labels dressed up
+          // as content. Compare what was kept against the whole page and against how
+          // interactive the page is, and say when the result should not be trusted.
+          const fullLen = (document.body.innerText || '').length;
+          const controls = document.querySelectorAll('button, input, select, a[href]').length;
+          const usedBody = picked === document.body;
+          const root = picked.cloneNode(true);
           const STRIP = 'nav, header, footer, aside, script, style, noscript, iframe, form, ' +
             '[role="navigation"], [role="banner"], [role="contentinfo"], [role="complementary"], ' +
             '[role="dialog"], [aria-hidden="true"], [class*="cookie" i], [class*="sidebar" i], ' +
@@ -2778,7 +2802,19 @@ async function dispatchCore(port, method, params) {
             .replace(/[ \t]+/g, ' ')
             .replace(/\n{3,}/g, '\n\n')
             .trim();
-          return text;
+          const density = fullLen ? controls / (fullLen / 1000) : 0; // controls per 1k chars
+          const low = usedBody || density > 12 || text.length < 250;
+          return {
+            text,
+            confidence: low ? 'low' : 'high',
+            ...(low ? {
+              reason: usedBody
+                ? 'no article container found, so this is the whole body with boilerplate stripped'
+                : density > 12
+                ? 'the page is control-dense and reads like an application rather than a document'
+                : 'very little text survived extraction',
+            } : {}),
+          };
         },
       });
       } catch (e) {
@@ -2793,13 +2829,22 @@ async function dispatchCore(port, method, params) {
         }
         throw e;
       }
-      let content = res?.result ?? '';
+      // article mode returns a shape; text and html return a plain string.
+      const raw = res?.result;
+      let articleMeta = null;
+      let content = '';
+      if (raw && typeof raw === 'object' && typeof raw.text === 'string') {
+        content = raw.text;
+        articleMeta = { confidence: raw.confidence, ...(raw.reason ? { confidence_reason: raw.reason } : {}) };
+      } else {
+        content = raw ?? '';
+      }
       const fullLength = content.length;
       if (content.length > maxChars) {
         content = content.slice(0, maxChars) +
           `\n\n[TRUNCATED: showing ${maxChars} of ${fullLength} chars — pass max_chars for more, or format:"article" to strip boilerplate]`;
       }
-      return { content, url: tab.url, title: tab.title, length: fullLength, format };
+      return { content, url: tab.url, title: tab.title, length: fullLength, format, ...(articleMeta || {}) };
     }
 
     case 'screenshot': {
@@ -2881,18 +2926,23 @@ async function dispatchCore(port, method, params) {
       const replFunc = (codeStr) => {
         const asErr = (e) => ({ __scriptingError: true, message: String(e?.message || e), name: e?.name });
         // Under `require-trusted-types-for 'script'` (Gmail, Workspace, banks) the
-        // Function constructor rejects plain strings. Route the source through a
-        // pass-through policy so the same code is legal on hardened pages.
-        try {
-          if (window.trustedTypes && window.trustedTypes.createPolicy) {
-            if (!window.__bmcpTT) {
-              window.__bmcpTT = window.trustedTypes.createPolicy('bmcp-exec', {
-                createHTML: (s) => s, createScript: (s) => s, createScriptURL: (s) => s,
-              });
+        // Function constructor rejects plain strings. Wrap only at the point of
+        // construction: the policy returns a TrustedScript object, and applying it
+        // to codeStr itself broke every string operation performed on the source.
+        const trust = (src) => {
+          try {
+            if (window.trustedTypes && window.trustedTypes.createPolicy) {
+              if (!window.__bmcpTT) {
+                window.__bmcpTT = window.trustedTypes.createPolicy('bmcp-exec', {
+                  createHTML: (s) => s, createScript: (s) => s, createScriptURL: (s) => s,
+                });
+              }
+              if (window.__bmcpTT && window.__bmcpTT.createScript) return window.__bmcpTT.createScript(src);
             }
-            if (window.__bmcpTT && window.__bmcpTT.createScript) codeStr = window.__bmcpTT.createScript(codeStr);
-          }
-        } catch (e) { /* policy blocked; fall through and let the debugger path handle it */ }
+          } catch (e) { /* policy blocked; the debugger path still works */ }
+          return src;
+        };
+        const mkFn = (src) => new Function(trust(src));
         const tryEval = (build) => {
           const fn = build();
           const v = fn();
@@ -2913,24 +2963,24 @@ async function dispatchCore(port, method, params) {
           return parts.join(';') + ';\nreturn (' + tail + '\n);';
         };
         try {
-          return tryEval(() => new Function('return (' + codeStr + '\n)'));
+          return tryEval(() => mkFn('return (' + codeStr + '\n)'));
         } catch (e1) {
           if (e1?.name !== 'SyntaxError') return asErr(e1);
           try {
             // Await-containing single EXPRESSION ("await fetch(...)"): wrap so the
             // awaited value is RETURNED, not discarded as a statement.
-            return tryEval(() => new Function('return (async () => { return (' + codeStr + '\n); })()'));
+            return tryEval(() => mkFn('return (async () => { return (' + codeStr + '\n); })()'));
           } catch (e1b) {
             if (e1b?.name !== 'SyntaxError') return asErr(e1b);
             const rewritten = withLastExprReturn();
             if (rewritten != null) {
               try {
-                return tryEval(() => new Function('return (async () => {\n' + rewritten + '\n})()'));
+                return tryEval(() => mkFn('return (async () => {\n' + rewritten + '\n})()'));
               } catch { /* fall through to plain body */ }
             }
             try {
               // Statement code / top-level return: async-body wrap
-              return tryEval(() => new Function('return (async () => {\n' + codeStr + '\n})()'));
+              return tryEval(() => mkFn('return (async () => {\n' + codeStr + '\n})()'));
             } catch (e2) {
               return asErr(e2);
             }
@@ -4537,9 +4587,24 @@ async function dispatchCore(port, method, params) {
             (!onlyErrors || l.type === 'error' || l.type === 'exception') &&
             (!re || re.test(l.text)));
           const total = out.length;
-          out = out.slice(-count);
-          if (clear) buf.length = 0;
-          return { logs: out, total_matched: total, captured_since_load: !!window.__mcpConsoleLogs };
+          // Development builds repeat the same warning hundreds of times and bury
+          // the one line that matters. Identical messages collapse to a single entry
+          // with a count, so the signal survives the noise.
+          const seen = new Map();
+          for (const l of out) {
+            const key = l.type + '|' + l.text;
+            if (seen.has(key)) { const e = seen.get(key); e.repeats = (e.repeats || 1) + 1; e.ts = l.ts; }
+            else seen.set(key, { ...l });
+          }
+          const collapsed = [...seen.values()];
+          const deduped = total - collapsed.length;
+          return {
+            logs: collapsed.slice(-count),
+            total_matched: total,
+            unique: collapsed.length,
+            ...(deduped > 0 ? { duplicates_collapsed: deduped } : {}),
+            captured_since_load: !!window.__mcpConsoleLogs,
+          };
         },
       });
       const r = res?.result || { logs: [], captured_since_load: false };
