@@ -958,15 +958,11 @@ function bmcpFillOp(op, selOrExpected, TAG, extra) {
         const cur = String(readVal(s.el));
         if (cur === s.v) continue;
         if (cur.includes(expected) || expected.includes(cur)) {
-          if (s.el.isContentEditable) s.el.textContent = s.v;
-          else {
-            const p = s.el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-            const dd = Object.getOwnPropertyDescriptor(p, 'value');
-            if (dd && dd.set) dd.set.call(s.el, s.v); else s.el.value = s.v;
-          }
-          s.el.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
-          s.el.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
-          collateral.push((s.el.name || s.el.id || s.el.tagName) + ' (restored)');
+          // Deliberately not repaired. Writing the old value back fires the
+          // framework's change handlers and can flip the form to unsaved-changes,
+          // and a silent repair hides the fact that a write went somewhere it
+          // should not have. Report it and let the caller stop.
+          collateral.push((s.el.name || s.el.id || s.el.tagName) + ' (received this value)');
         }
       }
     }
@@ -1078,7 +1074,10 @@ async function fillElementDeep(tabId, selector, value) {
     focus_verified: !!info.focused,
     ...(info.inShadow ? { shadow_dom: true } : {}),
     ...(info.focused ? {} : { focus_drift: info.focus_landed_on }),
-    ...(verify?.collateral?.length ? { collateral_restored: verify.collateral } : {}),
+    ...(verify?.collateral?.length ? {
+      collateral_written: verify.collateral,
+      error: "This value also landed in another field. Nothing was rewritten, because repairing it would fire the page's own change handlers and hide the fault. Check those fields before continuing.",
+    } : {}),
     ...(accepted ? {} : {
       error: finalValue === '' || finalValue == null
         ? 'Value did not persist — the framework reverted it after input (common on Salesforce LWC / React controlled inputs). The field will likely save blank.'
@@ -4091,15 +4090,25 @@ async function dispatchCore(port, method, params) {
               i++; j++;
               continue;
             }
+            // A field the page marks required is part of every run by definition.
+            // Demoting one to conditional produces the worst outcome available: a
+            // replay that completes successfully with the form half empty.
+            const mark = (st) => ({ ...st, optional: st.target?.required ? undefined : true });
             const oldAhead = j < newS.length ? oldS.slice(i).findIndex(s => key(s) === key(newS[j])) : -1;
-            if (oldAhead > 0) { out.push({ ...oldS[i], optional: true }); i++; continue; }
-            if (j < newS.length) { out.push({ ...newS[j], optional: true }); j++; continue; }
-            if (i < oldS.length) { out.push({ ...oldS[i], optional: true }); i++; continue; }
+            if (oldAhead > 0) { out.push(mark(oldS[i])); i++; continue; }
+            if (j < newS.length) { out.push(mark(newS[j])); j++; continue; }
+            if (i < oldS.length) { out.push(mark(oldS[i])); i++; continue; }
           }
           steps = out;
+          const cond = steps.filter(s => s.optional).length;
+          const ratio = steps.length ? cond / steps.length : 0;
           merged = {
-            required: steps.filter(s => !s.optional).length,
-            conditional: steps.filter(s => s.optional).length,
+            required: steps.length - cond,
+            conditional: cond,
+            alignment: ratio > 0.5 ? 'low' : ratio > 0.25 ? 'partial' : 'high',
+            ...(ratio > 0.5 ? {
+              warning: 'More than half the steps came out conditional, which usually means the two passes were different flows rather than variations of one — a portal that renames or reorders fields per record type does this. Replay would skip most steps and still report success. Re-record instead of extending.',
+            } : {}),
           };
         }
 
@@ -4173,12 +4182,24 @@ async function dispatchCore(port, method, params) {
         };
 
         const postsSeen = () => (networkLogs.get((getSession(port).activeTabId) || -1) || [])
-          .filter(e => e.method === 'POST' || e.method === 'PUT').length;
+          .filter(e => (e.method === 'POST' || e.method === 'PUT' || e.method === 'PATCH') &&
+            // 3xx to a sign-in page, 401 and 403 all mean the write was refused.
+            !(e.status >= 300 && e.status < 400) && e.status !== 401 && e.status !== 403)
+          .length;
 
         await persist();
         let stopped = null;
         for (const entry of ledger.rows) {
           if (entry.status === 'done' || entry.status === 'skipped') continue;
+          if (entry.status === 'in_progress' && !params.retry_committed) {
+            // The worker stopped while this row was running — Chrome evicts an idle
+            // service worker, and a long run is exactly that workload. Whether it
+            // completed is unknown, so it is not silently repeated.
+            entry.status = 'needs_review';
+            entry.note = 'the run stopped while this row was in flight, so its outcome is unknown. Check the site, then mark it done or re-run with retry_committed:true.';
+            await persist();
+            continue;
+          }
           // A row that failed after something was posted may already exist on the
           // other side. Re-running it blind is how a resume creates duplicates, so
           // it is held for review unless the caller says to retry it anyway.
@@ -4188,6 +4209,9 @@ async function dispatchCore(port, method, params) {
             await persist();
             continue;
           }
+          entry.status = 'in_progress';
+          entry.started_at = new Date().toISOString();
+          await persist();
           const postsBefore = postsSeen();
           let r = await dispatchCore(port, 'replay', { ...params, rows: undefined, resume: undefined, row: entry.row, verbose: false });
           let kind = r.ok ? null : classify(r.diverged_at);
@@ -4311,6 +4335,47 @@ async function dispatchCore(port, method, params) {
       const SUBMITISH = /^(submit|save|continue|next|apply|pay|confirm|send|finish|create|book|place order|sign in|log in)\b/i;
       const dryRun = params.dry_run === true;
 
+      // Holding back steps whose label reads like a commit is a guess, and it is
+      // wrong in both directions: a "Next" that saves server-side commits anyway,
+      // while a "Submit" that only opens a confirmation modal commits nothing. So
+      // during a dry run the guarantee is enforced at the network layer — anything
+      // that is not a safe method is blocked outright and reported.
+      const blocked = [];
+      let dryGuard = null;
+      if (dryRun) {
+        const tabForGuard = await getSessionTab(port);
+        dryGuard = { tabId: tabForGuard.id, handler: null };
+        try {
+          await debuggerAttach(dryGuard.tabId);
+          dryGuard.handler = (source, method, evt) => {
+            if (source.tabId !== dryGuard.tabId || method !== 'Fetch.requestPaused') return;
+            const m = (evt.request?.method || 'GET').toUpperCase();
+            const safe = m === 'GET' || m === 'HEAD' || m === 'OPTIONS';
+            if (safe) {
+              chrome.debugger.sendCommand({ tabId: dryGuard.tabId }, 'Fetch.continueRequest', { requestId: evt.requestId }).catch(() => {});
+            } else {
+              blocked.push({ method: m, url: (evt.request?.url || '').slice(0, 200) });
+              chrome.debugger.sendCommand({ tabId: dryGuard.tabId }, 'Fetch.failRequest', { requestId: evt.requestId, errorReason: 'Aborted' }).catch(() => {});
+            }
+          };
+          chrome.debugger.onEvent.addListener(dryGuard.handler);
+          await cdpSend(dryGuard.tabId, 'Fetch.enable', { patterns: [{ urlPattern: '*', requestStage: 'Request' }] });
+        } catch (e) {
+          if (dryGuard.handler) chrome.debugger.onEvent.removeListener(dryGuard.handler);
+          dryGuard = null;
+          return {
+            ok: false, flow: params.name,
+            error: `Could not arm the dry run: ${e?.message || e}. Without request blocking a dry run cannot promise it will not commit, so it was not started.`,
+          };
+        }
+      }
+      const disarm = async () => {
+        if (!dryGuard) return;
+        try { await cdpSend(dryGuard.tabId, 'Fetch.disable', {}); } catch {}
+        if (dryGuard.handler) chrome.debugger.onEvent.removeListener(dryGuard.handler);
+        dryGuard = null;
+      };
+
       for (let i = 0; i < flow.steps.length; i++) {
         const step = flow.steps[i];
         const p = { ...step.params };
@@ -4319,13 +4384,19 @@ async function dispatchCore(port, method, params) {
         // against real validation before anything is submitted for the first time.
         // Recorded clicks that look like a submit are held back too, since a click
         // is what commits on forms that were not recorded via browser_submit.
-        if (dryRun) {
-          const looksCommitting = step.method === 'submit' ||
-            (step.method === 'click' && SUBMITISH.test(String(step.target?.name || '')));
-          if (looksCommitting) {
-            results.push({ step: i, method: step.method, ok: true, held: 'not submitted (dry run)' });
-            continue;
-          }
+        if (dryRun && step.method === 'submit') {
+          // Run the real submit path, including its own control detection — a dry
+          // run that takes a different code path is not testing the thing that will
+          // run for real. The network guard is what prevents the commit, so the
+          // outcome it reports is expected to be a failure to progress.
+          const out = await dispatchCore(port, 'submit', { ...p, timeout: Math.min(p.timeout || 6000, 6000) })
+            .catch(e => ({ ok: false, error: e?.message }));
+          results.push({
+            step: i, method: 'submit', ok: true,
+            dry: 'submitted with state-changing requests blocked',
+            attempted: out?.outcome || (out?.error ? 'error: ' + out.error : 'unknown'),
+          });
+          continue;
         }
 
         // Re-point the step at whatever now matches its recorded identity.
@@ -4334,10 +4405,21 @@ async function dispatchCore(port, method, params) {
           const [r] = await chrome.scripting.executeScript({
             target: { tabId: tab.id }, world: 'MAIN', func: bmcpResolvePortable, args: [step.target],
           }).catch(() => [null]);
-          const res = r?.result;
+          let res = r?.result;
+          if (!res?.found && step.optional) {
+            // Frameworks render sections after the page has otherwise settled, so a
+            // single look decides "branch not taken" for a step that was about to
+            // exist. Re-check briefly before skipping.
+            for (let attempt = 0; attempt < 6 && !res?.found; attempt++) {
+              await new Promise(r2 => setTimeout(r2, 150));
+              const [again] = await chrome.scripting.executeScript({
+                target: { tabId: (await getSessionTab(port)).id }, world: 'MAIN',
+                func: bmcpResolvePortable, args: [step.target],
+              }).catch(() => [null]);
+              res = again?.result;
+            }
+          }
           if (!res?.found) {
-            // A conditional step's target being absent is the branch not applying,
-            // not a break. This is what lets one flow cover data-dependent forks.
             if (step.optional) {
               results.push({ step: i, method: step.method, ok: true, skipped: 'condition not present' });
               continue;
@@ -4378,6 +4460,7 @@ async function dispatchCore(port, method, params) {
 
       // With nothing submitted, the useful answer is whether it WOULD have been
       // accepted — so read the validation state the form is now showing.
+      await disarm();
       let validation;
       if (dryRun && !diverged && tab) {
         try {
@@ -4397,7 +4480,12 @@ async function dispatchCore(port, method, params) {
       return {
         ok: !diverged && (!validation || validation.would_submit !== false),
         flow: params.name,
-        ...(dryRun ? { dry_run: true, committed: false } : {}),
+        ...(dryRun ? {
+          dry_run: true,
+          committed: false,
+          blocked_requests: blocked.length,
+          ...(blocked.length ? { blocked: blocked.slice(0, 8) } : { note: 'No state-changing request was attempted, so this flow commits nothing before the steps that were run.' }),
+        } : {}),
         ...(validation ? { validation } : {}),
         steps_run: results.length,
         steps_total: flow.steps.length,
