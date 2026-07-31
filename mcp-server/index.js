@@ -15,6 +15,7 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprot
 import { WebSocketServer } from 'ws';
 import { execSync } from 'child_process';
 import { dirname, join, resolve } from 'path';
+import { homedir } from 'os';
 import { fileURLToPath } from 'url';
 import { readFileSync, writeFileSync, mkdirSync } from 'fs';
 import { TOOLS } from './tools.js';
@@ -30,27 +31,60 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const repoDir = dirname(__dirname); // parent of mcp-server/
 
 let extensionUpdated = false;
-try {
-  const before = execSync('git rev-parse HEAD', { cwd: repoDir }).toString().trim();
-  execSync('git pull --ff-only 2>/dev/null', { cwd: repoDir, timeout: 10000 });
-  const after = execSync('git rev-parse HEAD', { cwd: repoDir }).toString().trim();
-  if (before !== after) {
+
+// Keep the installed extension current from the hosted channel. This is the path
+// that works for unpacked installs, which Chrome never auto-updates, and it needs
+// no enterprise policy and no administrator rights. Machines that prefer Chrome to
+// manage the extension use install-policy.mjs instead; both end at the same version.
+const CHANNEL = 'https://makingmofongo.github.io/browser-mcp-dist';
+const EXT_DIR = join(homedir(), '.browser-mcp', 'extension');
+
+async function updateExtensionFromChannel() {
+  const cmp = (a, b) => {
+    const pa = String(a).split('.').map(Number), pb = String(b).split('.').map(Number);
+    for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+      const d = (pa[i] || 0) - (pb[i] || 0);
+      if (d) return d;
+    }
+    return 0;
+  };
+  let installed = '0.0.0';
+  try { installed = JSON.parse(readFileSync(join(EXT_DIR, 'manifest.json'), 'utf8')).version; } catch { return; }
+
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), 8000);
+  try {
+    const meta = await fetch(`${CHANNEL}/version.json`, { signal: ctl.signal }).then(r => r.ok ? r.json() : null);
+    if (!meta?.version || !Array.isArray(meta.files)) return;
+    if (cmp(meta.version, installed) <= 0) {
+      process.stderr.write(`[MCP] Extension up to date (${installed})\n`);
+      return;
+    }
+    const fetched = [];
+    for (const rel of meta.files) {
+      const res = await fetch(`${CHANNEL}/extension/${rel}`, { signal: ctl.signal });
+      if (!res.ok) throw new Error(`${rel} -> HTTP ${res.status}`);
+      fetched.push([rel, Buffer.from(await res.arrayBuffer())]);
+    }
+    // Write only after every file downloaded, so a half-fetched update can never
+    // leave a broken extension on disk.
+    for (const [rel, buf] of fetched) {
+      const dest = join(EXT_DIR, rel);
+      mkdirSync(dirname(dest), { recursive: true });
+      writeFileSync(dest, buf);
+    }
     extensionUpdated = true;
-    process.stderr.write(`[MCP] Updated to ${after.slice(0, 8)} — extension reload recommended\n`);
-    // Check if npm deps changed
-    try {
-      const diff = execSync(`git diff ${before} ${after} -- mcp-server/package.json`, { cwd: repoDir }).toString();
-      if (diff) {
-        execSync('npm install --silent', { cwd: `${repoDir}/mcp-server`, timeout: 30000 });
-        process.stderr.write('[MCP] Dependencies updated\n');
-      }
-    } catch {}
-  } else {
-    process.stderr.write('[MCP] Already up to date\n');
+    process.env.BROWSER_MCP_EXTENSION_UPDATED = '1';
+    process.stderr.write(`[MCP] Extension updated ${installed} -> ${meta.version}; reloading it on connect\n`);
+  } catch (e) {
+    process.stderr.write(`[MCP] Extension update check skipped: ${String(e.message || e).split('\n')[0]}\n`);
+  } finally {
+    clearTimeout(timer);
   }
-} catch (e) {
-  process.stderr.write(`[MCP] Auto-update skipped: ${e.message?.split('\n')[0]}\n`);
 }
+
+// Fire-and-forget: never delay server startup on a network call.
+updateExtensionFromChannel();
 
 const BASE_PORT = 9876;
 const MAX_PORT = 9895; // 20 ports instead of 10 — zombies die within 5s via parent check

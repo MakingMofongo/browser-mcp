@@ -89,6 +89,18 @@ if (!existsSync(join(DIST, '.git'))) {
 }
 
 copyFileSync(stagedCrx, join(DIST, 'browser-mcp.crx'));
+
+// Also publish the raw extension files. The CRX serves Chrome's own policy-based
+// updater; these serve the MCP server's updater, which is what keeps unpacked
+// installs current on machines where writing enterprise policy is not wanted.
+const { readdirSync, statSync } = await import('fs');
+const listFiles = (dir, base = '') => readdirSync(dir).flatMap((n) => {
+  const full = join(dir, n), rel = base ? `${base}/${n}` : n;
+  return statSync(full).isDirectory() ? listFiles(full, rel) : [rel];
+});
+cpSync(EXT, join(DIST, 'extension'), { recursive: true });
+const files = listFiles(EXT);
+writeFileSync(join(DIST, 'version.json'), JSON.stringify({ version, extension_id: extId, files }, null, 2) + '\n');
 writeFileSync(join(DIST, 'updates.xml'), `<?xml version="1.0" encoding="UTF-8"?>
 <gupdate xmlns="http://www.google.com/update2/response" protocol="2.0">
   <app appid="${extId}">
