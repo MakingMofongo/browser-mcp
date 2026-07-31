@@ -76,6 +76,17 @@ export const TOOLS = [
     },
   },
   {
+    name: 'browser_wait_idle',
+    description: 'Wait until the page settles: no requests in flight, no DOM mutations for a quiet period, no visible spinner and document ready. Returns as soon as that is true, with how long it waited and why it stopped. Use after an action that triggers loading instead of guessing a fixed timeout.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        timeout: { type: 'number', description: 'Maximum time to wait in ms (default: 15000)' },
+        quiet_ms: { type: 'number', description: 'How long the DOM must stay unchanged to count as settled (default: 600)' },
+      },
+    },
+  },
+  {
     name: 'browser_network_log',
     description: 'Read the HTTP requests made by the current page, including XHR, fetch, documents and images, with method, URL, status, MIME type and duration. Recording begins when the debugger attaches to the tab, so requests made before this call are included. Filter with url_pattern or only_failed. Requests from other installed extensions are excluded unless include_extension_requests is set.',
     inputSchema: {

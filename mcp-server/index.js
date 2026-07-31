@@ -387,6 +387,7 @@ mcpServer.setRequestHandler(CallToolRequestSchema, async (request) => {
       browser_health: 'health',
       browser_form_state: 'form_state',
       browser_submit: 'submit',
+      browser_wait_idle: 'wait_idle',
       browser_network_log: 'network_log',
       browser_drag: 'drag',
       browser_triple_click: 'triple_click',
