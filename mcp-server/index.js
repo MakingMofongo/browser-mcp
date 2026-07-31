@@ -82,7 +82,8 @@ async function updateExtensionFromChannel() {
     process.env.BROWSER_MCP_EXTENSION_UPDATED = '1';
     process.stderr.write(`[MCP] Extension updated ${installed} -> ${meta.version}; reloading it on connect\n`);
   } catch (e) {
-    process.stderr.write(`[MCP] Extension update check skipped: ${String(e.message || e).split('\n')[0]}\n`);
+    channelCheckFailed = String(e.message || e).split('\n')[0];
+    process.stderr.write(`[MCP] Extension update check skipped: ${channelCheckFailed}\n`);
   } finally {
     clearTimeout(timer);
   }
@@ -540,6 +541,15 @@ mcpServer.setRequestHandler(CallToolRequestSchema, async (request) => {
     // versions behind for a week without anything saying so, which is the whole
     // reason this is here. Said once, on the call people make when something seems
     // wrong, rather than logged to a stream nobody reads.
+    // Not knowing is its own answer. If the channel could not be reached, saying
+    // nothing would read exactly like "you are current" — and an install left on
+    // old code with no warning is precisely what this is here to prevent.
+    if (method === 'health' && result && typeof result === 'object' && !channelVersion && result.extension_version) {
+      result.update_check = channelCheckFailed
+        ? `could not reach the channel to compare versions (${channelCheckFailed}) — running ${result.extension_version}, whether that is current is unknown`
+        : `no version comparison available — running ${result.extension_version}, and this server has not checked the channel`;
+    }
+
     if (method === 'health' && result && typeof result === 'object' && channelVersion && result.extension_version) {
       const older = (a, b) => {
         const pa = String(a).split('.').map(Number), pb = String(b).split('.').map(Number);
