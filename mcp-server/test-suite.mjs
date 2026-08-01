@@ -588,6 +588,20 @@ async function suite() {
     await second.call('navigate', { url: `${BASE}/login` });
     const theirs = await second.call('health', {});
 
+    // Who owns what, across sessions. This was reported as an either/or — mine, or
+    // "user" — so with two sessions open, every tab belonging to the other one came
+    // back as the person's own. It is wrong in the direction that costs something:
+    // list_tabs invites adopting a "user" tab, and doing that to a tab another run is
+    // working in takes it out from under them mid-action.
+    const all = await send('list_tabs', { all: true });
+    const theirTab = (all.tabs || []).find((t) => t.id === theirs.active_tab?.id);
+    check('a tab held by another session is not reported as the user\'s own',
+      !!theirTab && /^session /.test(theirTab.owner || ''),
+      theirTab ? `owner=${theirTab.owner} (their label is ${theirs.session?.label})` : 'their tab was not listed at all');
+    const ownTab = (all.tabs || []).find((t) => t.id === mine.active_tab?.id);
+    check('and this session still recognises its own',
+      ownTab?.owner === 'this-session', `owner=${ownTab?.owner}`);
+
     // The held value is the sharpest case: this slot exists to move a credential
     // between pages without it entering the conversation, so one session being
     // able to paste or measure what another is holding defeats the purpose.

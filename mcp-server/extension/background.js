@@ -478,15 +478,19 @@ async function debuggerAttach(tabId) {
   // turned out to be an ordinary http page every time. What Chrome means is that
   // attaching to a tab attaches to its frames, and another extension has injected
   // one. That is a fact about which extension is installed, and it is enumerable.
+  // Only what is actually known. The first version of this listed every
+  // chrome-extension:// debug target it could see and called them "in the way",
+  // which named four innocent extensions — a password manager and a page monitor
+  // among them — none of which hold the debugger or even ask for the permission.
+  // Every extension has a service-worker target; that is not evidence of anything.
+  // What the tab's own target says about being attached is.
   let culprits = '';
   if (/different extension|Cannot access a chrome-extension/i.test(lastMsg)) {
     try {
-      const targets = await chrome.debugger.getTargets();
-      const mine = chrome.runtime.id;
-      const others = [...new Set(targets
-        .filter((t) => (t.url || '').startsWith('chrome-extension://') && !(t.url || '').includes(mine))
-        .map((t) => `${(t.url.split('/')[2])}${t.title ? ` (${t.title})` : ''}`))];
-      if (others.length) culprits = ` Another extension has a frame or page in the way: ${others.slice(0, 4).join(', ')}.`;
+      const target = (await chrome.debugger.getTargets()).find((t) => t.tabId === tabId);
+      culprits = target?.attached
+        ? ' Chrome reports this tab already has a debugger client, which is not us — only one is allowed at a time.'
+        : ' Chrome does not report another client on this tab, so this is not ordinary contention.';
     } catch {}
   }
   throw new Error(
@@ -7020,6 +7024,18 @@ async function dispatchCore(port, method, params) {
       if (params.all) {
         const everything = await chrome.tabs.query({});
         const mine = session.tabIds;
+        // Who each tab actually belongs to. This used to be a straight either/or —
+        // mine, or "user" — so every tab held by another session was reported as the
+        // person's own. With more than one session open that is simply false, and it
+        // is false in the direction that matters: the hint below invites adopting a
+        // "user" tab, which would take a tab out from under another run mid-action.
+        const ownerOf = (tabId) => {
+          if (mine.has(tabId)) return session.adopted?.has(tabId) ? 'this-session (adopted)' : 'this-session';
+          for (const [p, s] of sessions) {
+            if (p !== port && s.tabIds?.has(tabId)) return `session ${s.label}`;
+          }
+          return 'user';
+        };
         const grouped = {};
         for (const t of everything) {
           const entry = {
@@ -7028,7 +7044,7 @@ async function dispatchCore(port, method, params) {
             title: t.title || '',
             active: t.active,
             window_id: t.windowId,
-            owner: mine.has(t.id) ? (session.adopted?.has(t.id) ? 'this-session (adopted)' : 'this-session') : 'user',
+            owner: ownerOf(t.id),
             attachable: !(t.url || '').startsWith('chrome://') && !(t.url || '').startsWith('chrome-extension://') && !(t.url || '').startsWith('edge://'),
           };
           (grouped[t.windowId] ||= []).push(entry);
@@ -7040,7 +7056,7 @@ async function dispatchCore(port, method, params) {
           windows: Object.keys(grouped).length,
           session: session.label,
           session_tabs: mine.size,
-          hint: 'browser_attach_tab({tab_id}) adopts one of the "user" tabs into this session so every tool acts on it. Adopted tabs are never auto-closed. Tabs with attachable:false (chrome://, extension pages) cannot be automated.',
+          hint: 'browser_attach_tab({tab_id}) adopts one of the "user" tabs into this session so every tool acts on it. Adopted tabs are never auto-closed. Tabs owned by another session are named as such and are in use by a run that is still going. Tabs with attachable:false (chrome://, extension pages) cannot be automated.',
         };
       }
 
