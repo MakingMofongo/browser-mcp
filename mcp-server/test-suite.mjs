@@ -24,6 +24,7 @@ import { requireFreeBrowser, warnIfOthersConnected } from './browser-is-free.mjs
 import { fingerprintDir } from './fingerprint.mjs';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
+import { readFileSync, statSync } from 'fs';
 
 requireFreeBrowser('test-suite.mjs');
 await warnIfOthersConnected('test-suite.mjs');
@@ -166,12 +167,31 @@ async function suite() {
         `ok=${clicked.ok} path=${clicked.path} error=${String(clicked.error || '').slice(0, 80)}`);
 
       await send('navigate', { url: `${BASE}/upload` });
-      const up = await send('upload_file', { selector: '#file-upload', files: ['C:/Projects/browser-mcp/package.json'] });
-      // Attaching a file needs CDP and has no in-page equivalent. Saying so is the
-      // correct outcome; claiming the file was attached would not be.
-      check('upload_file either attaches the file or says it cannot',
-        up.ok === true ? up.verified === true : /debugger|attach/i.test(String(up.error || '')),
-        `ok=${up.ok} ${String(up.error || '').slice(0, 90)}`);
+      // These checks talk to the extension directly, so they supply the file contents
+      // the way index.js does for a real call. Nothing inside the browser can read a
+      // local path: a service worker cannot fetch the file: scheme, and an offscreen
+      // document cannot either even with file access granted — verified here, reported
+      // as on, and it still refused.
+      const realFile = 'C:/Projects/browser-mcp/mcp-server/package.json';
+      const withBytes = { name: 'package.json', b64: readFileSync(realFile).toString('base64') };
+      const up = await send('upload_file', { selector: '#file-upload', files: [realFile], files_b64: [withBytes] });
+      // Attaching a file no longer needs CDP: the bytes are read by the extension and
+      // the input is populated from the page. The one thing that can still stop it is
+      // "Allow access to file URLs" being off, which is the default — so a refusal is
+      // acceptable only if it names that, and names where to change it. A bare
+      // failure would be indistinguishable from the file not attaching.
+      check('upload_file attaches the file with no debugger at all',
+        up.ok === true && up.verified === true && up.path === 'page' && up.count === 1,
+        up.ok === true ? `attached ${JSON.stringify(up.files)} via ${up.path}`
+                       : `refused: ${String(up.error || '').slice(0, 140)}`);
+
+      // And the bytes arrived, not just the name.
+      const held = await send('execute_script', {
+        code: "[...document.querySelector('#file-upload').files].map(f => f.size)",
+      });
+      check('the attached file has its actual contents',
+        Array.isArray(held.result) && held.result[0] === statSync(realFile).size,
+        `page sees ${JSON.stringify(held.result)} bytes, file is ${statSync(realFile).size}`);
 
       const pdf = await send('save', { mode: 'pdf' });
       check('save reports that a PDF needs the debugger rather than throwing',
@@ -778,7 +798,7 @@ async function suite() {
       ['double_click', { selector: gone }],
       ['select_option', { selector: '#username', option: 'nope' }],
       ['set_date', { selector: '#username', date: 'not-a-date' }],
-      ['upload_file', { selector: gone, files: ['C:/Projects/browser-mcp/package.json'] }],
+      ['upload_file', { selector: gone, files: ['C:/Projects/browser-mcp/mcp-server/package.json'] }],
       ['scroll', { selector: gone }],
       ['wait', { selector: gone, timeout: 1200 }],
       ['extract', { selector: gone }],
@@ -808,10 +828,20 @@ async function suite() {
   // and reads the result back beats none by a wide margin.
   await group('tools with no other coverage', async () => {
     await send('navigate', { url: `${BASE}/upload` });
-    const up = await send('upload_file', { selector: '#file-upload', files: ['C:/Projects/browser-mcp/package.json'] });
-    const onInput = await send('execute_script', { code: "[...document.querySelector('#file-upload').files].map(f=>f.name)" });
+    const up = await send('upload_file', { selector: '#file-upload', files: ['C:/Projects/browser-mcp/mcp-server/package.json'] });
+    const onInput = await send('execute_script', { code: "[...document.querySelector('#file-upload').files].map(f=>({name:f.name,size:f.size}))" });
     check('upload_file puts the file on the input and confirms it',
-      up.ok === true && up.verified === true && onInput.result[0] === 'package.json', JSON.stringify(onInput.result));
+      up.ok === true && up.verified === true && onInput.result[0]?.name === 'package.json'
+        && onInput.result[0]?.size > 0, JSON.stringify(onInput.result));
+
+    // Chrome does not check that a path exists when a file is attached through the
+    // debugger: the input reports a file of that name with nothing behind it. This
+    // check existed for the whole life of the project pointed at a path that was not
+    // there, and passed every time, because nothing ever looked at the size.
+    const ghost = await send('upload_file', { selector: '#file-upload', files: ['C:/Projects/browser-mcp/does-not-exist.json'] });
+    check('a file that is not there is reported, not confirmed as attached',
+      ghost.ok === false && /no content|not there|Cannot read/i.test(String(ghost.error || '')),
+      `ok=${ghost.ok} ${String(ghost.error || '').slice(0, 120)}`);
 
     await send('navigate', { url: `${BASE}/login` });
     await setup(`document.body.insertAdjacentHTML('beforeend','<input id=dob type=date><input id=mdob placeholder="MM/DD/YYYY">'); 1`);
@@ -969,7 +999,7 @@ async function suite() {
       det.ok === true && att.ok === true, JSON.stringify({ det: det.ok, att: att.ok }));
 
     await send('navigate', { url: `${BASE}/login` });
-    const dd = await send('drop_file', { selector: '#username', files: ['C:/Projects/browser-mcp/package.json'] });
+    const dd = await send('drop_file', { selector: '#username', files: ['C:/Projects/browser-mcp/mcp-server/package.json'] });
     check('drop_file refuses a target with no file input rather than pretending',
       dd.ok === false && /no-file-input-found/.test(dd.error || ''), dd.error);
   });

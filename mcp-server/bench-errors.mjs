@@ -66,9 +66,9 @@ async function run() {
   await probe('set_date missing', 'set_date', { selector: NONSENSE, date: '2003-05-30' });
   await probe('set_date bad format', 'set_date', { selector: '#username', date: 'not-a-date' });
   await probe('set_combobox missing', 'set_combobox', { selector: NONSENSE, values: 'x' });
-  await probe('upload_file missing input', 'upload_file', { selector: NONSENSE, files: ['C:/Projects/browser-mcp/package.json'] });
+  await probe('upload_file missing input', 'upload_file', { selector: NONSENSE, files: ['C:/Projects/browser-mcp/mcp-server/package.json'] });
   await probe('upload_file missing file', 'upload_file', { selector: '#username', files: ['C:/definitely/not/here.pdf'] });
-  await probe('drop_file missing input', 'drop_file', { selector: NONSENSE, files: ['C:/Projects/browser-mcp/package.json'] });
+  await probe('drop_file missing input', 'drop_file', { selector: NONSENSE, files: ['C:/Projects/browser-mcp/mcp-server/package.json'] });
   await probe('drag missing endpoints', 'drag', { from_selector: NONSENSE, to_selector: NONSENSE });
   await probe('scroll to missing', 'scroll', { selector: NONSENSE });
   await probe('wait for missing', 'wait', { selector: NONSENSE, timeout: 1500 });

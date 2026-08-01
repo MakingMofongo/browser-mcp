@@ -344,11 +344,59 @@ chrome.storage.session.get('bmcpPretendNoDebugger')
   .then((r) => { if (r?.bmcpPretendNoDebugger) pretendNoDebugger = true; })
   .catch(() => {});
 
+/**
+ * Attach files to a file input without CDP.
+ *
+ * Reads the bytes here — the only part that needs privilege — and hands them to the
+ * page, where a DataTransfer can be assigned to input.files. Reading a local path
+ * requires "Allow access to file URLs" to be switched on for this extension, which is
+ * off by default; when it is off this says so and where to change it, because a
+ * generic failure here is indistinguishable from the file simply not attaching.
+ */
+async function uploadWithoutDebugger(tabId, selector, files, filesB64) {
+  if (!files.length && !filesB64?.length) return { ok: false, error: 'No files given.' };
+
+  // The server reads the bytes and sends them, because nothing inside the browser
+  // can. A service worker cannot fetch the file: scheme at all; an offscreen document
+  // cannot either, even with "Allow access to file URLs" granted — which was verified
+  // here, reported as on, and still refused the read. The only in-browser route left
+  // needs a tab pointed at the file, which is worse than asking the process that
+  // already has the path.
+  const parts = (filesB64 || []).map((f) => ({ name: f.name, b64: f.b64, type: '' }));
+  if (!parts.length) {
+    return {
+      ok: false,
+      error: 'Cannot attach a file: the debugger is held by another client, and no file contents were supplied with the request.',
+      hint: 'The MCP server normally reads the files and sends their contents. This path was reached without them, which means the call did not come through it.',
+    };
+  }
+
+  const [res] = await chrome.scripting.executeScript({
+    target: { tabId }, world: 'MAIN', func: bmcpAttachFiles, args: [selector, parts],
+  });
+  const r = res?.result;
+  if (!r?.found) return { ok: false, error: `File input not found: ${selector}` };
+  if (r.wrong_kind) return { ok: false, error: `${selector} is a ${r.wrong_kind}, not a file input.` };
+  if (!r.count) return { ok: false, error: 'The files were set but the input reports none attached.' };
+  return {
+    ok: true, files: r.names, count: r.count, verified: true, path: 'page',
+    note: 'Attached from the page because the debugger was unavailable.',
+  };
+}
+
 async function debuggerAttach(tabId) {
   if (pretendNoDebugger) {
-    // The same shape of error Chrome gives when another client owns the tab, so the
-    // code under test cannot tell this apart from the real thing.
-    throw new Error('Cannot access a chrome-extension:// URL of different extension');
+    // Behaves like a contested slot; does not pretend to be Chrome's message. Copying
+    // that string verbatim made the simulation faithful to the one thing about the
+    // real failure worth changing — it says nothing a caller can act on, and it sent
+    // three investigations after the tab rather than the debugger. What a tool
+    // surfaces from here should be readable by whoever hits it.
+    throw new Error(
+      'Debugger attach failed: the debugger is switched off for this session ' +
+      '(browser_reattach_debugger with disable:true). Chrome allows one debugger client ' +
+      'per tab, so this is the same state as another extension holding it. ' +
+      'Call browser_reattach_debugger with disable:false to restore it.'
+    );
   }
   // First check local cache — fast path
   if (debuggerAttached.has(tabId)) {
@@ -2335,18 +2383,24 @@ async function setDatePicker(tabId, selector, iso) {
     }, [dir]);
 
     if (!navClicked.result) {
-      await debuggerAttach(tabId);
+      // Paging the calendar with real keys is the nicer route, not the only one —
+      // the loop re-reads the month afterwards either way. An unguarded attach here
+      // turned "another extension holds the debugger" into a thrown error out of
+      // set_date, past the check that would have recovered.
       try {
-        const key = delta > 0 ? 'PageDown' : 'PageUp';
-        await cdpSend(tabId, 'Input.dispatchKeyEvent', {
-          type: 'keyDown', key, code: key,
-        });
-        await cdpSend(tabId, 'Input.dispatchKeyEvent', {
-          type: 'keyUp', key, code: key,
-        });
-      } finally {
-        await debuggerDetach(tabId);
-      }
+        await debuggerAttach(tabId);
+        try {
+          const key = delta > 0 ? 'PageDown' : 'PageUp';
+          await cdpSend(tabId, 'Input.dispatchKeyEvent', {
+            type: 'keyDown', key, code: key,
+          });
+          await cdpSend(tabId, 'Input.dispatchKeyEvent', {
+            type: 'keyUp', key, code: key,
+          });
+        } finally {
+          await debuggerDetach(tabId);
+        }
+      } catch { /* no debugger: the month is re-read below and paged another way */ }
     }
     navAttempts++;
     await new Promise(r => setTimeout(r, 90));
@@ -2687,7 +2741,10 @@ async function setCombobox(tabId, selector, values, opts = {}) {
       // always runs on one that is not — so the result is checked and the
       // native setter finishes the job when nothing arrived.
       const query = val.slice(0, Math.min(queryPrefixLen, val.length));
-      await debuggerAttach(tabId);
+      // Guarded for the same reason: the read-back below is what decides whether the
+      // query landed, and the native setter finishes the job when it did not. Failing
+      // to attach is one more way for nothing to arrive, not a reason to give up.
+      await debuggerAttach(tabId).catch(() => {});
       try { await cdpSend(tabId, 'Input.insertText', { text: query }); } catch {}
       let typed = await readBackValue(tabId, selector);
       if (typed !== query) {
@@ -5174,9 +5231,21 @@ async function dispatchCore(port, method, params) {
         if (!r?.data) return { ok: false, error: 'Chrome returned no PDF data for this page.' };
         return { ok: true, data: r.data, content_type: 'application/pdf', bytes: Math.round(r.data.length * 0.75), source_url: tab.url, title: tab.title };
       } catch (e) {
+        // Printing is one of the few things with no route except CDP, so when the
+        // debugger is held elsewhere the honest answer is that this cannot be done
+        // here — said in those terms. Passing Chrome's own wording through made the
+        // one recoverable cause look like a printing fault.
+        const msg = String(e?.message || e);
+        if (/debugger|attach|different extension/i.test(msg)) {
+          return {
+            ok: false,
+            error: 'Cannot print this page: rendering a PDF needs the Chrome debugger, and another client currently holds it for this tab. Chrome allows one at a time.',
+            hint: 'Close DevTools on this tab or pause the other automation extension, then call browser_reattach_debugger. To keep the original file instead of a rendering of it, pass its URL with mode:"url".',
+          };
+        }
         return {
           ok: false,
-          error: `Print failed: ${e?.message || e}`,
+          error: `Print failed: ${msg}`,
           hint: 'If the tab is displaying a PDF rather than a web page, pass its URL with mode:"url" to download the original file instead.',
         };
       }
@@ -7301,7 +7370,15 @@ async function dispatchCore(port, method, params) {
       const tab = await getSessionTab(port);
       const selector = params.selector || 'input[type="file"]';
       try {
-        await debuggerAttach(tab.id);
+        await debuggerAttach(tab.id).catch(async (attachErr) => {
+          // Chrome hands the debugger to one client per tab, so another automation
+          // extension holding it made attaching a file impossible — the one step
+          // that stops an otherwise unattended run, and it stops it at the end.
+          // The bytes are the only privileged part; the input itself can be
+          // populated from the page.
+          const viaPage = await uploadWithoutDebugger(tab.id, selector, params.files || [], params.files_b64);
+          throw Object.assign(new Error(attachErr.message), { viaPage });
+        });
         // Find the file input element
         const { result: nodeResult } = await cdpSend(tab.id, 'Runtime.evaluate', {
           expression: `(() => {
@@ -7348,13 +7425,19 @@ async function dispatchCore(port, method, params) {
             const el = document.querySelector(${JSON.stringify(selector)});
             if (!el) return { gone: true };
             const names = Array.from(el.files || []).map(f => f.name);
+            // Sizes, because DOM.setFileInputFiles does not check that the path
+            // exists: give it one that does not and the input still reports a file
+            // of that name, with no bytes behind it. Every upload test in this
+            // project passed for its whole history against a path that was not
+            // there, and the tool called it verified.
+            const sizes = Array.from(el.files || []).map(f => f.size);
             const err = (function() {
               const box = el.closest('form, div, section') || document.body;
               const t = (box.innerText || '').replace(/\\s+/g, ' ');
               const m = t.match(/[^.]*\\b(invalid|not allowed|too large|exceeds|unsupported|must be)\\b[^.]*/i);
               return m ? m[0].trim().slice(0, 160) : null;
             })();
-            return { names, count: names.length, error_text: err };
+            return { names, sizes, count: names.length, error_text: err };
           })()
         `);
         await debuggerDetach(tab.id);
@@ -7367,10 +7450,26 @@ async function dispatchCore(port, method, params) {
             files_attempted: files,
           };
         }
+        // A named file with no bytes is what a path that does not exist looks like
+        // from inside the page. Reporting that as attached is the false success this
+        // whole tool is supposed to prevent, and it is what it did.
+        const empty = (check.sizes || []).map((s, i) => (s === 0 ? check.names[i] : null)).filter(Boolean);
+        if (empty.length) {
+          return {
+            ok: false,
+            error: `The input holds ${empty.join(', ')} with no content. Chrome does not check that a path exists when a file is attached this way, so this is almost always a path that is not there.`,
+            files_attempted: files,
+            names: check.names,
+            sizes: check.sizes,
+          };
+        }
         return { ok: true, files: check.names, count: check.count, input: info, verified: true,
-                 ...(check.error_text ? { page_says: check.error_text } : {}) };
+                 bytes: check.sizes, ...(check.error_text ? { page_says: check.error_text } : {}) };
       } catch (e) {
         try { await debuggerDetach(tab.id); } catch {}
+        // The in-page route already ran and knows how it went; returning the attach
+        // error over the top of it would report a failure that did not happen.
+        if (e.viaPage) return e.viaPage;
         return { ok: false, error: e.message };
       }
     }
@@ -7948,6 +8047,14 @@ async function dispatchCore(port, method, params) {
         extension_version: chrome.runtime.getManifest().version,
         // And which source, which the version cannot tell you between releases.
         source_fingerprint: await computeFingerprint(),
+        // Whether this extension may read local files. Attaching a file to an upload
+        // field without the debugger depends on it, and when it is off the failure
+        // looks like the file simply not attaching. Reported here so it can be checked
+        // rather than inferred from a failed upload.
+        file_access: await new Promise((resolve) => {
+          try { chrome.extension.isAllowedFileSchemeAccess((r) => resolve(!!r)); }
+          catch { resolve(null); } // API not available in this context
+        }),
         // An install with no update address will never update, whatever the
         // channel publishes, and nothing about it looks wrong from the outside —
         // it answers every command while running whatever it was installed with.
@@ -8026,6 +8133,34 @@ async function dispatchCore(port, method, params) {
 
 // Injected twice per press: first to ask whether the real key arrived, then, if
 // it did not, to deliver one in the page and report what it actually did.
+// Put files on a file input from inside the page, without the debugger.
+//
+// DOM.setFileInputFiles is the usual route and it needs CDP, which Chrome grants to
+// one client per tab — so on a machine with another automation extension installed,
+// attaching a file was simply impossible, and this is the one step that reliably
+// stops an unattended run at the very end, after all the typing is done.
+//
+// A file input's files list is settable from script through a DataTransfer, so the
+// only genuinely privileged part is reading the bytes, which the extension does.
+function bmcpAttachFiles(selector, parts) {
+  const el = document.querySelector(selector);
+  if (!el) return { found: false };
+  if (el.tagName !== 'INPUT' || el.type !== 'file') return { found: true, wrong_kind: `${el.tagName}[type=${el.type}]` };
+  const dt = new DataTransfer();
+  for (const p of parts) {
+    const bin = atob(p.b64);
+    const arr = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+    dt.items.add(new File([arr], p.name, { type: p.type || 'application/octet-stream' }));
+  }
+  el.files = dt.files;
+  // The events a page actually listens for. Assigning files fires nothing on its own,
+  // so a form that validates on change would never learn a file had arrived.
+  el.dispatchEvent(new Event('input', { bubbles: true }));
+  el.dispatchEvent(new Event('change', { bubbles: true }));
+  return { found: true, names: [...el.files].map((f) => f.name), count: el.files.length };
+}
+
 function bmcpKeyOutcome(key, modifiers, code, vk, deliver) {
   const active = () => {
     let el = document.activeElement;

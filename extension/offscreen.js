@@ -210,6 +210,47 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   return true;
 });
 
+// Read a local file on the service worker's behalf.
+//
+// An MV3 service worker cannot fetch a file:// URL at all, even when the extension
+// has been granted access to file URLs — the scheme is simply unavailable there. An
+// offscreen document is an ordinary extension page, where the grant does apply, so
+// the read happens here and the bytes go back as base64.
+//
+// This exists so a file can be attached to an upload field when the Chrome debugger
+// is held by another client, which is the usual state on a machine running more than
+// one automation extension.
+chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+  if (msg?.type !== 'bmcp_read_file' || typeof msg.url !== 'string') return;
+  (async () => {
+    try {
+      // XMLHttpRequest, not fetch. The Fetch API does not support the file: scheme in
+      // any Chrome context and rejects with a bare "Failed to fetch", which reads as a
+      // permissions problem and is not one — file access was granted and it still
+      // failed. XHR does support it, given that grant.
+      const buf = await new Promise((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        xhr.open('GET', msg.url, true);
+        xhr.responseType = 'arraybuffer';
+        xhr.onload = () => (xhr.status === 0 || (xhr.status >= 200 && xhr.status < 300))
+          ? resolve(xhr.response)
+          : reject(new Error(`HTTP ${xhr.status}`));
+        xhr.onerror = () => reject(new Error('could not be read — check that "Allow access to file URLs" is on for this extension'));
+        xhr.send();
+      });
+      const bytes = new Uint8Array(buf);
+      // Chunked: String.fromCharCode over a whole multi-megabyte file overflows the
+      // argument stack, which would fail on exactly the large documents this is for.
+      let binary = '';
+      for (let i = 0; i < bytes.length; i += 8192) binary += String.fromCharCode(...bytes.subarray(i, i + 8192));
+      sendResponse({ ok: true, b64: btoa(binary), bytes: bytes.length });
+    } catch (e) {
+      sendResponse({ ok: false, error: String(e?.message || e) });
+    }
+  })();
+  return true; // keeps the channel open for the async reply
+});
+
 // Listen for terminate signals from background.js (sent when last tab in a session closes)
 chrome.runtime.onMessage.addListener((msg) => {
   if (msg.type !== 'terminate_mcp_session' || typeof msg.port !== 'number') return;

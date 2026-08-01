@@ -235,6 +235,37 @@ try {
 try { run(`gh api -X POST repos/${REPO}/pages -f "source[branch]=main" -f "source[path]=/" --silent`); }
 catch { /* already enabled */ }
 
+// Publishing is not the same as being published. Every install polls this URL and
+// takes whatever it says; if the push half-failed, or Pages is still serving the
+// previous build, every machine stays on the old version and nothing anywhere says
+// so — the install keeps answering commands normally while running code from before
+// the fix. That is precisely how one machine here sat a week behind. So: ask the
+// channel what it is offering, from outside, and compare it to what was just built.
+process.stdout.write('\nVerifying the channel serves this build … ');
+let served = null, crxOk = false;
+for (let attempt = 0; attempt < 10; attempt++) {
+  await new Promise((r) => setTimeout(r, attempt === 0 ? 3000 : 6000));
+  try {
+    const xml = await fetch(`${PAGES}/updates.xml`, { cache: 'no-store' }).then((r) => r.ok ? r.text() : '');
+    served = (xml.match(/version=['"]([^'"]+)['"]/) || [])[1] || null;
+    if (served === version) {
+      const head = await fetch(`${PAGES}/browser-mcp.crx`, { method: 'HEAD', cache: 'no-store' });
+      crxOk = head.ok && Number(head.headers.get('content-length') || 0) > 10_000;
+      if (crxOk) break;
+    }
+  } catch { /* Pages can take a moment to pick up a push */ }
+}
+if (served === version && crxOk) {
+  console.log('ok');
+} else {
+  console.log('NOT YET');
+  console.error(`\nThe channel is not serving ${version} yet.`);
+  console.error(`  updates.xml advertises : ${served || '(unreachable)'}`);
+  console.error(`  CRX downloadable       : ${crxOk}`);
+  console.error(`\nThe commit and tag are pushed; GitHub Pages may still be building — it usually`);
+  console.error(`takes a minute or two. Check ${PAGES}/updates.xml before assuming installs will update.`);
+}
+
 rmSync(stagedCrx, { force: true });
 console.log(`Released ${version}`);
 console.log(`  extension id : ${extId}`);

@@ -65,7 +65,7 @@ async function main() {
   await send('navigate', { url: `${BASE}/upload` }).catch(() => {});
   await new Promise((r) => setTimeout(r, 1500));
   try {
-    const r = await send('upload_file', { selector: '#file-upload', files: ['C:/Projects/browser-mcp/package.json'] });
+    const r = await send('upload_file', { selector: '#file-upload', files: ['C:/Projects/browser-mcp/mcp-server/package.json'] });
     console.log('  ok:', JSON.stringify(r).slice(0, 300));
   } catch (e) {
     console.log('  threw:', String(e.message || e));

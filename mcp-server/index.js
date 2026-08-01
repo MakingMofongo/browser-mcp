@@ -533,7 +533,30 @@ mcpServer.setRequestHandler(CallToolRequestSchema, async (request) => {
                     method === 'replay' ? 300000 :
                     method === 'save' ? 90000 :
                     method === 'submit' ? (args?.timeout || 15000) + 20000 : 30000;
-    const result = await sendToExtension(method, args || {}, timeout);
+    // Attaching a file needs the bytes, and the browser is the worst place in this
+    // system to get them from: a service worker cannot fetch file: at all, an
+    // offscreen document cannot either even with file access granted, and reading
+    // through a page needs a tab pointed at the file. This process is Node, running
+    // on the same machine as whoever passed the path, and can simply open it. The
+    // extension uses these when the debugger is unavailable and ignores them
+    // otherwise, since CDP takes the path directly.
+    let params = args || {};
+    if (method === 'upload_file' && Array.isArray(params.files) && params.files.length) {
+      const { readFileSync } = await import('fs');
+      const { basename } = await import('path');
+      const bytes = [];
+      for (const p of params.files) {
+        try {
+          bytes.push({ name: basename(String(p)), b64: readFileSync(String(p)).toString('base64') });
+        } catch (e) {
+          // Said plainly and early. A file that cannot be read here would otherwise
+          // fail deep inside the browser as something that looks like a page problem.
+          return { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: `Cannot read ${p}: ${e.message}` }) }], isError: true };
+        }
+      }
+      params = { ...params, files_b64: bytes };
+    }
+    const result = await sendToExtension(method, params, timeout);
 
     // An install that has stopped updating is otherwise silent — it answers every
     // command normally while running code from before every fix, and the only sign
