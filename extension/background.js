@@ -340,8 +340,14 @@ async function verifyAttachedWithChrome(tabId, attempts = 4) {
 // session storage because a service worker is evicted between calls and would
 // otherwise forget it mid-test.
 let pretendNoDebugger = false;
-chrome.storage.session.get('bmcpPretendNoDebugger')
-  .then((r) => { if (r?.bmcpPretendNoDebugger) pretendNoDebugger = true; })
+// The other half: calls that never return, rather than calls that fail. Set by
+// reattach_debugger({wedge:true}) so health's deadlines can be exercised on demand.
+let pretendWedged = false;
+chrome.storage.session.get(['bmcpPretendNoDebugger', 'bmcpPretendWedged'])
+  .then((r) => {
+    if (r?.bmcpPretendNoDebugger) pretendNoDebugger = true;
+    if (r?.bmcpPretendWedged) pretendWedged = true;
+  })
   .catch(() => {});
 
 /**
@@ -6681,6 +6687,23 @@ async function dispatchCore(port, method, params) {
       // happened to occur during a test. It could not be reproduced on purpose, so
       // three of those fallbacks were broken for an unknown length of time and were
       // found by accident. This makes the condition something a test can ask for.
+      // Make Chrome's own calls stop answering, rather than fail. These are different
+      // faults and only one of them hung health for three and a half hours: a
+      // rejection is caught, a call that never returns is not. Without a way to ask
+      // for it, the deadline path could only be checked by waiting for the browser to
+      // wedge on its own, and a check that passes because the condition never arose
+      // reads exactly like a check that passed.
+      if (typeof params.wedge === 'boolean') {
+        pretendWedged = params.wedge;
+        await chrome.storage.session.set({ bmcpPretendWedged: params.wedge });
+        return {
+          ok: true,
+          wedged_simulation: params.wedge,
+          note: params.wedge
+            ? 'Chrome\'s debugger calls will now hang instead of answering, as they do when the debugger is wedged.'
+            : 'Chrome\'s debugger calls answer normally again.',
+        };
+      }
       if (typeof params.disable === 'boolean') {
         pretendNoDebugger = params.disable;
         await chrome.storage.session.set({ bmcpPretendNoDebugger: params.disable });
@@ -8023,17 +8046,58 @@ async function dispatchCore(port, method, params) {
 
     case 'health': {
       const session = getSession(port);
-      const tab = await getSessionTab(port);
+
+      // Every probe below gets a deadline, and a probe that does not answer is
+      // reported as not having answered.
+      //
+      // These were plain awaits in try/catch, which handles a rejection but not a
+      // hang — nothing that never settles is ever caught. When the debugger wedged,
+      // getTargets stopped returning and this whole command blocked until the
+      // server's 30s timeout killed it. From the caller's side "health timed out" is
+      // indistinguishable from "the extension is gone", so a session concluded the
+      // bridge was down and stopped: it repeated that at every tick for three and a
+      // half hours while the bridge was fine the entire time and one call to
+      // reattach_debugger fixed it in six seconds.
+      //
+      // A diagnostic that can hang is worse than no diagnostic. It is the one thing
+      // that must answer when everything else has stopped.
+      const probe = async (what, ms, fn) => {
+        let timer;
+        try {
+          return await Promise.race([
+            Promise.resolve().then(fn),
+            new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`${what} did not answer within ${ms}ms`)), ms); }),
+          ]);
+        } finally { clearTimeout(timer); }
+      };
+
+      const notAnswering = [];
+      let tab;
+      try {
+        tab = await probe('finding this session\'s tab', 5000, () => getSessionTab(port));
+      } catch (e) {
+        notAnswering.push(String(e.message || e));
+        return {
+          ok: false,
+          error: 'Could not determine this session\'s tab.',
+          not_answering: notAnswering,
+          hint: 'The extension is reachable — this reply is proof of that — but Chrome is not answering about tabs. browser_list_browsers and browser_list_tabs do not depend on it.',
+        };
+      }
+
       let debuggerAttachedReal = false;
       try {
-        const targets = await chrome.debugger.getTargets();
+        const targets = await probe('chrome.debugger.getTargets', 4000,
+          () => (pretendWedged ? new Promise(() => {}) : chrome.debugger.getTargets()));
         debuggerAttachedReal = !!targets.find(t => t.tabId === tab.id)?.attached;
-      } catch {}
+      } catch (e) { notAnswering.push(String(e.message || e)); }
+
       let scriptingOk = false;
       try {
-        const [r] = await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: () => true });
+        const [r] = await probe('injecting a script into the page', 6000,
+          () => chrome.scripting.executeScript({ target: { tabId: tab.id }, func: () => true }));
         scriptingOk = r?.result === true;
-      } catch {}
+      } catch (e) { notAnswering.push(String(e.message || e)); }
       // The two reasons a page stops responding that are not faults at all: it is
       // asking for a person. Reported here so the answer arrives with the
       // diagnosis, rather than needing a separate call to go looking for it.
@@ -8051,6 +8115,10 @@ async function dispatchCore(port, method, params) {
       }
       return {
         ok: true,
+        // What did not answer, and what to do about it. A probe timing out is the
+        // signature of a wedged debugger, and the fix is one command — but only if
+        // the reply says so instead of never arriving.
+        ...(notAnswering.length ? { not_answering: notAnswering, wedged: true } : {}),
         active_tab: { id: tab.id, url: tab.url, title: tab.title },
         session: { label: session.label, color: session.color, tabs: session.tabIds.size },
         debugger_attached: debuggerAttachedReal,
@@ -8090,7 +8158,11 @@ async function dispatchCore(port, method, params) {
         ...(captcha ? { captcha } : {}),
         ...(wall ? { auth_wall: { detected: wall.evidence, url: wall.url } } : {}),
         ...(recentCalls ? { recent: recentCalls } : {}),
-        hint: captcha ? 'A CAPTCHA is on the page. It cannot be solved from here, and it is there precisely to require a person — tell the user what is blocking the flow, let them clear it in the browser, then continue.' :
+        // A probe that stopped answering comes first, ahead of everything else this
+        // hint can say. It is the condition that stops a run dead, it is the one
+        // nothing else reports, and its fix is a single command.
+        hint: notAnswering.length ? `Chrome stopped answering some of its own calls (${notAnswering.join('; ')}), which is what a wedged debugger looks like. The bridge is fine — this reply came over it. Call browser_reattach_debugger to clear it, then carry on.` :
+              captcha ? 'A CAPTCHA is on the page. It cannot be solved from here, and it is there precisely to require a person — tell the user what is blocking the flow, let them clear it in the browser, then continue.' :
               wall ? `The page is asking for authentication (${wall.evidence}). Tell the user, let them sign in, then continue. Automation cannot get past this on its own.` :
               !scriptingOk ? (!tab.url || tab.url.startsWith('about:') || tab.url.startsWith('chrome://')
                 ? `Active tab is a blank placeholder (${tab.url || 'about:blank'}) — injection is impossible there by design, and this is NOT a fault. Navigate to a real page first.`

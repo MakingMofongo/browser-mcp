@@ -46,6 +46,17 @@ function listen(i = 0) {
     console.log('reload pushed');
     setTimeout(() => process.exit(0), 1500);
   });
-  setTimeout(() => { console.error('no connection in 20s'); process.exit(1); }, 20000);
+  // The port scan lives in the offscreen document on a 2s interval, and Chrome
+  // throttles timers in hidden documents to roughly once a minute — so a listener
+  // that has just opened is not noticed for up to that long. Twenty seconds was
+  // shorter than the thing being waited for, which made a healthy extension look
+  // absent and sent the diagnosis after the extension instead of the clock.
+  setTimeout(() => {
+    console.error('No connection in 90s.');
+    console.error('The extension scans for servers from its offscreen document, and Chrome throttles');
+    console.error('that timer to about once a minute — so this waits well past one full round.');
+    console.error('Nothing arriving in 90s means it is not loaded or not enabled: check chrome://extensions.');
+    process.exit(1);
+  }, 90000);
 }
 listen();

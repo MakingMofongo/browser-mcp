@@ -147,6 +147,46 @@ async function suite() {
   // fallback for it, and until this group existed those fallbacks only ran when the
   // contention happened to occur mid-test: three of them were broken, for an unknown
   // length of time, and were found by accident rather than by a check.
+  // ── health answers even when Chrome does not ────────────────────────────
+  // health probes the debugger and script injection. Those were plain awaits, so a
+  // wedged debugger — where the call never returns rather than failing — hung the
+  // whole command until the server's 30s timeout killed it. A session read that as
+  // the bridge being down and stopped working for three and a half hours, repeating
+  // it every tick, while the bridge was fine and reattach_debugger fixed it in six
+  // seconds. The tool that has to answer when nothing else does was the one that
+  // could not.
+  await group('health answers within its own deadline', async () => {
+    await send('navigate', { url: `${BASE}/login` });
+    const t0 = Date.now();
+    const h = await send('health', {}, 25000);
+    const took = Date.now() - t0;
+    check('health returns quickly rather than blocking on Chrome',
+      h.ok !== undefined && took < 20000, `${took}ms`);
+
+    // Actually wedge it. Written the other way first — "!h.wedged || …" — which
+    // passed on a healthy browser without ever running the code it named, and
+    // reported "nothing hung on this run" as a pass. That is the same shape as every
+    // silence this project has spent its time removing, so it does not get to sit in
+    // the check for it.
+    await send('reattach_debugger', { wedge: true });
+    try {
+      const t1 = Date.now();
+      const w = await send('health', {}, 25000);
+      const wedgedTook = Date.now() - t1;
+      check('health still answers when Chrome has stopped answering',
+        w.ok === true && wedgedTook < 20000, `${wedgedTook}ms, wedged=${w.wedged}`);
+      check('and says which call stopped answering',
+        w.wedged === true && Array.isArray(w.not_answering) && /getTargets/.test(w.not_answering.join(' ')),
+        JSON.stringify(w.not_answering));
+      check('and names the command that clears it',
+        /reattach_debugger/.test(String(w.hint || '')), String(w.hint || '').slice(0, 120));
+    } finally {
+      await send('reattach_debugger', { wedge: false }).catch(() => {});
+    }
+    const back = await send('health', {});
+    check('and goes back to normal once it is unwedged', !back.wedged, `wedged=${back.wedged}`);
+  });
+
   await group('the debugger slot is taken by another extension', async () => {
     await send('navigate', { url: `${BASE}/login` });
     const off = await send('reattach_debugger', { disable: true });

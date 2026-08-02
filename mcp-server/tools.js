@@ -340,6 +340,10 @@ export const TOOLS = [
           type: 'boolean',
           description: 'Treat the debugger as unavailable until set back to false. Chrome allows one debugger client per tab, so this reproduces the state where another extension holds it and tools must fall back to synthetic events.',
         },
+        wedge: {
+          type: 'boolean',
+          description: 'Make Chrome\'s debugger calls hang instead of answering, until set back to false. This is the state where a call never returns rather than failing, which is what browser_health guards against with its own deadlines.',
+        },
       },
     },
   },
