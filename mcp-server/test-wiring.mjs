@@ -5,9 +5,10 @@
  * Run: node test-wiring.mjs
  */
 import { readFileSync, readdirSync, statSync } from 'fs';
-import { join } from 'path';
+import { join, dirname } from 'path';
 import { homedir } from 'os';
-import { pathToFileURL } from 'url';
+import { pathToFileURL, fileURLToPath } from 'url';
+import { execFileSync } from 'child_process';
 import { TOOLS } from './tools.js';
 
 const indexSrc = readFileSync(new URL('./index.js', import.meta.url), 'utf8');
@@ -152,6 +153,28 @@ for (const t of TOOLS) {
 }
 for (const name of Object.keys(UNTESTABLE)) {
   if (!TOOLS.some(t => t.name === name)) fail(`UNTESTABLE lists ${name}, which is no longer a tool — remove it`);
+}
+
+// Every script here parses.
+//
+// The extension's scripts have had this check since the night the service worker
+// would not load; the server's own did not, and eight of them were left
+// unparseable at once by an edit whose apostrophe closed a string. They were only
+// caught because something happened to run them — the gate would have said
+// everything was wired and been right, about files that could not start.
+//
+// Parsing, not importing: importing these opens sockets and takes the browser.
+{
+  const here = dirname(fileURLToPath(import.meta.url));
+  const scripts = readdirSync(here).filter((f) => f.endsWith('.mjs'));
+  for (const f of scripts) {
+    try {
+      execFileSync(process.execPath, ['--check', join(here, f)], { stdio: ['ignore', 'ignore', 'pipe'] });
+    } catch (e) {
+      fail(`${f} does not parse: ${String(e.stderr || e.message).split('\n').find((l) => /Error|error/.test(l)) || 'syntax error'}`);
+    }
+  }
+  if (!failures) console.log(`  ${scripts.length} server scripts parse`);
 }
 
 console.log(failures === 0

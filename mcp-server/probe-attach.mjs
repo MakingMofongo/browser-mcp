@@ -97,6 +97,6 @@ function listen(i = 0) {
       m.error ? p.reject(new Error(m.error)) : p.resolve(m.result);
     });
   });
-  setTimeout(() => { if (!hello) { console.error('no extension connected in 45s'); process.exit(1); } }, 45000);
+  setTimeout(() => { if (!hello) { console.error('no extension connected in 90s, which is longer than one full round of the port scan (Chrome throttles that timer to about a minute in the offscreen document)'); process.exit(1); } }, 90000);
 }
 listen();

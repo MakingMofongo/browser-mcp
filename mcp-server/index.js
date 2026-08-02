@@ -105,7 +105,6 @@ let activeExt = null;             // ws currently receiving commands
 let activePort = null;
 let wss = null; // Track WSS for graceful shutdown
 let cmdId = 0;
-let lastActivity = Date.now();
 const pending = new Map();
 
 function pickFailover() {
@@ -242,7 +241,19 @@ function createWSS(port = BASE_PORT) {
           pickFailover();
           return;
         }
-        gracefulShutdown('Terminate signal from extension (user closed last session tab)');
+        // Stay up. This used to shut the server down, on the reading that closing the
+        // last tab means the person is finished with automation. Sometimes it does.
+        // But it is also what happens when they tidy their tabs, or when a run closes
+        // the portal it just finished, and the cost of guessing wrong is not small:
+        // the server exits, every browser tool disappears, and the only way back is a
+        // person typing /mcp. For a run working overnight that is the difference
+        // between carrying on and being dead until morning.
+        //
+        // Nothing is leaked by staying: the session's tabs are already gone, the tab
+        // group with them, and parentCheck still ends the process when Claude Code
+        // does. The next navigate opens a fresh tab, which is an instruction rather
+        // than a guess.
+        process.stderr.write('[MCP] Session tabs all closed. Staying up; the next navigate will open a new tab.\n');
         return;
       }
 
@@ -295,9 +306,19 @@ function createWSS(port = BASE_PORT) {
         if (h) h.unanswered = (h.unanswered || 0) + 1;
       } catch {}
     }
-    if (Date.now() - lastActivity > 4 * 60 * 60 * 1000) {
-      gracefulShutdown('Idle timeout (4h)');
-    }
+    // No idle shutdown. There used to be one here — four hours without a tool call
+    // and the server exited — and it was aimed at a problem that is already solved
+    // twice over: parentCheck polls the parent every five seconds and shuts down
+    // when Claude Code goes, with stdin close as a backup. Nothing is left orphaned
+    // by staying up.
+    //
+    // What it did instead was kill a live server whose parent was still running.
+    // An agent working through applications overnight spends most of its time
+    // waiting on a person — a fee to pay, a signature, a decision — and makes no
+    // browser calls while it waits. Four hours of that is an ordinary night, so the
+    // browser died at roughly the same hour every time, and getting it back needed
+    // somebody awake to type /mcp. The tools were gone precisely when nobody was
+    // there to notice, which is the whole point of running unattended.
   }, HEARTBEAT_MS);
 }
 
@@ -441,7 +462,6 @@ mcpServer.setRequestHandler(ListToolsRequestSchema, async () => ({
 
 mcpServer.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
-  lastActivity = Date.now();
 
   try {
     const methodMap = {

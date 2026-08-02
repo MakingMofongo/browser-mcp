@@ -602,7 +602,15 @@ async function suite() {
 
     const second = await new Promise((resolve, reject) => {
       const srv = new WebSocketServer({ host: '127.0.0.1', port: freePort });
-      const to = setTimeout(() => reject(new Error('second session never connected')), 20000);
+      // 90s, not 20. The extension finds new servers from a scan in its offscreen
+      // document, and Chrome throttles timers in hidden documents to roughly once a
+      // minute — so a listener that has just opened can go unnoticed for most of a
+      // minute. Twenty seconds was shorter than one round of the thing being waited
+      // for, which made this fail intermittently and blame the extension. The same
+      // number was wrong in push-reload for the same reason, where it reported a
+      // perfectly healthy extension as missing.
+      const to = setTimeout(() => reject(new Error(
+        'second session never connected within 90s — that is more than a full round of the extension\'s (throttled) port scan, so it is not just slow')), 90000);
       srv.on('connection', (sock) => {
         let id = 0; const waiting = new Map();
         sock.on('message', (d) => {
