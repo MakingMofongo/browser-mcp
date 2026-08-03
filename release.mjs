@@ -247,7 +247,11 @@ for (let attempt = 0; attempt < 10; attempt++) {
   await new Promise((r) => setTimeout(r, attempt === 0 ? 3000 : 6000));
   try {
     const xml = await fetch(`${PAGES}/updates.xml`, { cache: 'no-store' }).then((r) => r.ok ? r.text() : '');
-    served = (xml.match(/version=['"]([^'"]+)['"]/) || [])[1] || null;
+    // Anchored to <updatecheck>. The first version= in this document belongs to the
+    // XML declaration — <?xml version="1.0" — so an unanchored match reads "1.0"
+    // every time and reports a perfectly good release as not published. The check
+    // written to catch silent staleness cried wolf on its first real run.
+    served = (xml.match(/<updatecheck[^>]*\bversion=['"]([^'"]+)['"]/) || [])[1] || null;
     if (served === version) {
       const head = await fetch(`${PAGES}/browser-mcp.crx`, { method: 'HEAD', cache: 'no-store' });
       crxOk = head.ok && Number(head.headers.get('content-length') || 0) > 10_000;
