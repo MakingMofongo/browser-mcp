@@ -280,6 +280,37 @@ async function suite() {
       String(rp.error || 'read').slice(0, 70));
   });
 
+  // ── filling a field twice replaces, it does not stack ───────────────────
+  // Reported from a real run: an email field ended up holding four copies of the
+  // address, and every fill along the way returned ok. Two faults met. The clear
+  // set value to '' through the setter and fired input, which a controlled field
+  // simply undoes, so the insert appended to the restored text. And the fill then
+  // read the field back and returned ok:true without ever comparing it to what it
+  // had been asked to write.
+  await group('filling twice replaces rather than stacks', async () => {
+    await send('navigate', { url: `${BASE}/login` });
+    await send('fill', { selector: '#username', value: 'first@example.com' });
+    const second = await send('fill', { selector: '#username', value: 'second@example.com' });
+    const got = await send('execute_script', { code: "document.querySelector('#username').value" });
+    check('an ordinary field takes the second value, not both',
+      second.ok === true && got.result === 'second@example.com', `${JSON.stringify(got.result)}`);
+
+    // The field that caused it: a clear through the setter is undone.
+    await send('navigate', { url: `${BASE}/sticky` });
+    await send('fill', { selector: '#sticky', value: 'first@example.com' });
+    const stuck = await send('fill', { selector: '#sticky', value: 'second@example.com' });
+    const after = await send('execute_script', { code: "document.querySelector('#sticky').value" });
+    check('a field that undoes a programmatic clear still ends up with one value',
+      after.result === 'second@example.com' || stuck.ok === false,
+      `ok=${stuck.ok} value=${JSON.stringify(after.result)} err=${String(stuck.error || '').slice(0, 80)}`);
+    check('and if it could not, it says so instead of returning ok',
+      after.result === 'second@example.com' ? true : /replac|clear|already held/i.test(String(stuck.error || '')),
+      String(stuck.error || '(succeeded)').slice(0, 110));
+    check('a stacked value is never reported as success',
+      !(stuck.ok === true && String(after.result || '').includes('first@example.com')),
+      `ok=${stuck.ok} value=${JSON.stringify(after.result)}`);
+  });
+
   // ── a framework that rejects the write must not read as success ─────────
   // The code that notices this has been in place for a while with nothing
   // exercising it, which is the same as not knowing whether it works. A field that

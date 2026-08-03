@@ -273,6 +273,23 @@ export function startFixtures() {
             <h3>Strict CSP</h3><input id="field" name="field">
             <script>window.__pageSecret = 'SECRET-42';</script>`));
         }
+        // A field that refuses to be cleared by a value-setter, the way Google's
+        // sign-in input behaves. Setting value to '' and firing input is a request;
+        // this puts its own text straight back, so anything that types afterwards
+        // appends. Four stacked copies of an email address were reported this way,
+        // with every fill returning ok.
+        case '/sticky': return html(page('Sticky', `
+          <label for="sticky">Sticky field</label><input id="sticky" name="sticky">
+          <script>
+            const el = document.querySelector('#sticky');
+            let mine = '';
+            el.addEventListener('input', () => {
+              // Programmatic clear: restore. Real editing (a selection being
+              // replaced) is honoured, which is exactly how a controlled input behaves.
+              if (el.value === '' && mine !== '') { el.value = mine; return; }
+              mine = el.value;
+            });
+          </script>`));
         case '/status_codes': return html(STATUS_CODES, 404);
         // What a server's own error page looks like: the status first, little else.
         case '/server_error': return html(page('503 Service Temporarily Unavailable', '<h1>503 Service Temporarily Unavailable</h1>'), 503);

@@ -1028,6 +1028,38 @@ async function evalAttached(tabId, expression) {
 // a preceding CDP focus/click is swallowed they silently wipe the PREVIOUS field
 // (observed: filling password erased the already-filled username, and the form
 // submitted empty). Targeting the element directly cannot damage its neighbours.
+/**
+ * What actually ended up in the field, compared to what was asked for.
+ *
+ *   exact       — it is there
+ *   transformed — a mask or formatter rewrote it (phone, date, card). Still a success:
+ *                 the field accepted the input and chose how to display it.
+ *   appended    — the old value is still there with the new one stuck on the end.
+ *                 This is the doubling bug, and it is the one worth naming.
+ *   wrong       — something else entirely, including empty.
+ *
+ * Length is used rather than exact text wherever possible because password fields
+ * report a length and never a value.
+ */
+function fillVerdict(after, expected) {
+  if (!after) return 'wrong';
+  const want = String(expected ?? '');
+  const len = after.len != null ? after.len : String(after.value ?? '').length;
+  if (want === '') return len === 0 ? 'exact' : 'wrong';
+  if (after.redacted || after.value == null) {
+    // Password field: length is all there is. Anything longer than asked for is the
+    // old contents still sitting there.
+    if (len === want.length) return 'exact';
+    return len > want.length ? 'appended' : 'wrong';
+  }
+  const got = String(after.value);
+  if (got === want) return 'exact';
+  if (got.length > want.length && got.includes(want)) return 'appended';
+  // A mask reformats without adding a whole extra copy: same order of magnitude.
+  if (got.length && Math.abs(got.length - want.length) <= Math.max(4, want.length * 0.5)) return 'transformed';
+  return 'wrong';
+}
+
 async function focusAndClearElement(tabId, selectorOrRef) {
   try {
     const [r] = await chrome.scripting.executeScript({
@@ -1052,7 +1084,42 @@ async function focusAndClearElement(tabId, selectorOrRef) {
         return { ok: true, focused: document.activeElement === el };
       },
     });
-    return r?.result || { ok: false };
+    const cleared = r?.result || { ok: false };
+
+    // Check the field is actually empty, and clear it with real keys if it is not.
+    //
+    // Setting value to '' through the native setter and firing input is a request,
+    // not a result: a controlled input — Google's sign-in field, React, Salesforce
+    // LWC — puts its own value straight back on the next render. Nothing here
+    // noticed, so the insert that followed appended to the restored text. One field
+    // reached four stacked copies of an email address that way, and every fill
+    // along the way returned ok.
+    if (cleared.ok) {
+      const [check] = await chrome.scripting.executeScript({
+        target: { tabId }, world: 'MAIN', args: [selectorOrRef],
+        func: (sel) => {
+          let el = null;
+          if (sel && sel.startsWith('ref_')) el = window.__bmcpRefEls && window.__bmcpRefEls[sel];
+          else if (sel) { try { el = document.querySelector(sel); } catch {} }
+          if (!el || !el.isConnected) return { gone: true };
+          return { len: ('value' in el ? String(el.value || '') : String(el.textContent || '')).length };
+        },
+      });
+      const stillHas = check?.result && !check.result.gone && check.result.len > 0;
+      if (stillHas) {
+        // Real select-all + Delete. A framework that overrides the setter still has
+        // to honour keyboard editing, because that is what a person would do.
+        try {
+          await debuggerAttach(tabId);
+          await cdpSend(tabId, 'Input.dispatchKeyEvent', { type: 'keyDown', key: 'a', code: 'KeyA', modifiers: SELECT_ALL_MODS });
+          await cdpSend(tabId, 'Input.dispatchKeyEvent', { type: 'keyUp', key: 'a', code: 'KeyA', modifiers: SELECT_ALL_MODS });
+          await cdpSend(tabId, 'Input.dispatchKeyEvent', { type: 'keyDown', key: 'Delete', code: 'Delete', windowsVirtualKeyCode: 46, nativeVirtualKeyCode: 46 });
+          await cdpSend(tabId, 'Input.dispatchKeyEvent', { type: 'keyUp', key: 'Delete', code: 'Delete', windowsVirtualKeyCode: 46, nativeVirtualKeyCode: 46 });
+        } catch { /* reported below by whoever reads the field next */ }
+        cleared.needed_keys = true;
+      }
+    }
+    return cleared;
   } catch {
     return { ok: false };
   }
@@ -4365,13 +4432,67 @@ async function dispatchCore(port, method, params) {
           });
           if (fb?.result?.ok) { method = 'native-setter-fallback'; after = await readField(); }
         }
+        // Same check as the selector path. This returned ok:true whatever landed,
+        // which is how a field ends up holding two values and reporting one.
+        const refVerdict = fillVerdict(after, params.value);
+        if (refVerdict === 'appended' || refVerdict === 'wrong') {
+          await focusAndClearElement(tab.id, target);
+          try {
+            await debuggerAttach(tab.id);
+            await cdpSend(tab.id, 'Input.insertText', { text: params.value });
+          } catch { /* the re-read below is what decides */ }
+          after = await readField();
+          const again = fillVerdict(after, params.value);
+          if (again === 'appended' || again === 'wrong') {
+            return {
+              ok: false,
+              method,
+              error: again === 'appended'
+                ? 'The value was added to what the field already held instead of replacing it. The field would not clear — usually a framework putting its own value back.'
+                : 'The field does not hold the value it was given.',
+              value_before: describe(before),
+              value_after: describe(after),
+              expected: params.value.length > 40 ? `[${params.value.length} chars]` : params.value,
+            };
+          }
+        }
         return { ok: true, method, value_before: describe(before), value_after: describe(after) };
       }
 
       // Always use debugger for input/textarea — React/Angular/Vue need real keyboard events
       try {
         await debuggerFill(tab.id, parsed.selector, params.value);
-        const after = await readField();
+        let after = await readField();
+
+        // Compare what landed against what was asked for. This returned ok:true
+        // unconditionally — it read the field back and then ignored the answer — so
+        // a field holding four stacked copies of an email address reported success
+        // four times, and the only thing that caught it was somebody reading a
+        // screenshot. A fill that cannot say the value is in the field is not a fill.
+        const verdict = fillVerdict(after, params.value);
+        if (verdict === 'appended' || verdict === 'wrong') {
+          // One retry, clearing with real keys first — the usual cause is a
+          // controlled input restoring its old value between the clear and the type.
+          await focusAndClearElement(tab.id, parsed.selector);
+          try {
+            await debuggerAttach(tab.id);
+            await cdpSend(tab.id, 'Input.insertText', { text: params.value });
+          } catch { /* verdict below reports it */ }
+          after = await readField();
+          const second = fillVerdict(after, params.value);
+          if (second === 'appended' || second === 'wrong') {
+            return {
+              ok: false,
+              method: 'debugger',
+              error: second === 'appended'
+                ? 'The value was added to what the field already held instead of replacing it. The field would not clear — this is usually a framework putting its own value back.'
+                : 'The field does not hold the value it was given.',
+              value_before: describe(before),
+              value_after: describe(after),
+              expected: params.value.length > 40 ? `[${params.value.length} chars]` : params.value,
+            };
+          }
+        }
         return { ok: true, method: 'debugger', value_before: describe(before), value_after: describe(after) };
       } catch (e) {
         // Fallback to executeScript if debugger fails
