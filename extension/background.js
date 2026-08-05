@@ -8182,17 +8182,32 @@ async function dispatchCore(port, method, params) {
       //
       // A diagnostic that can hang is worse than no diagnostic. It is the one thing
       // that must answer when everything else has stopped.
+      // Distinguishes "did not answer" from "answered with an error", because only
+      // the first is a wedged debugger.
+      //
+      // The first version treated both the same, so injecting into about:blank —
+      // which is refused by design, instantly, with a clear message — was reported
+      // as a hang, wedged:true, and "call browser_reattach_debugger". That is wrong
+      // advice for a blank tab, and it displaced the correct hint that was already
+      // there. A rejection is an answer; it is only silence that means nothing is
+      // listening.
+      const TIMED_OUT = Symbol('timed-out');
       const probe = async (what, ms, fn) => {
         let timer;
         try {
-          return await Promise.race([
-            Promise.resolve().then(fn),
-            new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`${what} did not answer within ${ms}ms`)), ms); }),
+          const result = await Promise.race([
+            Promise.resolve().then(fn).catch((e) => { throw Object.assign(e instanceof Error ? e : new Error(String(e)), { answered: true }); }),
+            new Promise((resolve) => { timer = setTimeout(() => resolve(TIMED_OUT), ms); }),
           ]);
+          if (result === TIMED_OUT) {
+            throw Object.assign(new Error(`${what} did not answer within ${ms}ms`), { timedOut: true });
+          }
+          return result;
         } finally { clearTimeout(timer); }
       };
 
-      const notAnswering = [];
+      const notAnswering = [];   // silence: the signature of a wedged debugger
+      const probeErrors = [];    // answered, with an error — an ordinary fact to report
       let tab;
       try {
         tab = await probe('finding this session\'s tab', 5000, () => getSessionTab(port));
@@ -8211,14 +8226,14 @@ async function dispatchCore(port, method, params) {
         const targets = await probe('chrome.debugger.getTargets', 4000,
           () => (pretendWedged ? new Promise(() => {}) : chrome.debugger.getTargets()));
         debuggerAttachedReal = !!targets.find(t => t.tabId === tab.id)?.attached;
-      } catch (e) { notAnswering.push(String(e.message || e)); }
+      } catch (e) { if (e?.timedOut) notAnswering.push(String(e.message || e)); else probeErrors.push(String(e.message || e)); }
 
       let scriptingOk = false;
       try {
         const [r] = await probe('injecting a script into the page', 6000,
           () => chrome.scripting.executeScript({ target: { tabId: tab.id }, func: () => true }));
         scriptingOk = r?.result === true;
-      } catch (e) { notAnswering.push(String(e.message || e)); }
+      } catch (e) { if (e?.timedOut) notAnswering.push(String(e.message || e)); else probeErrors.push(String(e.message || e)); }
       // The two reasons a page stops responding that are not faults at all: it is
       // asking for a person. Reported here so the answer arrives with the
       // diagnosis, rather than needing a separate call to go looking for it.
@@ -8240,6 +8255,7 @@ async function dispatchCore(port, method, params) {
         // signature of a wedged debugger, and the fix is one command — but only if
         // the reply says so instead of never arriving.
         ...(notAnswering.length ? { not_answering: notAnswering, wedged: true } : {}),
+        ...(probeErrors.length ? { probe_errors: probeErrors } : {}),
         active_tab: { id: tab.id, url: tab.url, title: tab.title },
         session: { label: session.label, color: session.color, tabs: session.tabIds.size },
         debugger_attached: debuggerAttachedReal,

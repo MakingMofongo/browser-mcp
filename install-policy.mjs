@@ -44,8 +44,38 @@ if (platform() === 'win32') {
     `Set-ItemProperty -Path "$base\\ExtensionInstallSources" -Name '1' -Value '${PAGES}/*'`,
     `Write-Output 'policy written'`,
   ].join('; ');
-  execSync(`powershell -NoProfile -Command "${ps.replace(/"/g, '\\"')}"`, { stdio: 'inherit' });
-  console.log('\nWindows policy installed (HKCU — no admin required).');
+  try {
+    execSync(`powershell -NoProfile -Command "${ps.replace(/"/g, '\\"')}"`, { stdio: 'inherit' });
+  } catch { /* the check below is what decides */ }
+
+  // Read the keys back rather than trusting the writes.
+  //
+  // The comment above says HKCU needs no elevation. That is wrong on a standard
+  // Windows install: HKCU\Software\Policies is owned by NT AUTHORITY\SYSTEM, so a
+  // normal user cannot create a subkey under it — deliberately, since otherwise
+  // anything running as you could force-install its own extension. Every write
+  // failed with "Access is denied", PowerShell printed the errors, and this script
+  // then announced "Windows policy installed" over the top of them.
+  const check = `powershell -NoProfile -Command "` +
+    `$p='HKCU:\\Software\\Policies\\Google\\Chrome\\ExtensionInstallForcelist';` +
+    `if (Test-Path $p) { (Get-ItemProperty $p).'1' } else { 'MISSING' }"`;
+  let got = 'MISSING';
+  try { got = execSync(check, { encoding: 'utf8' }).trim(); } catch {}
+
+  if (got.includes(extId)) {
+    console.log('\nWindows policy installed and verified in HKCU.');
+  } else {
+    console.error('\nPolicy NOT installed — the registry key is not there after writing it.');
+    console.error('HKCU\\Software\\Policies is owned by SYSTEM, so this needs an elevated shell.');
+    console.error('\nRun this in PowerShell as Administrator:\n');
+    console.error(`  $b='HKLM:\\SOFTWARE\\Policies\\Google\\Chrome'`);
+    console.error(`  New-Item "$b\\ExtensionInstallForcelist" -Force | Out-Null`);
+    console.error(`  New-ItemProperty "$b\\ExtensionInstallForcelist" -Name '1' -Value '${entry}' -PropertyType String -Force | Out-Null`);
+    console.error(`  New-Item "$b\\ExtensionInstallSources" -Force | Out-Null`);
+    console.error(`  New-ItemProperty "$b\\ExtensionInstallSources" -Name '1' -Value '${PAGES}/*' -PropertyType String -Force | Out-Null`);
+    console.error('\nThen restart Chrome. Loading it unpacked works too and needs no admin.');
+    process.exitCode = 1;
+  }
 } else {
   const dir = '/etc/opt/chrome/policies/managed';
   const body = JSON.stringify({

@@ -60,16 +60,20 @@ for (const f of named) {
 }
 
 for (const dest of TARGETS) {
-  const staging = `${dest}.incoming`;
-  const old = `${dest}.previous`;
-  rmSync(staging, { recursive: true, force: true });
-  cpSync(SRC, staging, { recursive: true });
-  // Swap: the live directory is only inconsistent for the length of two renames,
-  // rather than for the length of a recursive copy.
-  rmSync(old, { recursive: true, force: true });
-  if (existsSync(dest)) renameSync(dest, old);
-  renameSync(staging, dest);
-  rmSync(old, { recursive: true, force: true });
+  // Copy in place. Never rename or remove the live directory.
+  //
+  // This used to build beside it and swap by rename, on the theory that a rename is
+  // atomic and a recursive copy is not. That reasoning is right for a file and badly
+  // wrong for a directory Chrome has loaded an unpacked extension from: for the
+  // moment between the two renames the directory does not exist, and Chrome treats a
+  // vanished extension directory as an uninstall. Not disabled — removed, with no
+  // record left in Preferences and no way back except adding it by hand.
+  //
+  // Writing over the files keeps the directory's identity, which is the thing Chrome
+  // is actually watching. Everything was validated above, so a half-written state
+  // here is not a syntax error waiting to be loaded — and nothing reloads the
+  // extension until the copy has finished.
+  cpSync(SRC, dest, { recursive: true, force: true });
   const n = readdirSync(dest).length;
   console.log(`  ${dest}  (${n} entries)`);
 }
