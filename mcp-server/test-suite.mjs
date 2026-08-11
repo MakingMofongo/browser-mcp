@@ -1814,6 +1814,22 @@ function listen(i = 0) {
       m.error ? p.reject(new Error(m.error)) : p.resolve(m.result);
     });
   });
-  setTimeout(() => { if (!hello) { console.error('no extension connected in 60s'); process.exit(1); } }, 60000);
+  // Two minutes, because sixty seconds is inside the range this actually takes.
+  //
+  // The extension finds new servers from a scan in its offscreen document, and Chrome
+  // throttles timers in hidden documents to roughly once a minute. Discovery was
+  // measured at 45s and 69s on this machine. A sixty-second limit therefore fails
+  // sometimes and passes sometimes for reasons that have nothing to do with the build
+  // — it stopped two releases in a row, each time reporting a missing extension that
+  // was healthy and simply had not looked yet.
+  //
+  // The same number was wrong in eight other scripts and was fixed there; this one
+  // was missed, so the gate kept racing a limit already known to be too short.
+  setTimeout(() => {
+    if (hello) return;
+    console.error('no extension connected in 120s, which is well past a full round of the (throttled) port scan.');
+    console.error('Check chrome://extensions: it is probably not loaded rather than slow.');
+    process.exit(1);
+  }, 120000);
 }
 listen();

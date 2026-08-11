@@ -24,7 +24,7 @@ function listen(i = 0) {
   const server = new WebSocketServer({ host: '127.0.0.1', port: PORTS[i] });
   server.on('error', (e) => (e.code === 'EADDRINUSE' ? listen(i + 1) : console.error(e)));
   server.on('listening', () => {
-    console.log(`listening on ${PORTS[i]} — the extension rescans every 2s, so a healthy one arrives well inside 20s`);
+    console.log(`listening on ${PORTS[i]} — discovery takes up to ~70s: the scan lives in a hidden document and Chrome throttles that timer`);
   });
   server.on('connection', (sock) => {
     sock.on('message', (d) => {
@@ -39,9 +39,9 @@ function listen(i = 0) {
     });
   });
   setTimeout(() => {
-    console.error('\nNO HELLO IN 25s — the extension is not running, not loaded, or not scanning.');
+    console.error('\nNO HELLO IN 120s — the extension is not running, not loaded, or not scanning.');
     console.error('Check chrome://extensions: it may have been removed or switched off.');
     process.exit(1);
-  }, 25000);
+  }, 120000);
 }
 listen();

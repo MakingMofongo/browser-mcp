@@ -30,6 +30,6 @@ function listen(i = 0) {
       process.exit(0);
     });
   });
-  setTimeout(() => { console.error('no extension connected in 30s'); process.exit(1); }, 30000);
+  setTimeout(() => { console.error('no extension connected in 120s'); process.exit(1); }, 120000);
 }
 listen();
