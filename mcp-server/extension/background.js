@@ -1116,10 +1116,15 @@ async function findScrollables(tabId, limit = 4) {
       func: (max) => {
         const out = [];
         for (const el of document.querySelectorAll('*')) {
-          const overflow = getComputedStyle(el).overflowY;
-          if (overflow !== 'auto' && overflow !== 'scroll') continue;
+          // Cheap layout reads first. getComputedStyle is the expensive call here —
+          // running it on every element in the document cost a second on a page with
+          // a few thousand nodes, which the timing gate caught. Almost nothing has
+          // more scrollHeight than clientHeight, so testing that first skips the
+          // style lookup for the overwhelming majority.
           const hidden = el.scrollHeight - el.clientHeight;
           if (hidden < 200 || el.clientHeight < 100) continue;   // ignore trivial scrollers
+          const overflow = getComputedStyle(el).overflowY;
+          if (overflow !== 'auto' && overflow !== 'scroll') continue;
           // A selector the caller can use without inventing one. id when there is
           // one, otherwise a stable data attribute we add ourselves.
           let sel = el.id ? `#${el.id}` : null;
