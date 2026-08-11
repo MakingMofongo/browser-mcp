@@ -37,7 +37,7 @@ const pending = new Map();
 const send = (method, params = {}, timeoutMs = 90000) => new Promise((resolve, reject) => {
   const id = ++cmdId;
   const t = setTimeout(() => { pending.delete(id); reject(new Error(`timeout: ${method}`)); }, timeoutMs);
-  pending.set(id, { resolve, reject, t });
+  pending.set(id, { resolve, reject, t, method });
   ws.send(JSON.stringify({ id, method, params }));
 });
 
@@ -1811,7 +1811,10 @@ function listen(i = 0) {
       const p = pending.get(m.id);
       if (!p) return;
       pending.delete(m.id); clearTimeout(p.t);
-      m.error ? p.reject(new Error(m.error)) : p.resolve(m.result);
+      // Name the tool in the error. A group that throws reported only the
+      // extension's message, so 'Debugger attach failed' told us a tool somewhere
+      // in a fifteen-call group had died, and which one was left to guesswork.
+      m.error ? p.reject(new Error(`${p.method}: ${m.error}`)) : p.resolve(m.result);
     });
   });
   // Two minutes, because sixty seconds is inside the range this actually takes.
