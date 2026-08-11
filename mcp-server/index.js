@@ -326,7 +326,7 @@ createWSS();
 
 // ── Send command to extension ───────────────────────────────────────────────
 
-async function sendToExtension(method, params = {}, timeoutMs = 30000, _retries = 8) {
+async function sendToExtension(method, params = {}, timeoutMs = 30000, _retries = 60) {
   // A connection that has gone quiet is not used, whatever its readyState says.
   // Sending into it is how a run spends thirty seconds per command discovering
   // what a heartbeat already knows.
@@ -336,17 +336,27 @@ async function sendToExtension(method, params = {}, timeoutMs = 30000, _retries 
     activeExt = null;
     pickFailover();
   }
-  // Auto-reconnect: extension offscreen doc rescans ports every 2s, so transient
-  // disconnects (extension reload, service-worker restart, Chrome relaunch) heal
-  // themselves — we just wait for a socket. If the active one died but another
-  // browser is connected, failover already happened in the close handler.
+  // Wait long enough for the extension to actually find us.
+  //
+  // The comment here used to say the offscreen document rescans every 2s, and eight
+  // retries at 1.5s — twelve seconds — was sized against that. It is not true. The
+  // document is permanently hidden and Chrome throttles timers in hidden documents to
+  // roughly once a minute, so discovering a newly started server was measured at 69
+  // seconds on one machine. Every server was therefore giving up about a minute
+  // before the extension could possibly arrive, and saying "extension not connected"
+  // while the extension was healthy and simply had not looked yet. That single
+  // mismatch produced 111 failures in one session.
+  //
+  // Ninety seconds of patience, which covers a full throttled scan round with room
+  // to spare. Nothing is lost by waiting: the alternative is not a faster answer, it
+  // is a wrong one.
   if ((!activeExt || activeExt.readyState !== 1) && extConnections.size > 0) pickFailover();
   if (!activeExt || activeExt.readyState !== 1) {
     if (_retries > 0) {
       await new Promise(r => setTimeout(r, 1500));
       return sendToExtension(method, params, timeoutMs, _retries - 1);
     }
-    throw new Error('Chrome extension not connected after 12s of retries. Open Chrome and ensure the Browser MCP extension is loaded and enabled (chrome://extensions). It reconnects automatically within ~2s of Chrome starting.');
+    throw new Error('Chrome extension not connected after 90s. Open Chrome and check the extension is loaded and enabled (chrome://extensions). Note it can take up to a minute to notice a newly started server, because Chrome throttles the timer it scans with.');
   }
   return new Promise((resolve, reject) => {
     const id = ++cmdId;
