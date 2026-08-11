@@ -6780,6 +6780,20 @@ async function dispatchCore(port, method, params) {
         return buf.filter(e => e.status === undefined && !e.failed && (now - (e.t0 || 0)) < 10000).length;
       };
 
+      // Which requests are holding it up. A bare count says the page is busy without
+      // saying with what, so the only way to act on it was to call network_log and
+      // cross-reference by hand — and the answer turned out to matter: the thing
+      // never completing was a request to a fixture server that had been shut down,
+      // which no amount of waiting was ever going to resolve.
+      const inflightUrls = () => {
+        const buf = networkLogs.get(tab.id) || [];
+        const now = Date.now();
+        return buf
+          .filter(e => e.status === undefined && !e.failed && (now - (e.t0 || 0)) < 10000)
+          .slice(-5)
+          .map(e => ({ url: String(e.url || '').slice(0, 120), type: e.type, waiting_ms: now - (e.t0 || now) }));
+      };
+
       let reason = 'timeout';
       let lastPending = inflight();
       let lastSpinner = null;
@@ -6834,6 +6848,7 @@ async function dispatchCore(port, method, params) {
         reason,
         waited_ms: waited,
         pending_requests: lastPending,
+        ...(lastPending > 0 ? { pending: inflightUrls() } : {}),
         ...(lastSpinner ? { blocked_by: 'spinner: ' + lastSpinner } : {}),
         ...(reason === 'timeout' ? {
           hint: lastSpinner
