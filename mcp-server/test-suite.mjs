@@ -280,6 +280,38 @@ async function suite() {
       String(rp.error || 'read').slice(0, 70));
   });
 
+  // ── scrolling a pane, not the page ──────────────────────────────────────
+  // From a real run paging back through a chat: scroll with a distance AND a
+  // selector scrolled the PAGE to reveal that element, ignored the distance, and
+  // returned ok with verified:true. Four successes, the pane never moved, and the
+  // run gave up and wrote its own DOM code to do the job by hand.
+  await group('scrolling inside an element', async () => {
+    await send('navigate', { url: `${BASE}/thread` });
+    await send('execute_script', { code: "document.querySelector('#pane').scrollTop = 400; 'set'" });
+
+    const before = await send('execute_script', { code: "document.querySelector('#pane').scrollTop" });
+    const up = await send('scroll', { selector: '#pane', y: -300 });
+    const after = await send('execute_script', { code: "document.querySelector('#pane').scrollTop" });
+    check('a selector with a distance scrolls inside that element',
+      up.ok === true && after.result < before.result,
+      `ok=${up.ok} moved=${up.moved} ${before.result} -> ${after.result}`);
+
+    // The document itself cannot scroll here, so saying so must include which
+    // element can — "pass a selector instead" is true and useless on its own.
+    const pageScroll = await send('scroll', { y: -500 });
+    const named = (pageScroll.scrollable_elements || []).some((e) => e.selector === '#pane');
+    check('when the page cannot scroll, it names the element that can',
+      pageScroll.ok === false && named,
+      named ? 'reported #pane' : JSON.stringify(pageScroll.scrollable_elements || []).slice(0, 130));
+
+    // Reaching the top is a different answer from failing to move.
+    await send('execute_script', { code: "document.querySelector('#pane').scrollTop = 0; 'top'" });
+    const atTop = await send('scroll', { selector: '#pane', y: -300 });
+    check('already at the top reads as such, not as a failure to move',
+      atTop.ok === false && /already at the top/i.test(String(atTop.error || '')),
+      String(atTop.error || '').slice(0, 90));
+  });
+
   // ── filling a field twice replaces, it does not stack ───────────────────
   // Reported from a real run: an email field ended up holding four copies of the
   // address, and every fill along the way returned ok. Two faults met. The clear

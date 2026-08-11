@@ -290,6 +290,33 @@ export function startFixtures() {
               mine = el.value;
             });
           </script>`));
+        // A chat thread the way WhatsApp and Slack build one: the document itself
+        // does not scroll, an inner pane does, and older messages are fetched from a
+        // wheel handler rather than from a scroll position. Assigning scrollTop moves
+        // the box and loads nothing, which is precisely the wall a real run hit.
+        case '/thread': return html(page('Thread', `
+          <div id="app" style="height:300px;overflow:hidden">
+            <div id="pane" style="height:300px;overflow-y:auto">
+              <div id="msgs"></div>
+            </div>
+          </div>
+          <script>
+            const msgs = document.querySelector('#msgs');
+            let n = 0;
+            const add = (where) => {
+              const d = document.createElement('div');
+              d.style.height = '40px';
+              d.textContent = 'message ' + (++n);
+              where === 'top' ? msgs.prepend(d) : msgs.append(d);
+            };
+            for (let i = 0; i < 30; i++) add('bottom');
+            // Older history arrives ONLY on a wheel, exactly like a virtualised list.
+            document.querySelector('#pane').addEventListener('wheel', (e) => {
+              if (e.deltaY < 0 && document.querySelector('#pane').scrollTop < 80) {
+                for (let i = 0; i < 10; i++) add('top');
+              }
+            });
+          </script>`));
         case '/status_codes': return html(STATUS_CODES, 404);
         // What a server's own error page looks like: the status first, little else.
         case '/server_error': return html(page('503 Service Temporarily Unavailable', '<h1>503 Service Temporarily Unavailable</h1>'), 503);
