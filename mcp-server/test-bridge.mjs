@@ -11,6 +11,7 @@
  * Needs no browser: the server half is exercised directly.
  */
 import { spawn } from 'child_process';
+import { fileURLToPath } from 'url';
 import { WebSocket } from 'ws';
 
 const PORT = 9893; // outside the range the live sessions occupy
@@ -36,7 +37,7 @@ const check = (name, pass, detail = '') => {
 // and pinning the port stops this from testing whichever session happens to be
 // running on the default one.
 const server = spawn('node', ['index.js'], {
-  cwd: new URL('.', import.meta.url).pathname.replace(/^\//, ''),
+  cwd: fileURLToPath(new URL('.', import.meta.url)),
   stdio: ['pipe', 'pipe', 'pipe'],
   env: { ...process.env, BMCP_BASE_PORT: String(PORT), BMCP_HEARTBEAT_MS: '600', BMCP_UNANSWERED_LIMIT: '2' },
 });
