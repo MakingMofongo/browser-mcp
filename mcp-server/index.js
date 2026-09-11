@@ -17,7 +17,7 @@ import { execSync } from 'child_process';
 import { dirname, join, resolve } from 'path';
 import { homedir } from 'os';
 import { fileURLToPath } from 'url';
-import { readFileSync, writeFileSync, mkdirSync } from 'fs';
+import { readFileSync, writeFileSync, mkdirSync, renameSync, rmSync, statSync } from 'fs';
 import { TOOLS } from './tools.js';
 
 // Read version from package.json — single source of truth, never drifts
@@ -49,6 +49,24 @@ async function updateExtensionFromChannel() {
     }
     return 0;
   };
+  // Never rewrite a directory somebody is developing against, or that Chrome has
+  // loaded unpacked.
+  //
+  // This runs on EVERY server start. On a machine with a handful of sessions that is
+  // dozens of processes rewriting the same files, and if Chrome has that directory
+  // loaded unpacked it watches the churn, sees a torn set, and REMOVES the
+  // extension — which Chrome cannot undo, so it has to be added back by hand. That
+  // happened repeatedly on the development laptop, where the loaded directory was
+  // also the sync target and the update target at once.
+  //
+  // A marker file opts a directory out. Dropping .no-autoupdate in it says: this copy
+  // is managed by a person, leave it alone.
+  try {
+    readFileSync(join(EXT_DIR, '.no-autoupdate'));
+    process.stderr.write('[MCP] Extension directory is marked .no-autoupdate; not touching it' + String.fromCharCode(10));
+    return;
+  } catch { /* no marker: this is an ordinary managed install */ }
+
   let installed = '0.0.0';
   try { installed = JSON.parse(readFileSync(join(EXT_DIR, 'manifest.json'), 'utf8')).version; } catch { return; }
 
@@ -71,12 +89,45 @@ async function updateExtensionFromChannel() {
       if (!res.ok) throw new Error(`${rel} -> HTTP ${res.status}`);
       fetched.push([rel, Buffer.from(await res.arrayBuffer())]);
     }
-    // Write only after every file downloaded, so a half-fetched update can never
-    // leave a broken extension on disk.
-    for (const [rel, buf] of fetched) {
-      const dest = join(EXT_DIR, rel);
-      mkdirSync(dirname(dest), { recursive: true });
-      writeFileSync(dest, buf);
+    // One updater at a time, and the manifest last.
+    //
+    // This runs on every server start, and it rewrites the directory Chrome has
+    // loaded the extension from. With several sessions starting at once — ordinary
+    // on a machine running a handful — two updaters wrote the same files
+    // simultaneously and Chrome, which watches that directory, saw a torn set and
+    // removed the extension outright. An unpacked install cannot be recovered by
+    // Chrome; it has to be added back by hand, which happened repeatedly.
+    //
+    // mkdir is atomic, so it makes a usable lock: whoever creates it writes, and
+    // everybody else leaves the directory alone. A stale lock from a killed process
+    // is cleared after a minute so an update is never blocked for ever.
+    const lockDir = join(EXT_DIR, '.update-lock');
+    try {
+      mkdirSync(lockDir);
+    } catch {
+      try {
+        const age = Date.now() - statSync(lockDir).mtimeMs;
+        if (age < 60_000) {
+          process.stderr.write('[MCP] Another process is updating the extension; leaving it alone\n');
+          return;
+        }
+        // Stale: the holder died mid-update. Take it over.
+      } catch { return; }
+    }
+    try {
+      // Every file except the manifest first, each written to a temporary name and
+      // renamed into place. A rename is atomic, so Chrome never reads half a file.
+      const manifestEntry = fetched.find(([rel]) => rel === 'manifest.json');
+      const rest = fetched.filter(([rel]) => rel !== 'manifest.json');
+      for (const [rel, buf] of [...rest, ...(manifestEntry ? [manifestEntry] : [])]) {
+        const dest = join(EXT_DIR, rel);
+        mkdirSync(dirname(dest), { recursive: true });
+        const tmp = `${dest}.incoming`;
+        writeFileSync(tmp, buf);
+        renameSync(tmp, dest);
+      }
+    } finally {
+      try { rmSync(lockDir, { recursive: true, force: true }); } catch {}
     }
     extensionUpdated = true;
     process.env.BROWSER_MCP_EXTENSION_UPDATED = '1';
