@@ -218,8 +218,13 @@ let parentCheck = null;
 
 // ── WebSocket Server ───────────────────────────────────────────────────────
 
+// Loopback by default: the extension dials 127.0.0.1 on this machine. A server that runs inside
+// a container and is published to the host's loopback by docker has to accept on the
+// container's own interface instead, which is what BMCP_WS_HOST is for.
+const WS_HOST = process.env.BMCP_WS_HOST || '127.0.0.1';
+
 function createWSS(port = BASE_PORT) {
-  const server = new WebSocketServer({ host: '127.0.0.1', port });
+  const server = new WebSocketServer({ host: WS_HOST, port });
   wss = server;
 
   server.on('error', (err) => {
@@ -329,7 +334,7 @@ function createWSS(port = BASE_PORT) {
 
   server.on('listening', () => {
     activePort = port;
-    process.stderr.write(`[MCP] WebSocket server listening on ws://127.0.0.1:${port}\n`);
+    process.stderr.write(`[MCP] WebSocket server listening on ws://${WS_HOST}:${port}\n`);
   });
 
   // Heartbeat + idle timeout (4 hours) — hoisted to module scope so gracefulShutdown can clear it.
