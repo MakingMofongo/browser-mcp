@@ -14,7 +14,7 @@ import { spawn } from 'child_process';
 import { fileURLToPath } from 'url';
 import { WebSocket } from 'ws';
 
-const PORT = 9893; // outside the range the live sessions occupy
+const PORT = 19893; // outside the range the extension scans (9876–9935), so no real browser joins
 
 // Anything already on this port is somebody else's, and talking to it would test
 // their server rather than the one under test. This exact confusion hid a crash
@@ -39,7 +39,7 @@ const check = (name, pass, detail = '') => {
 const server = spawn('node', ['index.js'], {
   cwd: fileURLToPath(new URL('.', import.meta.url)),
   stdio: ['pipe', 'pipe', 'pipe'],
-  env: { ...process.env, BMCP_BASE_PORT: String(PORT), BMCP_HEARTBEAT_MS: '600', BMCP_UNANSWERED_LIMIT: '2' },
+  env: { ...process.env, BMCP_BASE_PORT: String(PORT), BMCP_MAX_PORT: String(PORT), BMCP_HEARTBEAT_MS: '600', BMCP_UNANSWERED_LIMIT: '2' },
 });
 let stderr = '';
 server.stderr.on('data', (d) => { stderr += d.toString(); });

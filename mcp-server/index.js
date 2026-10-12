@@ -3,7 +3,7 @@
  * Agent360 Browser MCP Server
  *
  * Bridges Claude Code (stdio MCP) to Chrome Extension (WebSocket).
- * Auto-selects first available port in range 9876-9885 for multi-session support.
+ * Auto-selects the first free port in 9876-9935 for multi-session support, retrying while all are taken.
  *
  * Architecture:
  *   Claude Code ←(stdio)→ this process ←(WS :port)→ Offscreen Doc ←(sendMessage)→ Service Worker → Chrome APIs
@@ -17,7 +17,7 @@ import { execSync } from 'child_process';
 import { dirname, join, resolve } from 'path';
 import { homedir } from 'os';
 import { fileURLToPath } from 'url';
-import { readFileSync, writeFileSync, mkdirSync, renameSync, rmSync, statSync } from 'fs';
+import { readFileSync, writeFileSync, mkdirSync, renameSync, rmSync, statSync, appendFileSync } from 'fs';
 import { TOOLS } from './tools.js';
 
 // Read version from package.json — single source of truth, never drifts
@@ -146,7 +146,14 @@ updateExtensionFromChannel();
 // Overridable so a test can stand up a server on a port of its own instead of
 // racing the sessions already using the range.
 const BASE_PORT = Number(process.env.BMCP_BASE_PORT) || 9876;
-const MAX_PORT = 9895; // 20 ports instead of 10 — zombies die within 5s via parent check
+// Sixty ports. Twenty filled up on a box running a couple of dozen sessions, and the
+// session that came next had no browser at all until someone typed /mcp. The
+// extension scans the same range (offscreen.js), backing off on ports that refuse,
+// so the extra forty cost it one refused connection each every half minute.
+const MAX_PORT = Number(process.env.BMCP_MAX_PORT) || 9935;
+// When every port is taken, try again on this interval rather than giving up for
+// the life of the session. A port frees whenever another session ends.
+const PORT_RETRY_MS = Number(process.env.BMCP_PORT_RETRY_MS) || 20000;
 // v2.0 multi-browser: EVERY connected extension instance (per Chrome profile/machine)
 // is tracked; commands route to the ACTIVE one. Previously the last connection
 // silently overwrote the socket — two browsers meant nondeterministic routing.
@@ -158,9 +165,76 @@ let wss = null; // Track WSS for graceful shutdown
 let cmdId = 0;
 const pending = new Map();
 
+// What happened to the connections, kept on disk. The server's stderr goes to Claude
+// Code, which keeps only what arrives during startup, so when tabs vanished on
+// 12 Oct 2026 there was no record of a single disconnect on the server side and the
+// cause had to be rebuilt from a packet capture. One shared file, one line per
+// event, tagged with pid and port; trimmed when it passes 5 MB.
+const LOG_FILE = join(homedir(), '.browser-mcp', 'logs', 'bridge.log');
+function logEvent(what, detail = '') {
+  try {
+    mkdirSync(dirname(LOG_FILE), { recursive: true });
+    try { if (statSync(LOG_FILE).size > 5e6) renameSync(LOG_FILE, LOG_FILE + '.1'); } catch {}
+    appendFileSync(LOG_FILE, `${new Date().toISOString()} pid=${process.pid} port=${activePort ?? '-'} ${what}${detail ? ' ' + detail : ''}\n`);
+  } catch {}
+}
+
+// A session belongs to the browser its tabs are in.
+//
+// The tabs a session opens live in ONE Chrome, and only that Chrome knows them. Any
+// other Chrome that happens to have the extension — this box force-installs it into
+// every Google Chrome, including throwaway profiles other sessions launch for their
+// own work — is a different place with none of those tabs. Routing commands there
+// shows the session zero tabs, and because the right Chrome then hears nothing from
+// the session, it gives the tabs up after its grace period and closes them.
+//
+// So the session is pinned to the instance id its browser reports in its hello, the
+// first time one identifies, and it stays pinned: when that browser's socket drops
+// and comes back, the reconnection is made active again; while it is away, commands
+// wait for it rather than going to a different browser. browser_select_browser moves
+// the pin deliberately.
+//
+// BMCP_PRIMARY_INSTANCE (comma-separated ids) or ~/.browser-mcp/primary-instance
+// (one id per line) names the browsers a session may pin to on its own. Others still
+// connect and are listed, and can be chosen with browser_select_browser, but are
+// never picked automatically.
+let pinnedInstance = null;
+function primaryInstances() {
+  const fromEnv = (process.env.BMCP_PRIMARY_INSTANCE || '').split(',').map(s => s.trim()).filter(Boolean);
+  if (fromEnv.length) return fromEnv;
+  try {
+    return readFileSync(join(homedir(), '.browser-mcp', 'primary-instance'), 'utf8')
+      .split('\n').map(s => s.trim()).filter(s => s && !s.startsWith('#'));
+  } catch { return []; }
+}
+function identified(meta) {
+  return !!meta?.id && meta.id !== 'pending';
+}
+function mayPinTo(meta) {
+  if (!identified(meta)) return false;
+  const allow = primaryInstances();
+  return allow.length === 0 || allow.includes(meta.id);
+}
+function setActive(ws, why) {
+  if (activeExt === ws) return;
+  activeExt = ws;
+  const meta = ws ? extConnections.get(ws) : null;
+  logEvent('active', `${meta?.id || 'none'} (${why})`);
+}
+
 function pickFailover() {
-  const next = extConnections.keys().next();
-  activeExt = next.done ? null : next.value;
+  let next = null;
+  for (const [ws, meta] of extConnections) {
+    if (ws.readyState !== 1) continue;
+    if (pinnedInstance) {
+      // Only the browser this session's tabs are in. Anything else would answer,
+      // and answer wrongly.
+      if (meta.id === pinnedInstance) { next = ws; break; }
+    } else if (mayPinTo(meta) || (!identified(meta) && primaryInstances().length === 0)) {
+      next = ws; break;
+    }
+  }
+  setActive(next, 'failover');
   if (activeExt) {
     const meta = extConnections.get(activeExt);
     process.stderr.write(`[MCP] Failed over to browser: ${meta?.label || 'unknown'}\n`);
@@ -225,7 +299,6 @@ const WS_HOST = process.env.BMCP_WS_HOST || '127.0.0.1';
 
 function createWSS(port = BASE_PORT) {
   const server = new WebSocketServer({ host: WS_HOST, port });
-  wss = server;
 
   server.on('error', (err) => {
     if (err.code === 'EADDRINUSE') {
@@ -233,7 +306,11 @@ function createWSS(port = BASE_PORT) {
         process.stderr.write(`[MCP] Port ${port} in use, trying ${port + 1}...\n`);
         createWSS(port + 1);
       } else {
-        process.stderr.write(`[MCP] All ports ${BASE_PORT}-${MAX_PORT} in use. Cannot start.\n`);
+        // Not the end. Starting over later is what the person used to do by hand
+        // with /mcp → Reconnect, once they had noticed the browser tools were gone.
+        process.stderr.write(`[MCP] All ports ${BASE_PORT}-${MAX_PORT} in use. Trying again in ${PORT_RETRY_MS / 1000}s.\n`);
+        logEvent('all-ports-busy', `${BASE_PORT}-${MAX_PORT}; retry in ${PORT_RETRY_MS}ms`);
+        setTimeout(() => { if (activePort === null) createWSS(BASE_PORT); }, PORT_RETRY_MS).unref?.();
       }
     } else {
       process.stderr.write(`[MCP] WebSocket error: ${err.message}\n`);
@@ -242,8 +319,12 @@ function createWSS(port = BASE_PORT) {
 
   server.on('connection', (ws) => {
     extConnections.set(ws, { id: null, label: 'connecting…', connectedAt: Date.now() });
-    if (!activeExt) activeExt = ws;
+    // Before it says who it is, a connection only becomes active when nothing has
+    // been pinned yet — the case of a single browser, or an extension too old to
+    // send an id. A pinned session waits for the hello.
+    if (!activeExt && !pinnedInstance && primaryInstances().length === 0) setActive(ws, 'first connection');
     process.stderr.write(`[MCP] Chrome extension connected on port ${port} (${extConnections.size} browser(s))\n`);
+    logEvent('connected', `${extConnections.size} browser(s)`);
 
     // If extension was auto-updated, trigger reload
     if (process.env.BROWSER_MCP_EXTENSION_UPDATED === '1') {
@@ -282,21 +363,31 @@ function createWSS(port = BASE_PORT) {
 
       if (msg.type === 'hello' && msg.instance) {
         const prev = extConnections.get(ws) || {};
-        extConnections.set(ws, { ...prev, ...msg.instance });
+        const meta = { ...prev, ...msg.instance };
+        extConnections.set(ws, meta);
         process.stderr.write(`[MCP] Browser identified: ${msg.instance.label} (${msg.instance.platform})\n`);
+        if (identified(meta)) {
+          logEvent('identified', `${meta.id} ${meta.label || ''}`);
+          if (!pinnedInstance && mayPinTo(meta) && (!activeExt || activeExt === ws || !identified(extConnections.get(activeExt)))) {
+            pinnedInstance = meta.id;
+            logEvent('pinned', meta.id);
+          }
+          // The pinned browser coming back after a dropped socket takes its session
+          // back. Without this the session stayed on whichever browser it had failed
+          // over to, for good.
+          if (meta.id === pinnedInstance) setActive(ws, 'pinned browser identified');
+          else if (activeExt === ws && pinnedInstance) pickFailover();
+        }
         return;
       }
 
       if (msg.type === 'terminate') {
-        // Only the ACTIVE browser closing this session's last tab may terminate —
-        // and only when no other browser is connected to fail over to.
+        // The session's last tab closed in that browser. This used to hang up on
+        // the browser and fail over whenever a second one was connected, which
+        // handed the session to a Chrome holding none of its tabs. The browser
+        // stays; only the tabs went.
         if (ws !== activeExt) return;
-        if (extConnections.size > 1) {
-          extConnections.delete(ws);
-          try { ws.close(); } catch {}
-          pickFailover();
-          return;
-        }
+        logEvent('terminate-notice', 'last session tab closed; staying up');
         // Stay up. This used to shut the server down, on the reading that closing the
         // last tab means the person is finished with automation. Sometimes it does.
         // But it is also what happens when they tidy their tabs, or when a run closes
@@ -322,9 +413,10 @@ function createWSS(port = BASE_PORT) {
       else p.resolve(result);
     });
 
-    ws.on('close', () => {
+    ws.on('close', (code) => {
       const meta = extConnections.get(ws);
       extConnections.delete(ws);
+      logEvent('closed', `${meta?.id || '?'} code=${code}${activeExt === ws ? ' (active)' : ''}`);
       if (activeExt === ws) {
         pickFailover();
         process.stderr.write(`[MCP] Active browser disconnected (${meta?.label || '?'}); ${extConnections.size} remaining\n`);
@@ -333,9 +425,29 @@ function createWSS(port = BASE_PORT) {
   });
 
   server.on('listening', () => {
+    wss = server;
     activePort = port;
     process.stderr.write(`[MCP] WebSocket server listening on ws://${WS_HOST}:${port}\n`);
+    logEvent('listening', `ws://${WS_HOST}:${port}`);
   });
+
+  startHeartbeat();
+}
+
+// One heartbeat per process.
+//
+// This used to be started inside createWSS, which calls itself once for every port
+// that is already taken — so a server that landed on 9885 had walked past nine busy
+// ports and was running ten heartbeats over the same connections. Each one sent a
+// ping and counted it unanswered; ten firing within a few milliseconds of each other
+// counted three unanswered pings before the browser could possibly reply, and the
+// fourth hung up on a perfectly healthy connection. Measured on 12 Oct 2026: every
+// server on 9880–9895 dropped the main Chrome every 15–30 seconds, about thirty
+// drops a minute, and each drop started the extension's countdown to closing that
+// session's tabs. Servers on 9876–9879 had too few copies to reach three and were
+// untouched, which is why it looked intermittent.
+function startHeartbeat() {
+  if (heartbeat) return;
 
   // Heartbeat + idle timeout (4 hours) — hoisted to module scope so gracefulShutdown can clear it.
   //
@@ -351,6 +463,7 @@ function createWSS(port = BASE_PORT) {
       if (ws.readyState !== 1) continue;
       if (!proven(ws)) {
         process.stderr.write('[MCP] connection stopped answering; dropping it so the extension reconnects\n');
+        logEvent('heartbeat-drop', `${extConnections.get(ws)?.id || '?'} unanswered=${extConnections.get(ws)?.unanswered}`);
         try { ws.terminate(); } catch {}
         extConnections.delete(ws);
         if (activeExt === ws) { activeExt = null; pickFailover(); }
@@ -412,6 +525,14 @@ async function sendToExtension(method, params = {}, timeoutMs = 30000, _retries 
       await new Promise(r => setTimeout(r, 1500));
       return sendToExtension(method, params, timeoutMs, _retries - 1);
     }
+    if (pinnedInstance && extConnections.size > 0) {
+      const others = [...extConnections.values()].map(m => `${m.label} (${m.id})`).join(', ');
+      throw new Error(`The browser this session's tabs are in (${pinnedInstance}) has not reconnected in 90s. Not switching to another browser on my own, because none of this session's tabs are there. Connected: ${others}. Use browser_select_browser to move this session deliberately.`);
+    }
+    if (!pinnedInstance && extConnections.size > 0 && primaryInstances().length) {
+      const others = [...extConnections.values()].map(m => `${m.label} (${m.id})`).join(', ');
+      throw new Error(`No connected browser is on the primary list (${primaryInstances().join(', ')}, from BMCP_PRIMARY_INSTANCE or ~/.browser-mcp/primary-instance). Connected: ${others}. Use browser_select_browser to use one of them anyway.`);
+    }
     throw new Error('Chrome extension not connected after 90s. Open Chrome and check the extension is loaded and enabled (chrome://extensions). Note it can take up to a minute to notice a newly started server, because Chrome throttles the timer it scans with.');
   }
   return new Promise((resolve, reject) => {
@@ -445,7 +566,7 @@ const INSTRUCTIONS = `You control the user's real Chrome browser via this MCP se
 - **Every response carries _tab** (id/url/title of the active tab) — use it to stay oriented instead of extra list_tabs calls.
 
 ## Multiple browsers
-If the user runs the extension in several Chrome profiles or machines, browser_list_browsers shows all connected instances and browser_select_browser switches the active one. If the active browser disconnects, the server fails over automatically.
+If the user runs the extension in several Chrome profiles or machines, browser_list_browsers shows all connected instances and browser_select_browser switches the active one. A session stays pinned to the browser its tabs are in: if that browser's connection drops, the server waits for it to come back rather than switching to another browser, and only browser_select_browser moves the session.
 
 ## Tab management
 - navigate creates tabs in your session's tab group (visible in Chrome as colored groups)
@@ -594,6 +715,7 @@ mcpServer.setRequestHandler(CallToolRequestSchema, async (request) => {
         chrome_version: meta.chrome_version,
         connected_since: new Date(meta.connectedAt).toISOString(),
         active: ws === activeExt,
+        pinned: !!meta.id && meta.id === pinnedInstance,
       }));
       return { content: [{ type: 'text', text: JSON.stringify({ browsers: list, count: list.length }, null, 2) }] };
     }
@@ -604,8 +726,9 @@ mcpServer.setRequestHandler(CallToolRequestSchema, async (request) => {
         const labels = [...extConnections.values()].map(m => `${m.label} (${m.id})`).join(', ') || 'none connected';
         return { content: [{ type: 'text', text: `Browser not found: ${args?.id || args?.label}. Connected: ${labels}` }], isError: true };
       }
-      activeExt = target[0];
-      return { content: [{ type: 'text', text: `Active browser is now: ${target[1].label} (${target[1].id})` }] };
+      setActive(target[0], 'browser_select_browser');
+      if (identified(target[1])) { pinnedInstance = target[1].id; logEvent('pinned', `${pinnedInstance} (browser_select_browser)`); }
+      return { content: [{ type: 'text', text: `Active browser is now: ${target[1].label} (${target[1].id}). This session is pinned to it.` }] };
     }
 
     const method = methodMap[name];

@@ -92,6 +92,7 @@ console.log('Checks:');
 gate('scripts load', 'node test-worker-loads.mjs', join(ROOT, 'mcp-server'));
 gate('drop and replace rules', 'node test-heartbeat-policy.mjs', join(ROOT, 'mcp-server'));
 gate('bridge recovery', 'node test-bridge.mjs', join(ROOT, 'mcp-server'));
+gate('session keeps its browser', 'node test-pinning.mjs', join(ROOT, 'mcp-server'));
 gate('tool wiring', 'node test-wiring.mjs', join(ROOT, 'mcp-server'));
 // The descriptions are the only part of this a model reads before choosing what to
 // call, and they are edited by hand every time a tool changes. They were brought
