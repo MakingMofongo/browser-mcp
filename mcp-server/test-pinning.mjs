@@ -20,7 +20,7 @@
 import { spawn } from 'child_process';
 import { fileURLToPath } from 'url';
 import { WebSocket, WebSocketServer } from 'ws';
-import { mkdtempSync } from 'fs';
+import { mkdtempSync, mkdirSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 
@@ -79,7 +79,7 @@ async function waitFor(fn, ms, step = 50) {
 
 // A fake extension: answers pings, pings on its own schedule like the offscreen
 // document does, identifies itself, and records every command it is sent.
-function fakeBrowser(port, id, { pingMs = 600, answer = true } = {}) {
+function fakeBrowser(port, id, { pingMs = 600, answer = true, label = `fake ${id}` } = {}) {
   const b = { id, closes: 0, commands: [], ws: null, closedByServer: 0 };
   const connect = () => new Promise((resolve) => {
     const ws = new WebSocket(`ws://127.0.0.1:${port}`);
@@ -87,7 +87,7 @@ function fakeBrowser(port, id, { pingMs = 600, answer = true } = {}) {
     let timer;
     ws.on('open', () => {
       ws.send(JSON.stringify({ type: 'hello', instance: { id: 'pending', label: `fake ${id}`, platform: 'test' } }));
-      ws.send(JSON.stringify({ type: 'hello', instance: { id, label: `fake ${id}`, platform: 'test' } }));
+      ws.send(JSON.stringify({ type: 'hello', instance: { id, label, platform: 'test' } }));
       timer = setInterval(() => { try { ws.send(JSON.stringify({ type: 'ping' })); } catch {} }, pingMs);
       resolve(ws);
     });
@@ -203,6 +203,47 @@ const env = { BMCP_HEARTBEAT_MS: '300', BMCP_UNANSWERED_LIMIT: '3', BMCP_PRIMARY
   const port = await waitFor(srv.listening, 5000);
   check('it takes a port as soon as one frees, without a restart', port === String(BASE + 1), `port ${port}`);
   srv.child.kill(); held[0].close();
+}
+
+
+// ── 5. a session on a desktop of its own uses that desktop's Chrome ─────────
+{
+  const BASE = 19890;
+  // computer-mcp's session records, as the server reads them: this test process is
+  // the "Claude" both servers are children of.
+  const cm = mkdtempSync(join(tmpdir(), 'bmcp-cm-'));
+  mkdirSync(join(cm, 'sessions'));
+  const rec = (display) => writeFileSync(join(cm, 'sessions', `${process.pid}.json`),
+    JSON.stringify({ server_pid: process.pid, claude_pid: process.pid, display, last: Date.now() / 1000 }));
+  rec(':2');
+  const srv = startServer({ ...env, BMCP_BASE_PORT: String(BASE), BMCP_MAX_PORT: String(BASE + 5), COMPUTER_MCP_ROOT: cm });
+  const port = Number(await waitFor(srv.listening, 8000));
+  await srv.rpc('initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'test', version: '0' } });
+  const desk = fakeBrowser(port, 'desk-chrome', { label: 'desktop :11' });
+  await desk.connect(); await sleep(150);
+  const main = fakeBrowser(port, 'main-chrome', { label: 'Chrome on Linux' });
+  await main.connect(); await sleep(200);
+  const tabs = async () => (await srv.rpc('tools/call', { name: 'browser_list_tabs', arguments: {} })).result?.content?.[0]?.text || '';
+  let t = await tabs();
+  check('on the main desktop, a desktop Chrome that connected first is never used', t.includes('main-chrome') && desk.commands.length === 0, `desk got ${desk.commands.length}`);
+  rec(':11'); await sleep(1100);
+  t = await tabs();
+  check('after moving to desktop :11 the session talks to the Chrome on :11', t.includes('desk-chrome'), t.slice(0, 60));
+  const mainBefore = main.commands.length;
+  await desk.leave();
+  const call = srv.rpc('tools/call', { name: 'browser_list_tabs', arguments: {} });
+  await sleep(700);
+  check('with the desktop Chrome away, nothing goes to the main Chrome instead', main.commands.length === mainBefore, `main got ${main.commands.length - mainBefore}`);
+  await desk.connect();
+  const res = await Promise.race([call, sleep(8000).then(() => null)]);
+  check('the waiting command lands on the desktop Chrome when it is back', (res?.result?.content?.[0]?.text || '').includes('desk-chrome'));
+  rec(':2'); await sleep(1100);
+  t = await tabs();
+  check('back on the main desktop, the session returns to the main Chrome', t.includes('main-chrome'), t.slice(0, 60));
+  const l = JSON.parse((await srv.rpc('tools/call', { name: 'browser_list_browsers', arguments: {} })).result.content[0].text);
+  check('browser_list_browsers names the session desktop', l.session_desktop === ':2', String(l.session_desktop));
+  srv.child.kill();
+  await sleep(200);
 }
 
 console.log(failed ? `\n${failed} check(s) failed` : '\nall checks passed');

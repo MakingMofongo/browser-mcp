@@ -17,7 +17,7 @@ import { execSync } from 'child_process';
 import { dirname, join, resolve } from 'path';
 import { homedir } from 'os';
 import { fileURLToPath } from 'url';
-import { readFileSync, writeFileSync, mkdirSync, renameSync, rmSync, statSync, appendFileSync } from 'fs';
+import { readFileSync, writeFileSync, mkdirSync, renameSync, rmSync, statSync, appendFileSync, readdirSync } from 'fs';
 import { TOOLS } from './tools.js';
 
 // Read version from package.json — single source of truth, never drifts
@@ -210,8 +210,40 @@ function primaryInstances() {
 function identified(meta) {
   return !!meta?.id && meta.id !== 'pending';
 }
+// Desktops. A session can work on a desktop of its own (computer-mcp `computer_display`),
+// and a Chrome started on that desktop names itself "desktop :N" (extension label.html).
+// The session's commands then go to that Chrome and nowhere else; on the main desktop
+// everything above applies. Which desktop the session is on is read from computer-mcp's
+// session records, matched by the Claude process both servers are children of, so
+// switching desktops there moves the browser here with it on the next command.
+const MAIN_DISPLAY = process.env.BMCP_MAIN_DISPLAY || ':2';
+const CM_SESSIONS = join(process.env.COMPUTER_MCP_ROOT || '/tmp/computer-mcp', 'sessions');
+const DESKTOP_LABEL = /^desktop :\d+$/;
+let displayCache = { at: 0, value: null };
+function alive(pid) { try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; } }
+function sessionDisplay() {
+  if (Date.now() - displayCache.at < 1000) return displayCache.value;
+  let best = null;
+  try {
+    for (const f of readdirSync(CM_SESSIONS)) {
+      if (!f.endsWith('.json')) continue;
+      let r; try { r = JSON.parse(readFileSync(join(CM_SESSIONS, f), 'utf8')); } catch { continue; }
+      if (r.claude_pid !== process.ppid || !r.display || !alive(r.server_pid)) continue;
+      if (!best || (r.last || 0) > (best.last || 0)) best = r;
+    }
+  } catch {}
+  displayCache = { at: Date.now(), value: best ? best.display : null };
+  return displayCache.value;
+}
+// The desktop this session's browser commands belong to, or null for the main one.
+function wantedDesktop() {
+  const d = sessionDisplay();
+  return d && d !== MAIN_DISPLAY ? d : null;
+}
+function isDesktopChrome(meta) { return DESKTOP_LABEL.test(meta?.label || ''); }
+
 function mayPinTo(meta) {
-  if (!identified(meta)) return false;
+  if (!identified(meta) || isDesktopChrome(meta)) return false;
   const allow = primaryInstances();
   return allow.length === 0 || allow.includes(meta.id);
 }
@@ -224,9 +256,14 @@ function setActive(ws, why) {
 
 function pickFailover() {
   let next = null;
+  const desk = wantedDesktop();
   for (const [ws, meta] of extConnections) {
     if (ws.readyState !== 1) continue;
-    if (pinnedInstance) {
+    if (desk) {
+      if (meta.label === `desktop ${desk}`) { next = ws; break; }
+    } else if (isDesktopChrome(meta)) {
+      continue;   // a desktop's own Chrome never serves the main desktop
+    } else if (pinnedInstance) {
       // Only the browser this session's tabs are in. Anything else would answer,
       // and answer wrongly.
       if (meta.id === pinnedInstance) { next = ws; break; }
@@ -322,7 +359,7 @@ function createWSS(port = BASE_PORT) {
     // Before it says who it is, a connection only becomes active when nothing has
     // been pinned yet — the case of a single browser, or an extension too old to
     // send an id. A pinned session waits for the hello.
-    if (!activeExt && !pinnedInstance && primaryInstances().length === 0) setActive(ws, 'first connection');
+    if (!activeExt && !pinnedInstance && primaryInstances().length === 0 && !wantedDesktop()) setActive(ws, 'first connection');
     process.stderr.write(`[MCP] Chrome extension connected on port ${port} (${extConnections.size} browser(s))\n`);
     logEvent('connected', `${extConnections.size} browser(s)`);
 
@@ -375,8 +412,10 @@ function createWSS(port = BASE_PORT) {
           // The pinned browser coming back after a dropped socket takes its session
           // back. Without this the session stayed on whichever browser it had failed
           // over to, for good.
-          if (meta.id === pinnedInstance) setActive(ws, 'pinned browser identified');
-          else if (activeExt === ws && pinnedInstance) pickFailover();
+          const desk = wantedDesktop();
+          if (desk) { if (meta.label === `desktop ${desk}`) setActive(ws, `desktop ${desk} identified`); else if (activeExt === ws) pickFailover(); }
+          else if (meta.id === pinnedInstance && !isDesktopChrome(meta)) setActive(ws, 'pinned browser identified');
+          else if (activeExt === ws && (pinnedInstance || isDesktopChrome(meta))) pickFailover();
         }
         return;
       }
@@ -519,11 +558,20 @@ async function sendToExtension(method, params = {}, timeoutMs = 30000, _retries 
   // Ninety seconds of patience, which covers a full throttled scan round with room
   // to spare. Nothing is lost by waiting: the alternative is not a faster answer, it
   // is a wrong one.
+  // The session may have moved desktops since the last command.
+  if (activeExt) {
+    const desk = wantedDesktop(), meta = extConnections.get(activeExt);
+    if (desk ? meta?.label !== `desktop ${desk}` : isDesktopChrome(meta)) pickFailover();
+  }
   if ((!activeExt || activeExt.readyState !== 1) && extConnections.size > 0) pickFailover();
   if (!activeExt || activeExt.readyState !== 1) {
     if (_retries > 0) {
       await new Promise(r => setTimeout(r, 1500));
       return sendToExtension(method, params, timeoutMs, _retries - 1);
+    }
+    const desk = wantedDesktop();
+    if (desk) {
+      throw new Error(`No Chrome on this session's desktop ${desk} has connected in 90s. Start one there (computer_display action "chrome"), or switch back to the main desktop (computer_display action "use", display "${MAIN_DISPLAY}").`);
     }
     if (pinnedInstance && extConnections.size > 0) {
       const others = [...extConnections.values()].map(m => `${m.label} (${m.id})`).join(', ');
@@ -717,7 +765,8 @@ mcpServer.setRequestHandler(CallToolRequestSchema, async (request) => {
         active: ws === activeExt,
         pinned: !!meta.id && meta.id === pinnedInstance,
       }));
-      return { content: [{ type: 'text', text: JSON.stringify({ browsers: list, count: list.length }, null, 2) }] };
+      const desk = wantedDesktop();
+      return { content: [{ type: 'text', text: JSON.stringify({ browsers: list, count: list.length, session_desktop: desk || MAIN_DISPLAY }, null, 2) }] };
     }
     if (name === 'browser_select_browser') {
       const target = [...extConnections.entries()].find(([, meta]) =>
