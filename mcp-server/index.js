@@ -228,7 +228,7 @@ function sessionDisplay() {
     for (const f of readdirSync(CM_SESSIONS)) {
       if (!f.endsWith('.json')) continue;
       let r; try { r = JSON.parse(readFileSync(join(CM_SESSIONS, f), 'utf8')); } catch { continue; }
-      if (r.claude_pid !== process.ppid || !r.display || !alive(r.server_pid)) continue;
+      if ((r.session_pid ?? r.claude_pid) !== process.ppid || !r.display || !alive(r.server_pid)) continue;
       if (!best || (r.last || 0) > (best.last || 0)) best = r;
     }
   } catch {}

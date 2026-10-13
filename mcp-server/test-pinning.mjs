@@ -214,7 +214,7 @@ const env = { BMCP_HEARTBEAT_MS: '300', BMCP_UNANSWERED_LIMIT: '3', BMCP_PRIMARY
   const cm = mkdtempSync(join(tmpdir(), 'bmcp-cm-'));
   mkdirSync(join(cm, 'sessions'));
   const rec = (display) => writeFileSync(join(cm, 'sessions', `${process.pid}.json`),
-    JSON.stringify({ server_pid: process.pid, claude_pid: process.pid, display, last: Date.now() / 1000 }));
+    JSON.stringify({ server_pid: process.pid, session_pid: process.pid, display, last: Date.now() / 1000 }));
   rec(':2');
   const srv = startServer({ ...env, BMCP_BASE_PORT: String(BASE), BMCP_MAX_PORT: String(BASE + 5), COMPUTER_MCP_ROOT: cm });
   const port = Number(await waitFor(srv.listening, 8000));
