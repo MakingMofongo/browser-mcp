@@ -146,7 +146,9 @@ try {
 } catch (e) {
   check('bridge test', false, e.message);
 } finally {
-  server.kill();
+  // Wait for the server to be gone before the exit handler removes TEST_HOME:
+  // a server still shutting down writes its log and recreates the directory.
+  if (server.exitCode === null) await new Promise((r) => { server.once('exit', r); server.kill(); });
   if (results.some(r => !r.pass)) console.error('\n--- server stderr ---\n' + stderr.split('\n').slice(0, 14).join('\n'));
   const passed = results.filter(r => r.pass).length;
   console.log(`\n${passed}/${results.length} passed`);
