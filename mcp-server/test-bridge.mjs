@@ -13,6 +13,9 @@
 import { spawn } from 'child_process';
 import { fileURLToPath } from 'url';
 import { WebSocket } from 'ws';
+import { mkdtempSync, rmSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
 
 const PORT = 19893; // outside the range the extension scans (9876–9935), so no real browser joins
 
@@ -36,10 +39,14 @@ const check = (name, pass, detail = '') => {
 // Its own port and fast timings: the behaviour is identical, the waiting is not,
 // and pinning the port stops this from testing whichever session happens to be
 // running on the default one.
+// A throwaway HOME keeps the test's connection events out of the real
+// ~/.browser-mcp/logs/bridge.log, which is the evidence trail for live sessions.
+const TEST_HOME = mkdtempSync(join(tmpdir(), 'bmcp-test-home-'));
+process.on('exit', () => rmSync(TEST_HOME, { recursive: true, force: true }));
 const server = spawn('node', ['index.js'], {
   cwd: fileURLToPath(new URL('.', import.meta.url)),
   stdio: ['pipe', 'pipe', 'pipe'],
-  env: { ...process.env, BMCP_BASE_PORT: String(PORT), BMCP_MAX_PORT: String(PORT), BMCP_HEARTBEAT_MS: '600', BMCP_UNANSWERED_LIMIT: '2' },
+  env: { ...process.env, HOME: TEST_HOME, BMCP_BASE_PORT: String(PORT), BMCP_MAX_PORT: String(PORT), BMCP_HEARTBEAT_MS: '600', BMCP_UNANSWERED_LIMIT: '2' },
 });
 let stderr = '';
 server.stderr.on('data', (d) => { stderr += d.toString(); });
